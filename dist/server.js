@@ -22999,13 +22999,66 @@ var ROLE_QUEUE_CACHE_MS = 2e4;
 var ROLE_QUEUE_IDLE_THRESHOLD_MS = 3e4;
 var ROLE_QUEUE_OBSERVATION_MS = 1e3;
 var FLEET_WATCHDOG_LANE_INVENTORY_TIMEOUT_MS = 1e3;
-function githubCommandArgs(args, connectorHost) {
-  return connectorHost ? ["--hostname", connectorHost, ...args] : args;
+var githubConnectorHostPattern = /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?::[1-9][0-9]{0,4})?$/u;
+var githubRefPartPattern = /^[A-Za-z0-9_.-]+$/u;
+function validGithubConnectorHost(value) {
+  return typeof value === "string" && githubConnectorHostPattern.test(value);
+}
+function githubRepositoryMappings(db, projectId) {
+  if (!db) return null;
+  const row = db.prepare(
+    `SELECT revisions.canonical_config_json
+     FROM project_config_heads AS heads
+     JOIN project_config_revisions AS revisions
+       ON revisions.project_id = heads.project_id AND revisions.config_revision = heads.config_revision
+     WHERE heads.project_id = ?`
+  ).get(projectId);
+  if (!row || typeof row.canonical_config_json !== "string") return null;
+  try {
+    const config2 = JSON.parse(row.canonical_config_json);
+    const rawMappings = config2.extensions?.bbCollab?.githubIssues?.repositoryMappings;
+    if (!Array.isArray(rawMappings)) return null;
+    const mappings = rawMappings.map((candidate) => {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
+      const mapping = candidate;
+      return typeof mapping.repoTargetId === "string" && mapping.repoTargetId.length > 0 && typeof mapping.owner === "string" && githubRefPartPattern.test(mapping.owner) && typeof mapping.repo === "string" && githubRefPartPattern.test(mapping.repo) && validGithubConnectorHost(mapping.connectorHost) ? { repoTargetId: mapping.repoTargetId, owner: mapping.owner, repo: mapping.repo, connectorHost: mapping.connectorHost } : null;
+    });
+    if (mappings.some((mapping) => mapping === null)) return null;
+    const result2 = mappings;
+    return new Set(result2.map((mapping) => mapping.repoTargetId)).size === result2.length ? result2 : null;
+  } catch {
+    return null;
+  }
+}
+function githubRepositoryMappingForRepository(db, projectId, owner, repo) {
+  const matches = githubRepositoryMappings(db, projectId)?.filter((mapping) => mapping.owner === owner && mapping.repo === repo) ?? [];
+  return matches.length === 1 ? matches[0] : null;
+}
+function githubRepositoryMappingForWorkItem(db, projectId, workItemId, owner, repo) {
+  const row = db?.prepare(
+    "SELECT repo_target_id FROM work_items WHERE project_id = ? AND work_item_id = ?"
+  ).get(projectId, workItemId);
+  if (!row || typeof row.repo_target_id !== "string") return null;
+  const mapping = githubRepositoryMappings(db, projectId)?.filter((candidate) => candidate.repoTargetId === row.repo_target_id) ?? [];
+  if (mapping.length !== 1 || owner !== void 0 && mapping[0].owner !== owner || repo !== void 0 && mapping[0].repo !== repo) return null;
+  return mapping[0];
+}
+function projectGithubIssueReader(db, projectId) {
+  return (owner, repo, issueNumber) => {
+    const mapping = githubRepositoryMappingForRepository(db, projectId, owner, repo);
+    if (!mapping) throw new Error("GitHub repository mapping is missing or ambiguous");
+    return readGithubIssueForBackfill(owner, repo, issueNumber, mapping.connectorHost);
+  };
+}
+function githubCommandEnvironment(connectorHost) {
+  return validGithubConnectorHost(connectorHost) ? { ...process.env, GH_HOST: connectorHost } : null;
 }
 function githubJson(args, connectorHost) {
   try {
-    const options = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1e4, killSignal: "SIGKILL", detached: true };
-    const result2 = spawnSync2("gh", githubCommandArgs(args, connectorHost), options);
+    const env = githubCommandEnvironment(connectorHost);
+    if (!env) return null;
+    const options = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1e4, killSignal: "SIGKILL", detached: true, env };
+    const result2 = spawnSync2("gh", args, options);
     if (typeof result2.pid === "number" && result2.pid > 0) {
       try {
         process.kill(-result2.pid, "SIGKILL");
@@ -23020,22 +23073,29 @@ function githubJson(args, connectorHost) {
   }
 }
 function githubJsonAsync(args, connectorHost) {
+  const env = githubCommandEnvironment(connectorHost);
+  if (!env) return Promise.resolve(null);
   return new Promise((resolve3) => {
-    execFile("gh", githubCommandArgs(args, connectorHost), { encoding: "utf8", timeout: ROLE_QUEUE_REFRESH_TIMEOUT_MS, killSignal: "SIGKILL" }, (error48, stdout) => {
+    execFile("gh", args, { encoding: "utf8", timeout: ROLE_QUEUE_REFRESH_TIMEOUT_MS, killSignal: "SIGKILL", env }, (error48, stdout) => {
       if (error48) {
         resolve3(null);
         return;
       }
       try {
-        resolve3(JSON.parse(stdout));
+        resolve3(JSON.parse(stdout.trim()));
       } catch {
         resolve3(null);
       }
     });
   });
 }
-async function startableQueueStateAsync(repositories) {
+async function startableQueueStateAsync(db, projectId, repositories) {
   if (repositories.length > ROLE_QUEUE_MAX_REPOSITORIES || new Set(repositories).size !== repositories.length) return null;
+  const mappings = repositories.map((repository) => {
+    const [owner, repo, extra] = repository.split("/");
+    return owner && repo && extra === void 0 ? githubRepositoryMappingForRepository(db, projectId, owner, repo) : null;
+  });
+  if (mappings.some((mapping) => mapping === null)) return null;
   let count = 0;
   let unlabelledCount = 0;
   let blockedCount = 0;
@@ -23043,9 +23103,9 @@ async function startableQueueStateAsync(repositories) {
   const heads = [];
   const dispatched = [];
   const isIssue = (issue2) => Boolean(issue2 && typeof issue2 === "object" && !Array.isArray(issue2) && typeof issue2.number === "number" && Number.isSafeInteger(issue2.number) && issue2.number > 0 && Array.isArray(issue2.labels) && issue2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string"));
-  const inventories = await Promise.all(repositories.map(async (repository) => ({
+  const inventories = await Promise.all(repositories.map(async (repository, index) => ({
     repository,
-    pages: await githubJsonAsync(["api", `repos/${repository}/issues`, "--paginate", "--slurp", "--method", "GET", "-f", "state=open", "-f", "per_page=100"])
+    pages: await githubJsonAsync(["api", `repos/${repository}/issues`, "--paginate", "--slurp", "--method", "GET", "-f", "state=open", "-f", "per_page=100"], mappings[index].connectorHost)
   })));
   for (const { repository, pages } of inventories) {
     if (!Array.isArray(pages) || !pages.every((page, index) => Array.isArray(page) && page.length <= 100 && (index === pages.length - 1 ? page.length < 100 : page.length === 100) && page.every(isIssue))) return null;
@@ -23096,8 +23156,24 @@ function dispatchedWithoutLiveLane(db, projectId, issues, lanes) {
 function validGithubStateReason(state, reason) {
   return state === "OPEN" ? reason === void 0 || reason === null || reason === "" || reason === "REOPENED" : state === "CLOSED" && (reason === "COMPLETED" || reason === "NOT_PLANNED" || reason === "DUPLICATE");
 }
-async function linkedGithubObservationAsync(owner, repo, issueNumber) {
-  const issue2 = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,stateReason,updatedAt,closedByPullRequestsReferences"]);
+function githubIssueIdentity(value) {
+  if (typeof value !== "string") return null;
+  try {
+    const url2 = new URL(value);
+    const match = url2.pathname.match(/^\/([^/]+)\/([^/]+)\/issues\/([1-9][0-9]*)$/u);
+    if (url2.protocol !== "https:" || url2.username || url2.password || url2.search || url2.hash || !match || !validGithubConnectorHost(url2.host) || !githubRefPartPattern.test(match[1]) || !githubRefPartPattern.test(match[2])) return null;
+    const issueNumber = Number(match[3]);
+    return Number.isSafeInteger(issueNumber) ? { host: url2.host, owner: match[1], repo: match[2], issueNumber } : null;
+  } catch {
+    return null;
+  }
+}
+function githubIssueIdentityMatches(value, owner, repo, issueNumber, connectorHost) {
+  const identity = githubIssueIdentity(value);
+  return identity && identity.host.toLowerCase() === connectorHost.toLowerCase() && identity.owner === owner && identity.repo === repo && identity.issueNumber === issueNumber ? identity : null;
+}
+async function linkedGithubObservationAsync(owner, repo, issueNumber, connectorHost) {
+  const issue2 = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,stateReason,updatedAt,closedByPullRequestsReferences"], connectorHost);
   if (!issue2 || typeof issue2 !== "object" || Array.isArray(issue2)) return null;
   const issueState = issue2.state;
   const stateReason = issue2.stateReason;
@@ -23106,7 +23182,7 @@ async function linkedGithubObservationAsync(owner, repo, issueNumber) {
   if (issueState !== "OPEN" && issueState !== "CLOSED" || !validGithubStateReason(issueState, stateReason) || typeof externalRevision !== "string" || !Array.isArray(closingPullRequests)) return null;
   const closingPullRequest = closingPullRequests[0];
   if (closingPullRequest !== void 0 && (!closingPullRequest || typeof closingPullRequest !== "object" || Array.isArray(closingPullRequest) || typeof closingPullRequest.number !== "number" || !Number.isSafeInteger(closingPullRequest.number))) return null;
-  const pullRequest = closingPullRequest === void 0 ? null : await githubJsonAsync(["pr", "view", String(closingPullRequest.number), "--repo", `${owner}/${repo}`, "--json", "state,mergedAt"]);
+  const pullRequest = closingPullRequest === void 0 ? null : await githubJsonAsync(["pr", "view", String(closingPullRequest.number), "--repo", `${owner}/${repo}`, "--json", "state,mergedAt"], connectorHost);
   let pullRequestMerged = false;
   let pullRequestClosed = false;
   if (pullRequest && typeof pullRequest === "object" && !Array.isArray(pullRequest)) {
@@ -23122,11 +23198,12 @@ async function linkedGithubObservationAsync(owner, repo, issueNumber) {
   return status === null ? null : { status, pullRequestMerged, issueClosed, issueOpen, stateReason: stateReason === "" || stateReason === null ? void 0 : stateReason, externalRevision, updatedAtMs: Number.isFinite(updatedAtMs) ? updatedAtMs : null };
 }
 async function readGithubIssueForBackfillAsync(owner, repo, issueNumber, connectorHost) {
-  const value = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt"], connectorHost);
+  const value = await githubJsonAsync(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt,url"], connectorHost);
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("GitHub issue lookup unavailable");
   const record2 = value;
-  if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || !validGithubStateReason(record2.state, record2.stateReason) || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
-  return { owner, repo, issueNumber: record2.number, title: record2.title, body: record2.body ?? "", state: record2.state === "OPEN" ? "open" : "closed", stateReason: record2.stateReason === "" || record2.stateReason === null ? void 0 : record2.stateReason, labels: record2.labels.map((label) => label.name), externalRevision: record2.updatedAt };
+  if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || !validGithubStateReason(record2.state, record2.stateReason) || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string" || !githubIssueIdentityMatches(record2.url, owner, repo, record2.number, connectorHost)) throw new Error("GitHub issue response is invalid");
+  const identity = githubIssueIdentity(record2.url);
+  return { owner: identity.owner, repo: identity.repo, issueNumber: identity.issueNumber, title: record2.title, body: record2.body ?? "", state: record2.state === "OPEN" ? "open" : "closed", stateReason: record2.stateReason === "" || record2.stateReason === null ? void 0 : record2.stateReason, labels: record2.labels.map((label) => label.name), externalRevision: record2.updatedAt };
 }
 function githubIssueBriefTarget(db, projectId, workItemId) {
   if (!db) return null;
@@ -23178,22 +23255,24 @@ function parseGithubIssueComments(value) {
     return { id: String(record2.id), body: record2.body, externalRevision: record2.updated_at };
   }).reverse();
 }
-async function readGithubIssueBriefAsync(db, projectId, workItemId, connectorHost) {
+async function readGithubIssueBriefAsync(db, projectId, workItemId) {
   const target = githubIssueBriefTarget(db, projectId, workItemId);
   if (!target || target === "invalid" || !projectionIsCurrent(target)) throw new Error("GitHub issue projection is unavailable for the current WorkItem revision");
-  const issue2 = await readGithubIssueForBackfillAsync(target.owner, target.repo, target.issueNumber, connectorHost);
+  const mapping = githubRepositoryMappingForRepository(db, projectId, target.owner, target.repo);
+  if (!mapping) throw new Error("GitHub repository mapping is missing or ambiguous");
+  const issue2 = await readGithubIssueForBackfillAsync(target.owner, target.repo, target.issueNumber, mapping.connectorHost);
   if (issue2.externalRevision !== target.projection.observedExternalRevision) throw new Error("GitHub issue body freshness does not match the current projection");
   const firstPage = await githubJsonAsync([
     "api",
     `repos/${target.owner}/${target.repo}/issues/${target.issueNumber}/comments?per_page=${GITHUB_ISSUE_COMMENT_TAIL_LIMIT}&page=1&sort=created&direction=desc`
-  ], connectorHost);
+  ], mapping.connectorHost);
   const comments = parseGithubIssueComments(firstPage);
   let commentsCapped = false;
   if (comments.length === GITHUB_ISSUE_COMMENT_TAIL_LIMIT) {
     const secondPage = await githubJsonAsync([
       "api",
       `repos/${target.owner}/${target.repo}/issues/${target.issueNumber}/comments?per_page=${GITHUB_ISSUE_COMMENT_TAIL_LIMIT}&page=2&sort=created&direction=desc`
-    ], connectorHost);
+    ], mapping.connectorHost);
     const olderComments = parseGithubIssueComments(secondPage);
     commentsCapped = olderComments.length > 0;
   }
@@ -23223,14 +23302,16 @@ ${brief.content}` };
   };
 }
 function readGithubIssueForBackfill(owner, repo, issueNumber, connectorHost) {
-  const value = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt"], connectorHost);
+  if (connectorHost === void 0) throw new Error("GitHub connector host is unavailable");
+  const value = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt,url"], connectorHost);
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("GitHub issue lookup unavailable");
   const record2 = value;
-  if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || !validGithubStateReason(record2.state, record2.stateReason) || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string") throw new Error("GitHub issue response is invalid");
+  if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || !validGithubStateReason(record2.state, record2.stateReason) || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string" || !githubIssueIdentityMatches(record2.url, owner, repo, record2.number, connectorHost)) throw new Error("GitHub issue response is invalid");
+  const identity = githubIssueIdentity(record2.url);
   return {
-    owner,
-    repo,
-    issueNumber: record2.number,
+    owner: identity.owner,
+    repo: identity.repo,
+    issueNumber: identity.issueNumber,
     title: record2.title,
     body: record2.body ?? "",
     state: record2.state === "OPEN" ? "open" : "closed",
@@ -23241,36 +23322,22 @@ function readGithubIssueForBackfill(owner, repo, issueNumber, connectorHost) {
 }
 function githubCliAdapterForWorkItem(db, projectId, workItemId) {
   if (!db) return null;
-  const row = db.prepare(
-    `SELECT work_items.repo_target_id, project_config_revisions.canonical_config_json
-     FROM work_items
-     JOIN project_config_heads ON project_config_heads.project_id = work_items.project_id
-     JOIN project_config_revisions ON project_config_revisions.project_id = project_config_heads.project_id
-       AND project_config_revisions.config_revision = project_config_heads.config_revision
-     WHERE work_items.project_id = ? AND work_items.work_item_id = ?`
-  ).get(projectId, workItemId);
-  if (!row || typeof row.repo_target_id !== "string" || typeof row.canonical_config_json !== "string") return null;
-  try {
-    const config2 = JSON.parse(row.canonical_config_json);
-    const mappings = config2.extensions?.bbCollab?.githubIssues?.repositoryMappings;
-    if (!Array.isArray(mappings)) return null;
-    const matches = mappings.filter((candidate) => candidate && typeof candidate === "object" && !Array.isArray(candidate) && candidate.repoTargetId === row.repo_target_id && typeof candidate.owner === "string" && typeof candidate.repo === "string" && typeof candidate.connectorHost === "string");
-    if (matches.length !== 1) return null;
-    const mapping = matches[0];
-    const connectorHost = mapping.connectorHost;
-    return {
-      owner: mapping.owner,
-      repo: mapping.repo,
-      connectorHost,
-      available: true,
-      read: (owner, repo, issueNumber) => readGithubIssueForBackfill(owner, repo, issueNumber, connectorHost),
-      mutate: (input) => githubCliMutation(input, connectorHost),
-      readAsync: (owner, repo, issueNumber) => readGithubIssueForBackfillAsync(owner, repo, issueNumber, connectorHost),
-      mutateAsync: (input) => githubCliMutationAsync(input, connectorHost)
-    };
-  } catch {
-    return null;
-  }
+  const mapping = githubRepositoryMappingForWorkItem(db, projectId, workItemId);
+  if (!mapping) return null;
+  return {
+    owner: mapping.owner,
+    repo: mapping.repo,
+    connectorHost: mapping.connectorHost,
+    available: true,
+    read: (owner, repo, issueNumber) => owner === mapping.owner && repo === mapping.repo ? readGithubIssueForBackfill(owner, repo, issueNumber, mapping.connectorHost) : (() => {
+      throw new Error("GitHub repository mapping changed");
+    })(),
+    mutate: (input) => input.owner === mapping.owner && input.repo === mapping.repo ? githubCliMutation(input, mapping.connectorHost) : (() => {
+      throw new Error("GitHub repository mapping changed");
+    })(),
+    readAsync: (owner, repo, issueNumber) => owner === mapping.owner && repo === mapping.repo ? readGithubIssueForBackfillAsync(owner, repo, issueNumber, mapping.connectorHost) : Promise.reject(new Error("GitHub repository mapping changed")),
+    mutateAsync: (input) => input.owner === mapping.owner && input.repo === mapping.repo ? githubCliMutationAsync(input, mapping.connectorHost) : Promise.reject(new Error("GitHub repository mapping changed"))
+  };
 }
 function githubCliMutation(input, connectorHost) {
   const current = input.kind === "update" ? readGithubIssueForBackfill(input.owner, input.repo, input.issueNumber, connectorHost) : null;
@@ -23293,9 +23360,10 @@ function githubCliMutation(input, connectorHost) {
   ];
   if (input.state === "closed") args.push("-f", "state_reason=completed");
   const response = githubJson(args, connectorHost);
-  const responseNumber = response && typeof response === "object" && !Array.isArray(response) ? response.number : void 0;
+  const responseRecord = response && typeof response === "object" && !Array.isArray(response) ? response : null;
+  const responseNumber = responseRecord?.number;
   const issueNumber = input.kind === "create" ? responseNumber : input.issueNumber;
-  if (typeof issueNumber !== "number" || !Number.isSafeInteger(issueNumber) || issueNumber < 1) throw new Error("GitHub issue mutation identity was not confirmed");
+  if (typeof issueNumber !== "number" || !Number.isSafeInteger(issueNumber) || issueNumber < 1 || !githubIssueIdentityMatches(responseRecord?.html_url ?? responseRecord?.url, input.owner, input.repo, issueNumber, connectorHost)) throw new Error("GitHub issue mutation identity was not confirmed");
   const snapshot2 = readGithubIssueForBackfill(input.owner, input.repo, issueNumber, connectorHost);
   if (snapshot2.owner !== input.owner || snapshot2.repo !== input.repo || snapshot2.issueNumber !== issueNumber) throw new Error("GitHub issue mutation identity changed");
   return snapshot2;
@@ -23321,9 +23389,10 @@ async function githubCliMutationAsync(input, connectorHost) {
   ];
   if (input.state === "closed") args.push("-f", "state_reason=completed");
   const response = await githubJsonAsync(args, connectorHost);
-  const responseNumber = response && typeof response === "object" && !Array.isArray(response) ? response.number : void 0;
+  const responseRecord = response && typeof response === "object" && !Array.isArray(response) ? response : null;
+  const responseNumber = responseRecord?.number;
   const issueNumber = input.kind === "create" ? responseNumber : input.issueNumber;
-  if (typeof issueNumber !== "number" || !Number.isSafeInteger(issueNumber) || issueNumber < 1) throw new Error("GitHub issue mutation identity was not confirmed");
+  if (typeof issueNumber !== "number" || !Number.isSafeInteger(issueNumber) || issueNumber < 1 || !githubIssueIdentityMatches(responseRecord?.html_url ?? responseRecord?.url, input.owner, input.repo, issueNumber, connectorHost)) throw new Error("GitHub issue mutation identity was not confirmed");
   const snapshot2 = await readGithubIssueForBackfillAsync(input.owner, input.repo, issueNumber, connectorHost);
   if (snapshot2.owner !== input.owner || snapshot2.repo !== input.repo || snapshot2.issueNumber !== issueNumber) throw new Error("GitHub issue mutation identity changed");
   return snapshot2;
@@ -23867,7 +23936,7 @@ async function dispatchLane(bb, db, input) {
     ...request,
     reasonCode: legacyReplay ? `dispatch_parent:${dispatchParentThreadId}` : `dispatch_parent:${dispatchParentThreadId}:title=${encodeURIComponent(dispatchTitle)}`,
     workAttempt: intentAttempt
-  }, false, "stop-active", githubAdapter?.read ?? readGithubIssueForBackfill, githubAdapter);
+  }, false, "stop-active", githubAdapter?.read ?? projectGithubIssueReader(db, request.projectId), githubAdapter);
   if (intent.outcome !== "OK") return intent;
   return serializeDispatchRecovery(request, async () => {
     let dispatchSpawn = spawnShape.data;
@@ -23886,16 +23955,16 @@ async function dispatchLane(bb, db, input) {
         expectedResourceRevision: currentWorkItem.resource_revision,
         workItemId: request.workItemId,
         projectionKind: "github_issue"
-      }, false, "refuse-active", readGithubIssueForBackfill, githubAdapter);
+      }, false, "refuse-active", projectGithubIssueReader(db, request.projectId), githubAdapter);
       if (projection.outcome !== "OK") return projection;
       try {
-        initialBrief = (await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "", githubAdapter?.connectorHost)).brief;
+        initialBrief = (await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "")).brief;
       } catch {
         return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub issue body, projection, and comment-tail source is unavailable" };
       }
       let latestRead;
       try {
-        latestRead = await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "", githubAdapter?.connectorHost);
+        latestRead = await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "");
       } catch {
         return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub issue body and comment-tail reread is unavailable" };
       }
@@ -24844,7 +24913,7 @@ async function runCli(db, bb, argv, ctx, deps) {
     }
     if (!db) return cliResult({ outcome: "CANONICAL_STORE_UNAVAILABLE", subject: projectId2, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" });
     try {
-      const backfill = backfillWorkItemGithubIssues(db, projectId2, readGithubIssueForBackfill);
+      const backfill = backfillWorkItemGithubIssues(db, projectId2, projectGithubIssueReader(db, projectId2));
       const complete = backfill.state === "completed";
       return cliResult({
         outcome: complete ? "OK" : "EXTERNAL_UNAVAILABLE",
@@ -25272,7 +25341,7 @@ ${thread.titleFallback ?? ""}`);
       try {
         if (reason === null) {
           if (!db) throw new Error("canonical-store-unavailable");
-          const queue = await startableQueueStateAsync(config2.repositories);
+          const queue = await startableQueueStateAsync(db, projectId, config2.repositories);
           if (queue === null) {
             reason = "startable-queue-unreadable";
           } else if (queue.head !== null) {
@@ -25585,7 +25654,7 @@ ${thread.titleFallback ?? ""}`);
     if (!db) return { known: false, reason: "canonical-store-unavailable" };
     try {
       if (configured.reason !== null) return { known: false, reason: configured.reason };
-      const queue = await startableQueueStateAsync(configured.repositories);
+      const queue = await startableQueueStateAsync(db, projectId, configured.repositories);
       return queue === null ? { known: false, reason: "startable-queue-unreadable" } : { known: true, value: queue };
     } catch (error48) {
       return { known: false, reason: `startable-queue-unreadable:${String(error48)}` };
@@ -26173,7 +26242,7 @@ ${thread.titleFallback ?? ""}`);
         const compatibleKey = legacyIdempotencyKey !== void 0 && db.prepare(
           "SELECT 1 FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ? AND request_digest = ?"
         ).get(projectId, legacyIdempotencyKey, mutationRequestDigest({ ...request, idempotencyKey: legacyIdempotencyKey })) !== void 0 ? legacyIdempotencyKey : idempotencyKey;
-        return applyLiveAuthorizedMutation(bb, db, { ...request, idempotencyKey: compatibleKey }, false, terminalizationPolicy, githubSnapshot ? () => githubSnapshot : readGithubIssueForBackfill);
+        return applyLiveAuthorizedMutation(bb, db, { ...request, idempotencyKey: compatibleKey }, false, terminalizationPolicy, githubSnapshot ? () => githubSnapshot : projectGithubIssueReader(db, projectId));
       };
       const inspectWaitTargets = async (projectId) => {
         for (const workItem of openWorkItemsByProject.get(projectId) ?? []) {
@@ -26184,9 +26253,14 @@ ${thread.titleFallback ?? ""}`);
             degrade(`github-wait-target:${projectId}:${workItem.workItemId}`);
             continue;
           }
+          const mapping = githubRepositoryMappingForWorkItem(db, projectId, workItem.workItemId, match[1], match[2]);
+          if (!mapping) {
+            degrade(`github-wait-target:${projectId}:${workItem.workItemId}`);
+            continue;
+          }
           const key = waitExternalKey(projectId, match[1], match[2], issueNumber);
           if (waitExternalRevisions.has(key)) continue;
-          const observation2 = await linkedGithubObservationAsync(match[1], match[2], issueNumber);
+          const observation2 = await linkedGithubObservationAsync(match[1], match[2], issueNumber, mapping.connectorHost);
           if (observation2 === null) degrade(`github-wait-target:${projectId}:${workItem.workItemId}`);
           else waitExternalRevisions.set(key, observation2);
         }
@@ -26204,7 +26278,12 @@ ${thread.titleFallback ?? ""}`);
            ORDER BY work_items.work_item_id`
         ).all(projectId, ...WORK_ITEM_NON_TERMINAL_STATES, "succeeded");
         for (const linked of linkedWorkItems) {
-          const observation2 = await linkedGithubObservationAsync(linked.owner, linked.repo, linked.issue_number);
+          const mapping = githubRepositoryMappingForWorkItem(db, projectId, linked.work_item_id, linked.owner, linked.repo);
+          if (!mapping) {
+            degrade(fleetWatchdogScope("github-work-item-status", projectId, linked.work_item_id));
+            continue;
+          }
+          const observation2 = await linkedGithubObservationAsync(linked.owner, linked.repo, linked.issue_number, mapping.connectorHost);
           if (observation2 === null) {
             degrade(fleetWatchdogScope("github-work-item-status", projectId, linked.work_item_id));
             continue;
@@ -26223,7 +26302,7 @@ ${thread.titleFallback ?? ""}`);
             }
             let githubSnapshot2;
             try {
-              githubSnapshot2 = await readGithubIssueForBackfillAsync(linked.owner, linked.repo, linked.issue_number);
+              githubSnapshot2 = await readGithubIssueForBackfillAsync(linked.owner, linked.repo, linked.issue_number, mapping.connectorHost);
             } catch {
               degrade(fleetWatchdogScope("github-work-item-reopen", projectId, linked.work_item_id));
               continue;
@@ -26272,7 +26351,7 @@ ${thread.titleFallback ?? ""}`);
           }
           let githubSnapshot;
           try {
-            githubSnapshot = await readGithubIssueForBackfillAsync(linked.owner, linked.repo, linked.issue_number);
+            githubSnapshot = await readGithubIssueForBackfillAsync(linked.owner, linked.repo, linked.issue_number, mapping.connectorHost);
           } catch {
             degrade(fleetWatchdogScope("github-work-item-terminalize", projectId, linked.work_item_id));
             continue;
@@ -26482,7 +26561,7 @@ ${thread.titleFallback ?? ""}`);
               "owed-act"
             );
           }
-          const observedQueue = configured.reason === null ? await startableQueueStateAsync(repositories) : null;
+          const observedQueue = configured.reason === null ? await startableQueueStateAsync(db, projectId, repositories) : null;
           const currentConfig2 = readRoleQueueConfig(projectId);
           const queue = currentConfig2.identity === configured.identity ? observedQueue : null;
           if (currentConfig2.identity !== configured.identity) {
@@ -26521,7 +26600,7 @@ ${thread.titleFallback ?? ""}`);
                     "owed-act",
                     async () => {
                       try {
-                        const freshQueue = await startableQueueStateAsync(repositories);
+                        const freshQueue = await startableQueueStateAsync(db, projectId, repositories);
                         if (freshQueue === null) {
                           degrade(fleetWatchdogScope("dispatched-lane-revalidation", projectId, "queue-unreadable"));
                           return false;
@@ -26565,8 +26644,13 @@ ${thread.titleFallback ?? ""}`);
                 degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
                 continue;
               }
+              const mapping = githubRepositoryMappingForWorkItem(db, projectId, blocked.workItemId, match[1], match[2]);
+              if (!mapping) {
+                degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
+                continue;
+              }
               try {
-                snapshot2 = await readGithubIssueForBackfillAsync(match[1], match[2], issueNumber);
+                snapshot2 = await readGithubIssueForBackfillAsync(match[1], match[2], issueNumber, mapping.connectorHost);
               } catch {
                 degrade(fleetWatchdogScope("work-item-blocker", projectId, blocked.workItemId));
                 continue;

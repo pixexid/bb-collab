@@ -719,7 +719,9 @@ async function loadedDistHost() {
 }
 
 async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, writingLaneCeiling?: number, withoutGithubIssues = true, projectId = PROJECT_ID, connectorHost = CONNECTOR_HOST, githubIssueNumber?: number) {
-  const fixture = await assignmentFixture({ projectId, connectorHost, directorSeat: true, orchestratorSeat: true, withoutGithubIssues, targetRemoteUrl: includeGithubRemote ? "https://github.com/example/project.git" : undefined, writingLaneCeiling, githubIssueNumber });
+  const fixture = await assignmentFixture({ projectId, connectorHost, directorSeat: true, orchestratorSeat: true, withoutGithubIssues: false, targetRemoteUrl: includeGithubRemote ? "https://github.com/example/project.git" : undefined, writingLaneCeiling, githubIssueNumber });
+  const pathHead = process.env.PATH?.split(":")[0];
+  if (!includeGithubRemote && !(pathHead && pathHead.startsWith(tmpdir()))) pendingReviewQueueCleanups.push(installEmptyGithubQueue());
   const director = fixture.db.prepare(
     "SELECT thread_id FROM execution_attempts WHERE origin = 'role_holder' AND role_id = 'director'",
   ).get() as { thread_id: string };
@@ -856,7 +858,7 @@ async function currentGithubBriefDispatch(projectId = PROJECT_ID, connectorHost 
   };
 }
 
-function installGithubBriefGh(snapshot: { title: string; body: string; state: "open" | "closed"; labels: readonly string[]; externalRevision: string }, options: { transitionSnapshot?: typeof snapshot; incomplete?: boolean; mutationFailure?: boolean; slowConnectorHost?: string } = {}) {
+function installGithubBriefGh(snapshot: { title: string; body: string; state: "open" | "closed"; labels: readonly string[]; externalRevision: string }, options: { transitionSnapshot?: typeof snapshot; incomplete?: boolean; mutationFailure?: boolean; slowConnectorHost?: string; responseUrl?: string } = {}) {
   const bin = mkdtempSync(join(tmpdir(), "bb-collab-github-brief-"));
   const gh = join(bin, "gh");
   const calls = join(bin, "calls");
@@ -864,29 +866,30 @@ function installGithubBriefGh(snapshot: { title: string; body: string; state: "o
   const fastTransitioned = join(bin, "fast-transitioned");
   const slowStarted = join(bin, "slow-started");
   const slowFinished = join(bin, "slow-finished");
-  const issue = JSON.stringify({ number: 1, title: snapshot.title, body: snapshot.body, state: snapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: snapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: snapshot.labels.map((name) => ({ name })), updatedAt: snapshot.externalRevision });
+  const issue = JSON.stringify({ number: 1, title: snapshot.title, body: snapshot.body, state: snapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: snapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: snapshot.labels.map((name) => ({ name })), updatedAt: snapshot.externalRevision, url: options.responseUrl ?? "https://__GH_HOST__/example/project/issues/1" });
   const transitionSnapshot = options.transitionSnapshot ?? snapshot;
-  const transitionedIssue = JSON.stringify({ number: 1, title: transitionSnapshot.title, body: transitionSnapshot.body, state: transitionSnapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: transitionSnapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: transitionSnapshot.labels.map((name) => ({ name })), updatedAt: transitionSnapshot.externalRevision });
+  const transitionedIssue = JSON.stringify({ number: 1, title: transitionSnapshot.title, body: transitionSnapshot.body, state: transitionSnapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: transitionSnapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: transitionSnapshot.labels.map((name) => ({ name })), updatedAt: transitionSnapshot.externalRevision, url: options.responseUrl ?? "https://__GH_HOST__/example/project/issues/1" });
   const allComments = Array.from({ length: 48 }, (_, index) => ({ id: 48 - index, body: `comment-${48 - index}`, updated_at: `comment-revision-${48 - index}` }));
   const recent = JSON.stringify(allComments.slice(0, 8));
   const older = JSON.stringify(options.incomplete ? { not: "comments" } : allComments.slice(8, 16));
-  writeFileSync(gh, `#!/bin/sh
-printf '%s\\n' "$*" >> '${calls}'
-connector_host=default
-if [ "$1" = --hostname ]; then
-  connector_host="$2"
-  if [ "$2" = '${options.slowConnectorHost ?? ""}' ]; then touch '${slowStarted}'; sleep 2; touch '${slowFinished}'; fi
-  shift 2
-fi
+writeFileSync(gh, `#!/bin/sh
+printf 'GH_HOST=%s args=%s\\n' "\${GH_HOST:-}" "$*" >> '${calls}'
+if [ -z "\${GH_HOST:-}" ]; then exit 65; fi
+case "$1" in issue|api|pr) ;; *) exit 66 ;; esac
+for arg in "$@"; do
+  if [ "$arg" = --hostname ]; then exit 64; fi
+done
+connector_host="\${GH_HOST:-default}"
+if [ "$connector_host" = '${options.slowConnectorHost ?? ""}' ]; then touch '${slowStarted}'; sleep 2; touch '${slowFinished}'; fi
 if [ "$connector_host" = '${options.slowConnectorHost ?? ""}' ]; then state_file='${slowTransitioned}'; else state_file='${fastTransitioned}'; fi
 if [ "$1" = issue ]; then
-  if [ -f "$state_file" ]; then printf '%s\\n' '${transitionedIssue}'; else printf '%s\\n' '${issue}'; fi
+  if [ -f "$state_file" ]; then printf '%s\\n' '${transitionedIssue}' | sed "s/__GH_HOST__/$connector_host/g"; else printf '%s\\n' '${issue}' | sed "s/__GH_HOST__/$connector_host/g"; fi
   exit 0
 fi
 if [ "$1" = api ]; then
   case "$*" in
     *--method*PATCH*|*--method*POST*)
-      ${options.mutationFailure ? "exit 12" : `touch "$state_file"; printf '%s\\n' '{"number":1}'`}
+      ${options.mutationFailure ? "exit 12" : `touch "$state_file"; printf '%s\\n' '{"number":1,"html_url":"https://__GH_HOST__/example/project/issues/1"}' | sed "s/__GH_HOST__/$connector_host/g"`}
       exit 0 ;;
     *--paginate*) exit 12 ;;
     *page=1*) printf '%s\\n' '${recent}'; exit 0 ;;
@@ -929,7 +932,25 @@ function installStartableQueueFixture(issueNumber: number) {
   const gh = join(bin, "gh");
   const issue = JSON.stringify({ number: issueNumber, labels: [{ name: "queue:startable" }] });
   writeFileSync(gh, `#!/bin/sh
+if [ -z "\${GH_HOST:-}" ]; then exit 65; fi
 if [ "$1" = "api" ]; then printf '%s\\n' '[[${issue}]]'; else printf '%s\\n' '[${issue}]'; fi
+`);
+  chmodSync(gh, 0o755);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${bin}:${originalPath ?? ""}`;
+  return () => {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    rmSync(bin, { recursive: true, force: true });
+  };
+}
+
+function installEmptyGithubQueue() {
+  const bin = mkdtempSync(join(tmpdir(), "bb-collab-empty-queue-"));
+  const gh = join(bin, "gh");
+  writeFileSync(gh, `#!/bin/sh
+if [ -z "\${GH_HOST:-}" ]; then exit 65; fi
+if [ "$1" = api ]; then printf '%s\\n' '[[]]'; else printf '%s\\n' '[]'; fi
 `);
   chmodSync(gh, 0o755);
   const originalPath = process.env.PATH;
@@ -4118,6 +4139,14 @@ exec /bin/cat '${inventory}'
            VALUES (?, ?, 1, 'source-main', 'host-main', ?, ?, 'main', ?)`,
         ).run(PROJECT_ID, `target-${index}`, `/workspace/target-${index}`, `https://github.com/example/project-${index}.git`, `digest-${index}`);
       }
+      const row = db.prepare(
+        "SELECT canonical_config_json FROM project_config_revisions WHERE project_id = ? AND config_revision = 1",
+      ).get(PROJECT_ID) as { canonical_config_json: string };
+      const config = JSON.parse(row.canonical_config_json) as { extensions: { bbCollab: { githubIssues: { repositoryMappings: Array<Record<string, unknown>> } } } };
+      for (let index = 2; index <= count; index += 1) {
+        config.extensions.bbCollab.githubIssues.repositoryMappings.push({ repoTargetId: `target-${index}`, owner: GITHUB_OWNER, repo: `project-${index}`, connectorHost: CONNECTOR_HOST });
+      }
+      db.prepare("UPDATE project_config_revisions SET canonical_config_json = ? WHERE project_id = ? AND config_revision = 1").run(JSON.stringify(config), PROJECT_ID);
     };
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-role-queue-fanout-"));
     const gh = join(bin, "gh");
@@ -5176,7 +5205,8 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       const calls = restore.readCallsAndCleanup();
       expect(calls.match(/page=1/gu)).toHaveLength(2);
       expect(calls.match(/page=2/gu)).toHaveLength(2);
-      expect(calls).toContain(CONNECTOR_HOST);
+      expect(calls).toMatch(new RegExp(`GH_HOST=${CONNECTOR_HOST}`));
+      expect(calls).not.toContain("--hostname");
       expect(calls).not.toContain("--paginate");
       expect(calls).not.toContain("page=3");
     } finally {
@@ -5188,6 +5218,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     const slow = await currentGithubBriefDispatch("project-a", "slow.github.test");
     const fast = await currentGithubBriefDispatch("project-b", CONNECTOR_HOST);
     const restore = installGithubBriefGh(slow.snapshot, { transitionSnapshot: slow.transitionSnapshot, slowConnectorHost: "slow.github.test" });
+    const inheritedHost = process.env.GH_HOST;
     try {
       let slowSettled = false;
       const slowCommandStarted = restore.waitForSlowCommandStart();
@@ -5209,10 +5240,49 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       expect(slowSettled).toBe(false);
       expect(restore.slowCommandFinished()).toBe(false);
       expect((await slowResult).outcome).toBe("OK");
+      expect(process.env.GH_HOST).toBe(inheritedHost);
+      const calls = restore.readCallsAndCleanup();
+      expect(calls).toContain("GH_HOST=slow.github.test");
+      expect(calls).toContain(`GH_HOST=${CONNECTOR_HOST}`);
+      expect(calls).not.toContain("--hostname");
     } finally {
       restore.cleanup();
     }
   }, 30_000);
+
+  it("refuses a malformed configured connector host before durable dispatch intent", async () => {
+    const fixture = await currentGithubBriefDispatch();
+    const configRow = fixture.fixture.db.prepare(
+      "SELECT canonical_config_json FROM project_config_revisions WHERE project_id = ? AND config_revision = 1",
+    ).get(PROJECT_ID) as { canonical_config_json: string };
+    const config = JSON.parse(configRow.canonical_config_json) as { extensions: { bbCollab: { githubIssues: { repositoryMappings: Array<{ connectorHost: string }> } } } };
+    config.extensions.bbCollab.githubIssues.repositoryMappings[0]!.connectorHost = "https://foreign host";
+    fixture.fixture.db.prepare("UPDATE project_config_revisions SET canonical_config_json = ? WHERE project_id = ? AND config_revision = 1")
+      .run(JSON.stringify(config), PROJECT_ID);
+    const result = JSON.parse(await fixture.fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: fixture.request,
+      spawn: dispatchSpawn(fixture.fixture.orchestratorThreadId),
+    }, { projectId: PROJECT_ID, threadId: fixture.fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).toBe("EXTERNAL_UNAVAILABLE");
+    expect(fixture.fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    expect(fixture.fixture.db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ count: 0 });
+  });
+
+  it("refuses a foreign response URL before projection or spawn", async () => {
+    const projected = await currentGithubBriefDispatch();
+    const restore = installGithubBriefGh(projected.snapshot, { transitionSnapshot: projected.transitionSnapshot, responseUrl: "https://foreign.test/example/project/issues/1" });
+    try {
+      const result = JSON.parse(await projected.fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: projected.request,
+        spawn: dispatchSpawn(projected.fixture.orchestratorThreadId),
+      }, { projectId: PROJECT_ID, threadId: projected.fixture.orchestratorThreadId }) as string);
+      expect(result.outcome).toBe("EXTERNAL_UNAVAILABLE");
+      expect(projected.fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+      expect(projected.fixture.db.prepare("SELECT projected_resource_revision, observed_external_digest FROM external_work_refs WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ projected_resource_revision: null, observed_external_digest: null });
+    } finally {
+      restore.cleanup();
+    }
+  });
 
   it("refuses production comment completeness when the bounded older-page read fails", async () => {
     const projected = await currentGithubBriefDispatch();
@@ -6251,22 +6321,22 @@ if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "9999" ] && [ "$7" = "sta
   if [ "$phase" = "closed-1" ]; then printf '%s\n' '{"state":"OPEN","stateReason":"COMPLETED","updatedAt":"impossible-open","closedByPullRequestsReferences":[]}' ; else printf '%s\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"open-2","closedByPullRequestsReferences":[]}' ; fi
   exit 0
 fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "9999" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "9999" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt,url" ]; then
   phase=$(cat "${adversarialPhaseFile}")
-  if [ "$phase" = "open-2" ]; then printf '%s\n' '{"number":9999,"title":"issue","body":"body","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"open-2"}'; else printf '%s\n' '{"number":9999,"title":"issue","body":"body","state":"OPEN","stateReason":"COMPLETED","labels":[],"updatedAt":"impossible-open"}'; fi
+  if [ "$phase" = "open-2" ]; then printf '%s\n' '{"number":9999,"title":"issue","body":"body","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"open-2","url":"https://github.test/example/project/issues/9999"}'; else printf '%s\n' '{"number":9999,"title":"issue","body":"body","state":"OPEN","stateReason":"COMPLETED","labels":[],"updatedAt":"impossible-open","url":"https://github.test/example/project/issues/9999"}'; fi
   exit 0
 fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "206" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then
   if [ "$phase" = "open-2" ]; then printf '%s\\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"open-2","closedByPullRequestsReferences":[]}'; else printf '%s\\n' '{"state":"CLOSED","stateReason":"COMPLETED","updatedAt":"'"$phase"'","closedByPullRequestsReferences":[{"number":340}]}'; fi
   exit 0
 fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "206" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then
-  if [ "$phase" = "open-2" ]; then printf '%s\\n' '{"number":206,"title":"issue","body":"body","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"open-2"}'; else printf '%s\\n' '{"number":206,"title":"issue","body":"body","state":"CLOSED","stateReason":"COMPLETED","labels":[],"updatedAt":"'"$phase"'"}'; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "206" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt,url" ]; then
+  if [ "$phase" = "open-2" ]; then printf '%s\\n' '{"number":206,"title":"issue","body":"body","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"open-2","url":"https://github.test/example/project/issues/206"}'; else printf '%s\\n' '{"number":206,"title":"issue","body":"body","state":"CLOSED","stateReason":"COMPLETED","labels":[],"updatedAt":"'"$phase"'","url":"https://github.test/example/project/issues/206"}'; fi
   exit 0
 fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "210" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then printf '%s\\n' '{"number":210,"title":"issue","body":"body","state":"CLOSED","stateReason":"DUPLICATE","labels":[],"updatedAt":"closed-210"}'; exit 0; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then printf '%s\\n' '{"number":'"$3"',"title":"issue","body":"body","state":"CLOSED","stateReason":"COMPLETED","labels":[],"updatedAt":"closed-'"$3"'"}'; exit 0; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" != "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then exit 1; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "210" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt,url" ]; then printf '%s\\n' '{"number":210,"title":"issue","body":"body","state":"CLOSED","stateReason":"DUPLICATE","labels":[],"updatedAt":"closed-210","url":"https://github.test/example/project/issues/210"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt,url" ]; then printf '%s\\n' '{"number":'"$3"',"title":"issue","body":"body","state":"CLOSED","stateReason":"COMPLETED","labels":[],"updatedAt":"closed-'"$3"'","url":"https://github.test/example/project/issues/'"$3"'"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" != "state,stateReason,updatedAt,closedByPullRequestsReferences" ] && [ "$7" != "state,stateReason,updatedAt,closedByPullRequestsReferences,url" ] && [ "$7" != "number,title,body,state,stateReason,labels,updatedAt,url" ]; then exit 1; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && { [ "$3" = "206" ] || [ "$3" = "208" ] || [ "$3" = "209" ] || [ "$3" = "210" ]; }; then printf '%s\\n' '{"state":"CLOSED","stateReason":"COMPLETED","updatedAt":"closed-'"$3"'","closedByPullRequestsReferences":[{"number":340}]}'; exit 0; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ]; then printf '%s\\n' '{"state":"CLOSED","stateReason":"COMPLETED","updatedAt":"closed-'"$3"'","closedByPullRequestsReferences":[]}'; exit 0; fi
 exit 1
@@ -7623,9 +7693,9 @@ exit 1
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then
   printf '%s\\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"open-y","closedByPullRequestsReferences":[]}'; exit 0
 fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt,url" ]; then
   if [ -f "$0.full-read" ]; then revision=open-y; else revision=closed-x; touch "$0.full-read"; fi
-  printf '%s\\n' '{"number":351,"title":"reopen","body":"","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"'$revision'"}'; exit 0
+  printf '%s\\n' '{"number":351,"title":"reopen","body":"","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"'$revision'","url":"https://github.test/example/project/issues/351"}'; exit 0
 fi
 exit 1
 `);
@@ -7681,9 +7751,9 @@ if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,stateReason,update
   if [ "$count" -ge 3 ]; then revision=open-z; fi
   printf '%s\\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"'$revision'","closedByPullRequestsReferences":[]}'; exit 0
 fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt,url" ]; then
   if [ "$count" -ge 3 ]; then revision=open-z; fi
-  printf '%s\\n' '{"number":'"$3"',"title":"reopen","body":"","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"'$revision'"}'; exit 0
+  printf '%s\\n' '{"number":'"$3"',"title":"reopen","body":"","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"'$revision'","url":"https://github.test/example/project/issues/'"$3"'"}'; exit 0
 fi
 exit 1
 `);
@@ -7750,7 +7820,7 @@ exit 1
     writeFileSync(gh, `#!/bin/sh
 if [ "$1" = "issue" ] && [ "$2" = "list" ]; then printf '%s\n' '[]'; exit 0; fi
 if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "state,stateReason,updatedAt,closedByPullRequestsReferences" ]; then printf '%s\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"open-y","closedByPullRequestsReferences":[]}'; exit 0; fi
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt" ]; then printf '%s\n' '{"number":'"$3"',"title":"reopened","body":"","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"open-y"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$7" = "number,title,body,state,stateReason,labels,updatedAt,url" ]; then printf '%s\n' '{"number":'"$3"',"title":"reopened","body":"","state":"OPEN","stateReason":"REOPENED","labels":[],"updatedAt":"open-y","url":"https://github.test/example/project/issues/'"$3"'"}'; exit 0; fi
 exit 1
 `);
     chmodSync(gh, 0o755);
@@ -8022,7 +8092,7 @@ fi
 
       writeFileSync(revision, "1970-01-02T01:00:00.000Z");
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      expect(staleSends()).toHaveLength(3);
+      expect(staleSends()).toHaveLength(2);
     } finally {
       clock.mockRestore();
       if (originalPath === undefined) delete process.env.PATH;
@@ -8525,6 +8595,10 @@ else printf '%s\\n' '[]'; fi
       fixture.setThreadProject("director-two", "project-two");
       fixture.setThreadProject("orchestrator-two", "project-two");
       fixture.db.prepare("UPDATE repository_targets SET remote_url = 'https://github.com/example/project-two.git' WHERE project_id = ?").run("project-two");
+      const projectTwoConfigRow = fixture.db.prepare("SELECT canonical_config_json FROM project_config_revisions WHERE project_id = ? AND config_revision = 1").get("project-two") as { canonical_config_json: string };
+      const projectTwoConfig = JSON.parse(projectTwoConfigRow.canonical_config_json) as { extensions: { bbCollab: { githubIssues: { repositoryMappings: Array<{ repo: string }> } } } };
+      projectTwoConfig.extensions.bbCollab.githubIssues.repositoryMappings[0]!.repo = "project-two";
+      fixture.db.prepare("UPDATE project_config_revisions SET canonical_config_json = ? WHERE project_id = ? AND config_revision = 1").run(JSON.stringify(projectTwoConfig), "project-two");
       bindFixtureGithubIssue(fixture.db, 205, WORK_ITEM_ID, PROJECT_ID);
       bindFixtureGithubIssue(fixture.db, 206, WORK_ITEM_ID, "project-two", "project-two");
       let releaseProjectA!: () => void;
@@ -13697,8 +13771,9 @@ else printf '%s\\n' '[]'; fi
     const gh = join(bin, "gh");
     const calls = join(bin, "calls");
     writeFileSync(gh, `#!/bin/sh
+if [ -z "\${GH_HOST:-}" ]; then exit 65; fi
 printf '%s\n' "$@" >> "${calls}"
-if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "401" ]; then printf '%s\n' '{"number":401,"title":"Existing","body":"Existing","state":"OPEN","stateReason":"","labels":[],"updatedAt":"2026-08-19T00:00:00Z"}'; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "401" ]; then printf '%s\n' '{"number":401,"title":"Existing","body":"Existing","state":"OPEN","stateReason":"","labels":[],"updatedAt":"2026-08-19T00:00:00Z","url":"https://github.test/example/project/issues/401"}'; exit 0; fi
 exit 1
 `);
     chmodSync(gh, 0o755);
