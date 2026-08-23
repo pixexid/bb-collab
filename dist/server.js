@@ -24755,7 +24755,8 @@ async function dispatchEnvironmentPreflight(bb, projectId, environment, proof) {
     return { outcome: "REPO_TARGET_FOREIGN", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "dispatch requires one exact host managed-worktree environment" };
   }
   const baseBranch = environment.workspace.baseBranch.kind === "default" ? proof.defaultBranch : environment.workspace.baseBranch.name;
-  if (environment.hostId !== proof.hostId || baseBranch !== proof.defaultBranch) {
+  const exactDefaultBase = baseBranch === proof.defaultBranch || baseBranch === `origin/${proof.defaultBranch}`;
+  if (environment.hostId !== proof.hostId || !exactDefaultBase) {
     return { outcome: "REPO_TARGET_FOREIGN", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "dispatch environment does not match the exact target host and default branch" };
   }
   try {

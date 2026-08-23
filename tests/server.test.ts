@@ -5190,7 +5190,9 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
 
     const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
       request: { ...transitionRequest(fixture.fenceToken, "in_progress", 2), expectedConfigRevision: 2 },
-      spawn: dispatchSpawn(fixture.orchestratorThreadId),
+      spawn: dispatchSpawn(fixture.orchestratorThreadId, {
+        environment: { type: "host", hostId: "host-main", workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: "origin/main" } } },
+      }),
     }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
     expect(result.outcome).toBe("OK");
     expect(fixture.db.prepare("SELECT config_revision, lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ config_revision: 1, lifecycle_state: "in_progress", resource_revision: 3 });
@@ -5234,6 +5236,9 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     ["unmanaged", { type: "host", hostId: "host-main", workspace: { type: "unmanaged", path: "/workspace/project", branch: { kind: "existing", name: "main" } } }],
     ["reuse", { type: "reuse", environmentId: "environment-foreign" }],
     ["foreign host", { type: "host", hostId: "host-foreign", workspace: { type: "managed-worktree", baseBranch: { kind: "default" } } }],
+    ["foreign branch", { type: "host", hostId: "host-main", workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: "origin/other" } } }],
+    ["foreign remote", { type: "host", hostId: "host-main", workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: "fork/main" } } }],
+    ["arbitrary base", { type: "host", hostId: "host-main", workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: "92051c1f915d32efe3f9a45f52a6ca6cbdd18a4c" } } }],
   ] as const)("refuses %s or foreign dispatch environment before intent", async (_name, environment) => {
     const fixture = await fleetWatchdogFixture(0, true, 1, false);
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
