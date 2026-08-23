@@ -184,19 +184,63 @@ describe("inbox unread nav indicator", () => {
     expect(row.children.length).toBe(originalChildren);
     expect(row.getAttribute("aria-label")).toBe("Inbox, 4 unread operator messages");
 
-    paintInboxNavUnread(document, 0);
+    // #when the host unmounts and remounts its nav subtree
+    region.remove();
+    const unmounted = paintInboxNavUnread(document, 0);
+    expect(unmounted.matched).toBe(false);
+    expect(unmounted.matched === false ? unmounted.reason : "").toContain(INBOX_NAV_REGION_SELECTOR);
     expect(asset.getAttribute("class")).toBe(originalClass);
     expect(asset.getAttribute("style")).toBe(originalStyle);
     expect(row.hasAttribute("aria-label")).toBe(false);
     expect(row.hasAttribute("title")).toBe(false);
-
-    // #when the host unmounts and remounts its nav subtree
-    region.remove();
-    expect(document.querySelector(INBOX_NAV_REGION_SELECTOR)).toBeNull();
     navRegion({ inboxGlyph: null, inboxAsset: ENVELOPE_ASSET, lanesGlyph: GIT_BRANCH });
     expect(paintInboxNavUnread(document, 1)).toEqual({ matched: true });
     expect(inboxGlyph()?.className).toBe("host-asset text-primary");
     expect(inboxRow().getAttribute("aria-label")).toBe("Inbox, 1 unread operator message");
+    expect(document.querySelector("[data-bb-collab-inbox-unread]")).toBeNull();
+  });
+
+  it("clears a painted row when the host region drifts and reports the drift", () => {
+    // #given a painted asset row with host-owned attributes
+    const region = navRegion({ inboxGlyph: null, inboxAsset: ENVELOPE_ASSET, lanesGlyph: GIT_BRANCH });
+    const row = inboxRow();
+    const asset = inboxGlyph()!;
+    row.setAttribute("aria-label", "Inbox");
+    row.setAttribute("title", "Open Inbox");
+    paintInboxNavUnread(document, 3);
+
+    // #when the host renames the region
+    region.setAttribute("data-testid", "plugin-nav-sidebar-renamed");
+    const drift = paintInboxNavUnread(document, 0);
+
+    // #then stale plugin state is gone even though the row is not rediscoverable
+    expect(drift.matched).toBe(false);
+    expect(drift.matched === false ? drift.reason : "").toContain(INBOX_NAV_REGION_SELECTOR);
+    expect(asset.className).toBe("host-asset");
+    expect(row.getAttribute("aria-label")).toBe("Inbox");
+    expect(row.getAttribute("title")).toBe("Open Inbox");
+    expect(document.querySelector("[data-bb-collab-inbox-unread]")).toBeNull();
+  });
+
+  it("clears a painted row when the host title drifts and reports the drift", () => {
+    // #given a painted SVG row with host-owned attributes
+    navRegion({ lanesGlyph: GIT_BRANCH });
+    const row = inboxRow();
+    const glyph = inboxGlyph()!;
+    row.setAttribute("aria-label", "Inbox");
+    row.setAttribute("title", "Open Inbox");
+    paintInboxNavUnread(document, 3);
+
+    // #when the host relabels the row
+    row.lastElementChild!.textContent = "Messages";
+    const drift = paintInboxNavUnread(document, 0);
+
+    // #then stale plugin state is gone even though the row is not rediscoverable
+    expect(drift.matched).toBe(false);
+    expect(drift.matched === false ? drift.reason : "").toContain("0 of the 2 rows");
+    expect(glyph.classList.contains("text-primary")).toBe(false);
+    expect(row.getAttribute("aria-label")).toBe("Inbox");
+    expect(row.getAttribute("title")).toBe("Open Inbox");
     expect(document.querySelector("[data-bb-collab-inbox-unread]")).toBeNull();
   });
 

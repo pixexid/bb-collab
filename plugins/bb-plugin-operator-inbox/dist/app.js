@@ -262,7 +262,7 @@ var INBOX_NAV_ROW_TITLE = "Inbox";
 var LANES_NAV_ROW_TITLE = "Lanes";
 var INBOX_INDICATOR_BROKEN_TITLE = "Inbox unread indicator broken";
 var LEGACY_UNREAD_MARKER = "[data-bb-collab-inbox-unread]";
-var navSnapshots = /* @__PURE__ */ new WeakMap();
+var paintedRows = /* @__PURE__ */ new Map();
 var RENDERING_ATTRIBUTES = [
   "d",
   "points",
@@ -308,26 +308,49 @@ function restoreAttribute(element, name, value) {
   if (value === null) element.removeAttribute(name);
   else element.setAttribute(name, value);
 }
-function restoreNavState(row) {
-  row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
-  const snapshot = navSnapshots.get(row);
-  if (snapshot === void 0) return;
+function restoreSnapshot(row, snapshot) {
   restoreAttribute(row, "aria-label", snapshot.ariaLabel);
   restoreAttribute(row, "title", snapshot.title);
   restoreAttribute(snapshot.glyph, "class", snapshot.glyphClass);
   restoreAttribute(snapshot.glyph, "style", snapshot.glyphStyle);
-  navSnapshots.delete(row);
+}
+function clearPaintedRows(keep) {
+  for (const [row, snapshot] of paintedRows) {
+    if (row === keep) continue;
+    row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
+    restoreSnapshot(row, snapshot);
+    paintedRows.delete(row);
+  }
+}
+function cleanupDetachedRows(root) {
+  const owner = root;
+  for (const [row, snapshot] of paintedRows) {
+    if (row.isConnected || owner.contains(row)) continue;
+    restoreSnapshot(row, snapshot);
+    paintedRows.delete(row);
+  }
+}
+function restoreNavState(row) {
+  row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
+  const snapshot = paintedRows.get(row);
+  if (snapshot === void 0) return;
+  restoreSnapshot(row, snapshot);
+  paintedRows.delete(row);
 }
 function paintInboxNavUnread(root, unread) {
+  cleanupDetachedRows(root);
   const rows = navRows(root);
   if (rows === null) {
+    clearPaintedRows();
     return { matched: false, reason: `no element matches ${INBOX_NAV_REGION_SELECTOR}` };
   }
   const matches = rowsTitled(rows, INBOX_NAV_ROW_TITLE);
   if (matches.length !== 1) {
+    clearPaintedRows();
     return { matched: false, reason: `${matches.length} of the ${rows.length} rows in ${INBOX_NAV_REGION_SELECTOR} are titled ${JSON.stringify(INBOX_NAV_ROW_TITLE)}, expected exactly 1` };
   }
   const row = matches[0];
+  clearPaintedRows(row);
   const resolution = resolveGlyph(row);
   if ("reason" in resolution) {
     restoreNavState(row);
@@ -338,9 +361,9 @@ function paintInboxNavUnread(root, unread) {
     restoreNavState(row);
     return { matched: true };
   }
-  const current = navSnapshots.get(row);
+  const current = paintedRows.get(row);
   if (current === void 0) {
-    navSnapshots.set(row, {
+    paintedRows.set(row, {
       ariaLabel: row.getAttribute("aria-label"),
       title: row.getAttribute("title"),
       glyph,
@@ -350,12 +373,12 @@ function paintInboxNavUnread(root, unread) {
   } else if (current.glyph !== glyph) {
     restoreAttribute(current.glyph, "class", current.glyphClass);
     restoreAttribute(current.glyph, "style", current.glyphStyle);
-    navSnapshots.set(row, { ...current, glyph, glyphClass: glyph.getAttribute("class"), glyphStyle: glyph.getAttribute("style") });
+    paintedRows.set(row, { ...current, glyph, glyphClass: glyph.getAttribute("class"), glyphStyle: glyph.getAttribute("style") });
   }
   row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
   glyph.classList.add("text-primary");
   const countLabel = `${unread} unread operator ${unread === 1 ? "message" : "messages"}`;
-  const snapshot = navSnapshots.get(row);
+  const snapshot = paintedRows.get(row);
   row.setAttribute("aria-label", `${snapshot.ariaLabel ?? INBOX_NAV_ROW_TITLE}, ${countLabel}`);
   row.setAttribute("title", `${snapshot.title === null ? "" : `${snapshot.title} \u2014 `}${countLabel}`);
   return { matched: true };

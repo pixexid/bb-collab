@@ -13,7 +13,7 @@ export const INBOX_INDICATOR_BROKEN_TITLE = "Inbox unread indicator broken";
 const LEGACY_UNREAD_MARKER = "[data-bb-collab-inbox-unread]";
 type NavSnapshot = { ariaLabel: string | null; title: string | null; glyph: Element; glyphClass: string | null; glyphStyle: string | null };
 type GlyphResolution = { element: Element } | { reason: string };
-const navSnapshots = new WeakMap<Element, NavSnapshot>();
+const paintedRows = new Map<Element, NavSnapshot>();
 
 // Geometry, never class names: two host icons differ by the shape they draw,
 // and the minified class of a host row tells us nothing about which glyph it is.
@@ -53,29 +53,55 @@ function restoreAttribute(element: Element, name: string, value: string | null):
   else element.setAttribute(name, value);
 }
 
-function restoreNavState(row: Element): void {
-  row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
-  const snapshot = navSnapshots.get(row);
-  if (snapshot === undefined) return;
+function restoreSnapshot(row: Element, snapshot: NavSnapshot): void {
   restoreAttribute(row, "aria-label", snapshot.ariaLabel);
   restoreAttribute(row, "title", snapshot.title);
   restoreAttribute(snapshot.glyph, "class", snapshot.glyphClass);
   restoreAttribute(snapshot.glyph, "style", snapshot.glyphStyle);
-  navSnapshots.delete(row);
+}
+
+function clearPaintedRows(keep?: Element): void {
+  for (const [row, snapshot] of paintedRows) {
+    if (row === keep) continue;
+    row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
+    restoreSnapshot(row, snapshot);
+    paintedRows.delete(row);
+  }
+}
+
+function cleanupDetachedRows(root: ParentNode): void {
+  const owner = root as Node;
+  for (const [row, snapshot] of paintedRows) {
+    if (row.isConnected || owner.contains(row)) continue;
+    restoreSnapshot(row, snapshot);
+    paintedRows.delete(row);
+  }
+}
+
+function restoreNavState(row: Element): void {
+  row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
+  const snapshot = paintedRows.get(row);
+  if (snapshot === undefined) return;
+  restoreSnapshot(row, snapshot);
+  paintedRows.delete(row);
 }
 
 export function paintInboxNavUnread(root: ParentNode, unread: number): InboxNavPaint {
+  cleanupDetachedRows(root);
   const rows = navRows(root);
   if (rows === null) {
+    clearPaintedRows();
     return { matched: false, reason: `no element matches ${INBOX_NAV_REGION_SELECTOR}` };
   }
   const matches = rowsTitled(rows, INBOX_NAV_ROW_TITLE);
   if (matches.length !== 1) {
     // Two matches is the wrong-but-plausible death: another plugin's row is
-    // titled Inbox too, and the dot would land on a row that is not ours.
+    // titled Inbox too, and the accent would land on a row that is not ours.
+    clearPaintedRows();
     return { matched: false, reason: `${matches.length} of the ${rows.length} rows in ${INBOX_NAV_REGION_SELECTOR} are titled ${JSON.stringify(INBOX_NAV_ROW_TITLE)}, expected exactly 1` };
   }
   const row = matches[0]!;
+  clearPaintedRows(row);
   const resolution = resolveGlyph(row);
   if ("reason" in resolution) {
     restoreNavState(row);
@@ -86,9 +112,9 @@ export function paintInboxNavUnread(root: ParentNode, unread: number): InboxNavP
     restoreNavState(row);
     return { matched: true };
   }
-  const current = navSnapshots.get(row);
+  const current = paintedRows.get(row);
   if (current === undefined) {
-    navSnapshots.set(row, {
+    paintedRows.set(row, {
       ariaLabel: row.getAttribute("aria-label"),
       title: row.getAttribute("title"),
       glyph,
@@ -98,12 +124,12 @@ export function paintInboxNavUnread(root: ParentNode, unread: number): InboxNavP
   } else if (current.glyph !== glyph) {
     restoreAttribute(current.glyph, "class", current.glyphClass);
     restoreAttribute(current.glyph, "style", current.glyphStyle);
-    navSnapshots.set(row, { ...current, glyph, glyphClass: glyph.getAttribute("class"), glyphStyle: glyph.getAttribute("style") });
+    paintedRows.set(row, { ...current, glyph, glyphClass: glyph.getAttribute("class"), glyphStyle: glyph.getAttribute("style") });
   }
   row.querySelector(LEGACY_UNREAD_MARKER)?.remove();
   glyph.classList.add("text-primary");
   const countLabel = `${unread} unread operator ${unread === 1 ? "message" : "messages"}`;
-  const snapshot = navSnapshots.get(row)!;
+  const snapshot = paintedRows.get(row)!;
   row.setAttribute("aria-label", `${snapshot.ariaLabel ?? INBOX_NAV_ROW_TITLE}, ${countLabel}`);
   row.setAttribute("title", `${snapshot.title === null ? "" : `${snapshot.title} — `}${countLabel}`);
   return { matched: true };

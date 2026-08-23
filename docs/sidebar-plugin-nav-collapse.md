@@ -84,7 +84,11 @@ that the Inbox nav row must carry unread state before the panel is opened;
 the gap is filed upstream as get-bb/bb#1852.
 `plugins/bb-plugin-operator-inbox/src/inbox-nav-indicator.ts`
 therefore matches the host `data-testid` region and the row's visible title, and
-paints a dot on it.
+resolves the host-rendered `EnvelopeSimple` branding glyph and accents that
+glyph when unread messages exist. BB compact chrome normally renders the
+plugin-relative SVG as a `[data-plugin-icon-asset]` CSS-mask element; the
+indicator targets that element first and retains an SVG fallback for hosts or
+fixtures that render the icon as SVG.
 
 **SCOPE: the inbox unread indicator only. The refusal remains doctrine
 everywhere else.** Ordering, visibility, collapse, and every other row stay
@@ -99,24 +103,36 @@ into a visible `Inbox unread indicator broken` alert in the thread list — the
 one plugin surface that is on screen without opening a panel — and a recorded
 `console.error` carrying the reason. Zero-match is never silently nothing.
 
-The switch covers two deaths, because the indicator has two:
+The switch covers the indicator's deaths, including stale state left behind by
+host redraws:
 
-- **Zero-match.** The region test id is renamed, or the row is relabelled, and
-  nothing matches. `paintInboxNavUnread` reports it.
+- **Zero-match and stale cleanup.** The region test id is renamed, or the row
+  is relabelled, and nothing matches. `paintInboxNavUnread` reports it and
+  restores every previously painted row's glyph class/style and host
+  `aria-label`/`title` before returning. Detached rows are swept from the
+  cleanup-capable painted-row map on each paint, and the panel unmount cleanup
+  paints zero as well.
 - **Valid but wrong.** Something plausible is still drawn and the operator reads
-  it as truth. Two shapes of it are detectable, and both report broken: a
-  *second* row also titled `Inbox`, where the dot would land on a row that is not
-  ours; and the two rows of this plugin drawing the *same* glyph though they
-  declare different icons, which is the precedence collapse and the
+  it as truth. Missing or ambiguous asset/SVG glyph targets fail closed. Two
+  shapes of it are detectable, and both report broken: a *second* row also
+  titled `Inbox`, where the accent would land on a row that is not ours; and
+  the two rows of this plugin drawing the *same* glyph though they declare
+  different icons, which is the precedence collapse and the
   unknown-name-falls-back-to-default case at once. `inspectInboxNavGlyph` reads
   drawn geometry rather than class names — a minified host class says nothing
   about which glyph it is — and compares `Inbox` against the `Lanes` control,
   because a control row is the only thing that tells a collapse apart from a
   fallback. "Geometry" is everything that moves pixels, `transform` and the
   root `viewBox` included, not just `d`: the same path data rotated is a
-  different glyph, and a fingerprint blind to that would raise a false alarm on
-  a legitimate re-theme. This switch is the retirement signal for
+  different glyph, and a fingerprint blind to that would raise a false alarm
+  on a legitimate re-theme. This switch is the retirement signal for
   get-bb/bb#1852, and a signal that fires on noise gets muted.
+
+Unread state is non-color-only: the Inbox control receives the exact unread
+count in its accessible label and title. Only the resolved glyph receives the
+live theme `text-primary` token; the nav label is not tinted and no dot, span,
+or layout gutter is added. At zero, or after drift/unmount cleanup, the
+indicator restores the host-owned glyph class/style and aria/title attributes.
 
 **What cannot be detected from inside the plugin, stated plainly:** whether the
 glyph drawn beside `Inbox` is the one `Inbox` *declared*. The host owns the icon
@@ -129,61 +145,37 @@ icons end up identical.* A single row drawing a wrong-but-unique glyph is not
 caught, and `inspectInboxNavGlyph` returns `null` rather than a verdict whenever
 the control row or the geometry is unreadable.
 
-`plugins/bb-plugin-operator-inbox/tests/inbox-nav-indicator.test.tsx` fires the switch on every detectable mode:
-renamed test id, relabelled row, duplicate row, and collapsed glyph.
+`plugins/bb-plugin-operator-inbox/tests/inbox-nav-indicator.test.tsx` fires the
+switch on every detectable mode: renamed test id, relabelled row, duplicate
+row, collapsed glyph, missing/ambiguous glyph, asset-mask paint/update/clear,
+region/title drift cleanup, detached-row cleanup, and SVG fallback.
 
 **RETIREMENT: when get-bb/bb#1852 is resolved upstream, replace this with the
 real affordance and re-close the exception.** Delete the Operator Inbox plugin's
 `src/inbox-nav-indicator.ts`, its test, the poll in its app, and this section.
 
-## Why this plugin declares no `branding.icon`
+## Approved Operator Inbox branding
 
-**If the sidebar logo looks wrong to you and you are about to add
-`branding.icon` to `package.json`: don't. It will collapse `Lanes` and `Inbox`
-to a single glyph and fire the dead-man switch above.** That is the precedence
-collapse the previous section detects but does not explain, so it is explained
-here.
+Operator Inbox deliberately declares the plugin-relative
+`./assets/envelope-simple-duotone.svg` as `bb.branding.icon` and as its Inbox
+panel icon. This is the approved single-Inbox exception to the general
+host-branding refusal: the asset gives compact chrome the Phosphor
+`EnvelopeSimple` shape without trying to mount React in host-owned branding.
+Panel actions continue to use the React Phosphor components directly.
 
-**Precedence is form-independent.** A plugin's manifest `branding.icon`
-overrides every one of its contributions' own icons — whether it is a
-plugin-owned `./assets/*.svg` path or a plain BB icon name. The server's
-`/api/v1/plugins` row emits the raw manifest string with no path-versus-name
-filtering (the path case has its own `iconUrl` field), and the app's icon
-component resolves, after the plugin-owned mask branch, with `o?.icon ?? r` —
-`o.icon` the manifest string, `r` the contribution's own. A plain nullish
-coalesce with no `"./"` test, so the contribution's icon is reached *only when
-the manifest declares none*. Every nav row of a plugin renders through that one
-component and passes the same plugin id, so every row resolves to the same
-glyph. It is not compact-chrome-specific; it is every glyph the plugin draws,
-the sidebar footer action and the Extensions detail included.
+The branding asset is static; it does not carry unread state. The narrow
+indicator above resolves the host's asset-mask element and paints only that
+element with the live theme token, while keeping the Inbox label and layout
+unchanged. It restores host attributes on zero, redraw, title/region drift,
+and unmount cleanup. The branding path does not relax the fail-loud scope:
+unknown or ambiguous glyph resolution still reports `Inbox unread indicator
+broken`, and the host-DOM exception remains limited to this indicator.
 
-Measured with a throwaway plugin declaring two nav panels, `Mail` and
-`GitBranch`, one install, rows read out of the rendered DOM. The app bundle was
-byte-identical across both rows; only the manifest changed:
-
-| `branding.icon` | ProbeAlpha (`Mail`) | ProbeBeta (`GitBranch`) |
-| --- | --- | --- |
-| absent (`logo.light` only) | Mail glyph | GitBranch glyph — **distinct** |
-| `"Toolbox"` | Toolbox glyph | Toolbox glyph — **collapsed** |
-
-So **changing the value does not help** — it moves every row to the new glyph.
-The only thing that restores per-row icons is an *absent* `branding.icon`, and
-that is why `package.json` declares `branding.logo.light: "./assets/logo.svg"`
-and nothing else: `pluginBrandingSchema`'s final `refine` requires at least one
-of `icon` and `logo.light`, so dropping the icon obliges shipping a real logo
-asset. The two are additive rather than either-or, which is exactly the trap —
-adding an icon beside the logo is legal, installs clean, and silently collapses
-the rows.
-
-One rule if a future change does reintroduce one: a plugin-owned `icon` must be
-both `./`-prefixed **and** `.svg`-suffixed. `isPluginOwnedIconPath` is only
-`icon.startsWith("./")`, one half of a `superRefine` condition rather than the
-constraint itself; `.png` and `.webp` are accepted for `logo` only.
-
-Reload-scope is the companion finding and lives upstream on get-bb/bb#1852:
-branding assets are read once at plugin load and served from memory, so
-rewriting the file at runtime changes nothing until the plugin reloads. An icon
-cannot carry live state even when it is not collapsing anything.
+Branding assets are read at plugin load and served by the host. Changing the
+asset requires the normal plugin reload boundary; unread count changes never
+rewrite the asset itself. When get-bb/bb#1852 supplies a host-owned unread
+indicator API, remove this DOM coupling, the indicator poll, its tests, and
+this exception section as described by the retirement boundary above.
 
 ## Smallest host support that unblocks this
 
