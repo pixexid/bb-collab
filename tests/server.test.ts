@@ -797,7 +797,7 @@ async function emitIdleFleet(fixture: Awaited<ReturnType<typeof fleetWatchdogFix
   await new Promise((resolve) => setTimeout(resolve, 1000));
 }
 
-function bindFixtureGithubIssue(db: Database.Database, issueNumber: number, workItemId = WORK_ITEM_ID) {
+function bindFixtureGithubIssue(db: Database.Database, issueNumber: number, workItemId = WORK_ITEM_ID, projectId = PROJECT_ID, repo = GITHUB_REPO) {
   db.prepare(
     `INSERT INTO external_work_refs (
        project_id, work_item_id, provider, owner, repo, issue_number, projection_state,
@@ -805,7 +805,7 @@ function bindFixtureGithubIssue(db: Database.Database, issueNumber: number, work
        observed_external_revision, observed_external_digest, last_idempotency_key,
        last_request_digest, created_at_ms, updated_at_ms
      ) VALUES (?, ?, 'github', ?, ?, ?, 'current', 2, 2, ?, 'fixture', ?, 'fixture-ref', ?, 1, 1)`,
-  ).run(PROJECT_ID, workItemId, GITHUB_OWNER, GITHUB_REPO, issueNumber, sha256("fixture-desired"), sha256("fixture-observed"), sha256("fixture-request"));
+  ).run(projectId, workItemId, GITHUB_OWNER, repo, issueNumber, sha256("fixture-desired"), sha256("fixture-observed"), sha256("fixture-request"));
 }
 
 function installStartableQueueFixture(issueNumber: number) {
@@ -3524,9 +3524,10 @@ describe("bb-collab plugin boundary", () => {
     expect(fleetWatchdogCompositeKey("a\u0000b", "c")).not.toBe(fleetWatchdogCompositeKey("a", "b\u0000c"));
 
     const holder = (project_id: string, role_id: string, role_generation: number, execution_attempt_id: string, thread_id: string) => ({ project_id, role_id, role_generation, execution_attempt_id, thread_id });
-    expect(fleetWatchdogIssueReopenedKey("a\u0000b", "c")).not.toBe(fleetWatchdogIssueReopenedKey("a", "b\u0000c"));
-    expect(fleetWatchdogMergeCloseKey("a\u0000b", "c", "d")).not.toBe(fleetWatchdogMergeCloseKey("a", "b\u0000c", "d"));
-    expect(fleetWatchdogBlockerFiredKey("a\u0000b", "c")).not.toBe(fleetWatchdogBlockerFiredKey("a", "b\u0000c"));
+    expect(fleetWatchdogIssueReopenedKey("project", "a\u0000b", "c")).not.toBe(fleetWatchdogIssueReopenedKey("project", "a", "b\u0000c"));
+    expect(fleetWatchdogMergeCloseKey("project", "a\u0000b", "c", "d")).not.toBe(fleetWatchdogMergeCloseKey("project", "a", "b\u0000c", "d"));
+    expect(fleetWatchdogBlockerFiredKey("project", "a\u0000b", "c")).not.toBe(fleetWatchdogBlockerFiredKey("project", "a", "b\u0000c"));
+    expect(fleetWatchdogBlockerFiredKey("project-a", "same-work-item", "same-subject")).not.toBe(fleetWatchdogBlockerFiredKey("project-b", "same-work-item", "same-subject"));
     expect(fleetWatchdogRoleLivenessKey(holder("a\u0000b", "c", 1, "d", "e"))).not.toBe(fleetWatchdogRoleLivenessKey(holder("a", "b\u0000c", 1, "d", "e")));
     expect(fleetWatchdogEpisodeKey(holder("a", "b", 1, "c", "d"), "e\u0000f")).not.toBe(fleetWatchdogEpisodeKey(holder("a", "b", 1, "c", "d\u0000e"), "f"));
     expect(fleetWatchdogScope("degrade", "a:b", "c")).not.toBe(fleetWatchdogScope("degrade", "a", "b:c"));
@@ -4328,7 +4329,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
     expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
       level: "warn",
-      message: expect.stringMatching(/^fleet-watchdog coverage=degraded seats=2 lanes=0 cannotSee=platform-parentage:proj_test:Error: thread inventory unavailable$/),
+      message: expect.stringMatching(/^fleet-watchdog coverage=degraded seats=2 lanes=0 cannotSee=platform-parentage:proj_test:Error: native-lane-inventory-timeout$/),
     }));
   });
 
@@ -7760,6 +7761,59 @@ fi
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").map(([input]) => (input as { threadId: string }).threadId).filter((threadId) => threadId === "director-two")).toEqual(["director-two"]);
     } finally {
       clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("evaluates an actionable project before an unresolved other project's lane inventory settles", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-concurrent-lane-inventory-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = api ] && [ "$2" = repos/example/project-two/issues ]; then printf '%s\\n' '[[{"number":206,"labels":[{"name":"queue:startable"}]}]]';
+elif [ "$1" = api ]; then printf '%s\\n' '[[{"number":205,"labels":[{"name":"queue:startable"}]}]]';
+else printf '%s\\n' '[]'; fi
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${originalPath ? `:${originalPath}` : ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      cloneProject(fixture.db, PROJECT_ID, "project-two");
+      fixture.setThreadProject("director-two", "project-two");
+      fixture.setThreadProject("orchestrator-two", "project-two");
+      fixture.db.prepare("UPDATE repository_targets SET remote_url = 'https://github.com/example/project-two.git' WHERE project_id = ?").run("project-two");
+      bindFixtureGithubIssue(fixture.db, 205, WORK_ITEM_ID, PROJECT_ID);
+      bindFixtureGithubIssue(fixture.db, 206, WORK_ITEM_ID, "project-two", "project-two");
+      let releaseProjectA!: () => void;
+      const projectAUnsettled = new Promise<void>((resolve) => { releaseProjectA = resolve; });
+      fixture.host.harness.sdk.stub("threads.list", (async ({ projectId }: { projectId?: string }) => {
+        if (projectId === PROJECT_ID) {
+          await projectAUnsettled;
+          return [];
+        }
+        return projectId === "project-two"
+          ? [
+            makeThreadResponse({ id: "director-two", projectId: "project-two", status: "idle", updatedAt: 0 }),
+            makeThreadResponse({ id: "orchestrator-two", projectId: "project-two", status: "idle", updatedAt: 0 }),
+          ]
+          : [];
+      }) as never);
+
+      let settled = false;
+      const cycle = fixture.host.harness.runSchedule("fleet-watchdog").finally(() => { settled = true; });
+      await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toContainEqual([
+        expect.objectContaining({
+          threadId: "orchestrator-two",
+          input: [expect.objectContaining({ text: expect.stringContaining("startable queue has 1 issue") })],
+        }),
+      ]));
+      expect(settled).toBe(false);
+      releaseProjectA();
+      await cycle;
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").map(([input]) => (input as { threadId: string }).threadId)).toEqual(["orchestrator-two", "thread-fleet-orchestrator"]);
+    } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
       rmSync(bin, { recursive: true, force: true });

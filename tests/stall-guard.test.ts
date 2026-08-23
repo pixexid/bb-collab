@@ -51,6 +51,28 @@ function absentArtifact() {
 }
 
 describe("stall-guard artifact cycle", () => {
+  it("retries a transient initial persistence read", async () => {
+    let reads = 0;
+    const cycle = createStallGuardCycle({
+      readProjectIds: () => ["project-a"],
+      readRoleHolders: () => [holder(1, "same-thread", "project-a")],
+      readArtifact: async () => absentArtifact(),
+      wakeRole: async () => ({ attempted: false, delivered: false, refusal: "policy" }),
+      persistence: {
+        read: async () => {
+          reads += 1;
+          if (reads === 1) throw new Error("transient-read");
+          return {};
+        },
+        write: async () => undefined,
+      },
+    });
+
+    await expect(cycle.cycle("project-a")).rejects.toThrow("transient-read");
+    await expect(cycle.cycle("project-a")).resolves.toMatchObject({ outcome: "OK" });
+    expect(reads).toBe(2);
+  });
+
   it("retargets the current generation after succession without a restart", async () => {
     let holders = [holder(1, "old-holder")];
     let currentArtifact = absentArtifact();
@@ -229,6 +251,152 @@ describe("stall-guard artifact cycle", () => {
     await cycle.cycle();
 
     expect(wakeRole).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses canonical project inventory and isolates blind slow reads with duplicate identities", async () => {
+    const store = kvPersistence();
+    const holders = [holder(1, "same-thread", "project-a"), holder(1, "same-thread", "project-b"), holder(1, "orphan-thread", "project-c")];
+    const before = absentArtifact();
+    const after = artifact("changed");
+    const current: Record<string, StallGuardArtifact[] | null> = { "project-a": before, "project-b": before };
+    const reads: string[] = [];
+    let slowProject = false;
+    let releaseSlow!: () => void;
+    const slow = new Promise<void>((resolve) => { releaseSlow = resolve; });
+    const wakeRole = vi.fn().mockResolvedValue({ attempted: true, delivered: true });
+    const cycle = createStallGuardCycle({
+      readProjectIds: () => ["project-a", "project-b"],
+      readRoleHolders: () => holders,
+      readArtifact: async (projectId) => {
+        reads.push(projectId);
+        if (slowProject && projectId === "project-a") await slow;
+        return current[projectId] ?? null;
+      },
+      readQueueHead: () => ({ workItemId: "same-work-item", resourceRevision: 1 }),
+      wakeRole,
+      persistence: store.persistence,
+    });
+
+    await cycle.cycle();
+    current["project-a"] = null;
+    current["project-b"] = after;
+    slowProject = true;
+    reads.length = 0;
+    const next = cycle.cycle();
+    await vi.waitFor(() => expect(reads).toContain("project-b"));
+    releaseSlow();
+    await next;
+
+    expect(wakeRole).toHaveBeenCalledTimes(1);
+    expect(wakeRole.mock.calls[0]?.[0]).toMatchObject({ projectId: "project-b", threadId: "same-thread", queueHeadId: "same-work-item" });
+    expect(reads).not.toContain("project-c");
+  });
+
+  it("does not baseline malformed or unavailable artifact evidence", async () => {
+    const store = kvPersistence();
+    let current: StallGuardArtifact[] | null = absentArtifact();
+    const wakeRole = vi.fn().mockResolvedValue({ attempted: true, delivered: true });
+    const cycle = createStallGuardCycle({
+      readProjectIds: () => [PROJECT_ID],
+      readRoleHolders: () => [holder(1, "current-holder")],
+      readArtifact: async () => current,
+      wakeRole,
+      persistence: store.persistence,
+    });
+
+    await cycle.cycle();
+    const baseline = await store.persistence.read();
+    current = [{ id: "artifact", unavailable: true, value: null }];
+    await cycle.cycle();
+    expect(await store.persistence.read()).toEqual(baseline);
+    current = [];
+    await cycle.cycle();
+    expect(await store.persistence.read()).toEqual(baseline);
+    expect(wakeRole).not.toHaveBeenCalled();
+  });
+
+  it("serializes same-project cycles without blocking another project or duplicating a wake", async () => {
+    const store = kvPersistence();
+    const reads: string[] = [];
+    const current = new Map<string, StallGuardArtifact[]>([["project-a", absentArtifact()], ["project-b", absentArtifact()]]);
+    let blockNextA = false;
+    let releaseA!: () => void;
+    const slowA = new Promise<void>((resolve) => { releaseA = resolve; });
+    const wakeRole = vi.fn().mockResolvedValue({ attempted: true, delivered: true });
+    const readArtifact = vi.fn(async (projectId: string) => {
+      reads.push(projectId);
+      if (projectId === "project-a" && blockNextA) {
+        blockNextA = false;
+        await slowA;
+      }
+      return current.get(projectId)!;
+    });
+    const cycle = createStallGuardCycle({
+      readProjectIds: () => ["project-a", "project-b"],
+      readRoleHolders: () => [holder(1, "same-thread", "project-a"), holder(1, "same-thread", "project-b")],
+      readArtifact,
+      wakeRole,
+      persistence: store.persistence,
+    });
+
+    await cycle.cycle();
+    current.set("project-a", artifact("changed-a"));
+    current.set("project-b", artifact("changed-b"));
+    reads.length = 0;
+    blockNextA = true;
+    const firstA = cycle.cycle("project-a");
+    const secondA = cycle.cycle("project-a");
+    const firstB = cycle.cycle("project-b");
+    await vi.waitFor(() => expect(reads).toEqual(["project-a", "project-b"]));
+    await vi.waitFor(() => expect(wakeRole).toHaveBeenCalledTimes(1));
+    expect(wakeRole.mock.calls[0]?.[0]).toMatchObject({ projectId: "project-b" });
+    releaseA();
+    await Promise.all([firstA, secondA, firstB]);
+
+    expect(wakeRole).toHaveBeenCalledTimes(2);
+    expect(wakeRole.mock.calls.map(([role]) => (role as { projectId: string }).projectId)).toEqual(["project-b", "project-a"]);
+    expect(await store.persistence.read()).toMatchObject({
+      '["project-a","project-orchestrator"]': JSON.stringify(artifact("changed-a")),
+      '["project-b","project-orchestrator"]': JSON.stringify(artifact("changed-b")),
+    });
+  });
+
+  it("recovers a failed delivered-wake commit without redelivery", async () => {
+    let durable: Record<string, string> = {};
+    let artifactValue = "baseline";
+    let failNextWrite = false;
+    let wakes = 0;
+    const options = {
+      readProjectIds: () => ["project-a"],
+      readRoleHolders: () => [holder(1, "same-thread", "project-a")],
+      readArtifact: async () => [{ id: "artifact", unavailable: false, value: artifactValue }],
+      wakeRole: async () => {
+        wakes += 1;
+        return { attempted: true as const, delivered: true as const };
+      },
+      persistence: {
+        read: async () => durable,
+        write: async (next: Record<string, string>) => {
+          if (failNextWrite) {
+            failNextWrite = false;
+            throw new Error("short-commit-failure");
+          }
+          durable = next;
+        },
+      },
+    };
+    const cycle = createStallGuardCycle(options);
+
+    await cycle.cycle("project-a");
+    artifactValue = "changed";
+    failNextWrite = true;
+    await expect(cycle.cycle("project-a")).rejects.toThrow("short-commit-failure");
+    await expect(cycle.cycle("project-a")).resolves.toMatchObject({ outcome: "OK" });
+    expect(wakes).toBe(1);
+
+    const restarted = createStallGuardCycle(options);
+    await restarted.cycle("project-a");
+    expect(wakes).toBe(1);
   });
 
   it("baselines a first artifact snapshot without waking", async () => {

@@ -870,4 +870,50 @@ describe("lane awareness", () => {
       vi.useRealTimers();
     }
   });
+
+  it("merges concurrent project episode commits after a slow write", async () => {
+    let durable: Record<string, string> = {};
+    let writeCount = 0;
+    let releaseFirst!: () => void;
+    let markFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+    const firstBlocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const wakes: string[] = [];
+    const detector = createIdleFleetDetector({
+      debounceMs: 0,
+      read: async (probe) => ({
+        kind: "ready",
+        episodeKey: `episode-${probe.projectId}`,
+        role: { projectId: probe.projectId, roleId: "project-orchestrator", roleGeneration: 1, executionAttemptId: "attempt", threadId: probe.threadId, queueHeadId: "head", idleAgeMs: 0 },
+        message: "wake",
+      }),
+      readRearmProbes: async () => [],
+      wake: async ({ probe }) => { wakes.push(probe.projectId); return true; },
+      onBlind: () => undefined,
+      persistence: {
+        read: async () => durable,
+        write: async (next) => {
+          writeCount += 1;
+          if (writeCount === 1) {
+            markFirstStarted();
+            await firstBlocked;
+          }
+          durable = next;
+        },
+      },
+    });
+
+    detector.arm({ projectId: "project-a", threadId: "thread-a", idleEpisode: "a" });
+    await firstStarted;
+    detector.arm({ projectId: "project-b", threadId: "thread-b", idleEpisode: "b" });
+    await vi.waitFor(() => expect(wakes).toEqual(["project-a", "project-b"]));
+    releaseFirst();
+    await vi.waitFor(() => expect(writeCount).toBe(2));
+    await detector.stop();
+
+    expect(durable).toEqual({
+      '["project-a","thread-a"]': "episode-project-a",
+      '["project-b","thread-b"]': "episode-project-b",
+    });
+  });
 });
