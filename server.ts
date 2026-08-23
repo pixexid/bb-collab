@@ -997,6 +997,7 @@ function dispatchThreadShape(thread: unknown): thread is DispatchThread {
 }
 
 async function dispatchThreadInventory(bb: BbPluginApi, projectId: string): Promise<DispatchThread[]> {
+  // Native threads.list is authoritative over complete active and archived populations; deleted history is not listable evidence.
   const [active, archived] = await Promise.all([
     listAllProjectThreads((args) => bb.sdk.threads.list(args), projectId),
     listAllProjectThreads((args) => bb.sdk.threads.list({ ...args, archived: true }), projectId),
@@ -1077,31 +1078,18 @@ async function reconcileDispatchIntent(
     return dispatchRecoveryRefusal(request.projectId, "replay title does not match the recorded dispatch title", { intent: intentResult });
   }
   const expectedTitle = intent.title ?? replayTitle;
+  const dispatchMarkerPattern = /\[dispatch:[^\]\r\n]+\]/gu;
+  const dispatchMarkers = threads.flatMap((thread) => thread.title?.match(dispatchMarkerPattern) ?? []);
   const marked = threads.filter((thread) => thread.title?.includes(marker) === true);
   const exact = marked.filter((thread) =>
     thread.parentThreadId === intent.parentThreadId &&
     thread.archivedAt === null &&
-    thread.deletedAt === null &&
     thread.title === `${expectedTitle} ${marker}`,
   );
-  const legacySibling = intent.title === null && threads.some((thread) =>
-    thread.parentThreadId === intent.parentThreadId && (exact.length !== 1 || thread.id !== exact[0]!.id),
-  );
-  if (marked.length > 1 || exact.length > 1 || (marked.length === 1 && exact.length !== 1) || legacySibling) {
+  if (dispatchMarkers.some((candidate) => candidate !== marker) || marked.length > 1 || exact.length > 1 || (marked.length === 1 && exact.length !== 1)) {
     return dispatchRecoveryRefusal(request.projectId, "native dispatch evidence is foreign, multiple, or not bound to the recorded parent", { intent: intentResult, matches: marked.map((thread) => ({ id: thread.id, parentThreadId: thread.parentThreadId, title: thread.title })) });
   }
-  if (exact.length === 1) {
-    if (exact[0]!.archivedAt !== null || exact[0]!.deletedAt !== null) {
-      return dispatchRecoveryRefusal(request.projectId, "the exact dispatch thread is archived or deleted; refusing duplicate spawn or binding", { intent: intentResult, thread: exact[0] });
-    }
-    return finalizeDispatchIntent(bb, db, request, intent, exact[0]!.id);
-  }
-  if (threads.some((thread) => thread.parentThreadId === intent.parentThreadId && (thread.archivedAt !== null || thread.deletedAt !== null))) {
-    return dispatchRecoveryRefusal(request.projectId, "native dispatch inventory contains an archived child under the recorded parent", { intent: intentResult });
-  }
-  if (threads.some((thread) => thread.parentThreadId === intent.parentThreadId)) {
-    return dispatchRecoveryRefusal(request.projectId, "native dispatch inventory has a child under the recorded parent without the exact dispatch identity", { intent: intentResult });
-  }
+  if (exact.length === 1) return finalizeDispatchIntent(bb, db, request, intent, exact[0]!.id);
   if (!allowRetry) return dispatchRecoveryRefusal(request.projectId, "native dispatch inventory proves no exact thread, but the prior spawn outcome is not retryable", { intent: intentResult });
   try {
     const retried = await spawnDispatchThread(bb, spawn, request.idempotencyKey);
