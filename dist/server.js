@@ -21295,6 +21295,7 @@ function decisionDoctorEvidence(db, projectId) {
   const derivedHolds = [];
   let relationCount = 0;
   for (const decision of decisions) {
+    let bootstrapAuthorityRoot = null;
     if (!DECISION_CLASSES.includes(decision.decision_class ?? "") || !decision.options_json || !decision.decision_identity_digest || decision.scope_digest !== sha256(decision.scope_json) || storedDecisionIdentityDigest(decision) !== decision.decision_identity_digest) {
       unresolvedDecisions.push({ decisionId: decision.decision_id, reason: "DECISION_IDENTITY_CONFLICT" });
     }
@@ -21303,9 +21304,12 @@ function decisionDoctorEvidence(db, projectId) {
         const head = asRow(db.prepare(
           "SELECT project_governorships.actor_receipt_id FROM project_governorship_heads JOIN project_governorships USING (project_id, governance_epoch) WHERE project_governorship_heads.project_id = ?"
         ).get(projectId));
-        if (!head || canonicalJson(storedDecisionAuthorityRoot(decision)) !== canonicalJson(currentBootstrapDecisionAuthorityRootForActor(db, projectId, head.actor_receipt_id))) {
+        const storedRoot = storedDecisionAuthorityRoot(decision);
+        const currentRoot = head && currentBootstrapDecisionAuthorityRootForActor(db, projectId, head.actor_receipt_id);
+        if (!currentRoot || canonicalJson(storedRoot) !== canonicalJson(currentRoot)) {
           throw new Error("authority root is not current");
         }
+        bootstrapAuthorityRoot = storedRoot;
       } catch {
         unresolvedDecisions.push({ decisionId: decision.decision_id, reason: "DECISION_AUTHORITY_ROOT_INVALID" });
       }
@@ -21326,7 +21330,8 @@ function decisionDoctorEvidence(db, projectId) {
         "SELECT caller_plugin_id, mutation_class FROM operator_receipts WHERE project_id = ? AND receipt_id = ?"
       ).get(projectId, actor.operator_receipt_id)) : void 0;
       const pluginActor = actor?.actor_kind === "plugin" && decision.decision_class === "operator_only" && actor.subject_id === PLUGIN_ID && actor.retirement_condition === OPERATOR_RECEIPT_RETIREMENT_CONDITION && linkedReceipt?.caller_plugin_id === PLUGIN_ID && linkedReceipt.mutation_class === "decision_disposition";
-      if (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || !pluginActor && !["role", "operator"].includes(actor.actor_kind)) {
+      const bootstrapPluginActor = bootstrapAuthorityRoot !== null && disposition.actor_receipt_id === bootstrapAuthorityRoot.actorReceiptId && actor?.actor_kind === "plugin" && actor.project_id === projectId && actor.verification_state === "verified" && actor.receipt_digest === bootstrapAuthorityRoot.actorReceiptDigest;
+      if (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || !pluginActor && !bootstrapPluginActor && !["role", "operator"].includes(actor.actor_kind)) {
         issues.push({ decisionId: decision.decision_id, reason: "decision_actor_invalid" });
       } else {
         const receiptDigest = actorReceiptDigest({

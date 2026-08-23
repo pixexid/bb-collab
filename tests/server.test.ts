@@ -9935,7 +9935,7 @@ else printf '%s\\n' '[]'; fi
   });
 
   it("authorizes only the exact governorship-rooted cross-project bootstrap Decision", async () => {
-    const { db, fenceToken } = await assignmentFixture();
+    const { host, db, fenceToken } = await assignmentFixture();
     seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "bootstrap-plugin", actorKind: "plugin", subjectId: PLUGIN_ID });
     db.prepare("UPDATE project_governorships SET actor_receipt_id = ? WHERE project_id = ? AND governance_epoch = 1").run("bootstrap-plugin", PROJECT_ID);
     const decision = {
@@ -9958,6 +9958,10 @@ else printf '%s\\n' '[]'; fi
     });
     const adopted = applyWithFixtureReceipt(db, adoptRequest);
     expect(adopted).toMatchObject({ outcome: "OK", currentResourceRevision: 2 });
+    expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
+      outcome: "OK",
+      evidence: { decisionIntegrity: { unresolvedDecisions: [], issues: [] } },
+    });
     expect(applyWithFixtureReceipt(db, adoptRequest)).toMatchObject({ outcome: "OK", replay: true });
     const switchedDecision = {
       ...decision,

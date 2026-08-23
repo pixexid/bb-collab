@@ -8432,6 +8432,7 @@ function decisionDoctorEvidence(db: SqliteDatabase, projectId: string): {
   const derivedHolds: Array<{ decisionId: string; holdCode: string; setterSequence: number }> = [];
   let relationCount = 0;
   for (const decision of decisions) {
+    let bootstrapAuthorityRoot: DecisionAuthorityRoot | null = null;
     if (
       !(DECISION_CLASSES as readonly string[]).includes(decision.decision_class ?? "") ||
       !decision.options_json || !decision.decision_identity_digest ||
@@ -8445,9 +8446,12 @@ function decisionDoctorEvidence(db: SqliteDatabase, projectId: string): {
         const head = asRow<{ actor_receipt_id: string }>(db.prepare(
           "SELECT project_governorships.actor_receipt_id FROM project_governorship_heads JOIN project_governorships USING (project_id, governance_epoch) WHERE project_governorship_heads.project_id = ?",
         ).get(projectId));
-        if (!head || canonicalJson(storedDecisionAuthorityRoot(decision)) !== canonicalJson(currentBootstrapDecisionAuthorityRootForActor(db, projectId, head.actor_receipt_id))) {
+        const storedRoot = storedDecisionAuthorityRoot(decision);
+        const currentRoot = head && currentBootstrapDecisionAuthorityRootForActor(db, projectId, head.actor_receipt_id);
+        if (!currentRoot || canonicalJson(storedRoot) !== canonicalJson(currentRoot)) {
           throw new Error("authority root is not current");
         }
+        bootstrapAuthorityRoot = storedRoot;
       } catch {
         unresolvedDecisions.push({ decisionId: decision.decision_id, reason: "DECISION_AUTHORITY_ROOT_INVALID" });
       }
@@ -8470,7 +8474,10 @@ function decisionDoctorEvidence(db: SqliteDatabase, projectId: string): {
       const pluginActor = actor?.actor_kind === "plugin" && decision.decision_class === "operator_only" && actor.subject_id === PLUGIN_ID &&
         actor.retirement_condition === OPERATOR_RECEIPT_RETIREMENT_CONDITION && linkedReceipt?.caller_plugin_id === PLUGIN_ID &&
         linkedReceipt.mutation_class === "decision_disposition";
-      if (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || (!pluginActor && !["role", "operator"].includes(actor.actor_kind))) {
+      const bootstrapPluginActor = bootstrapAuthorityRoot !== null && disposition.actor_receipt_id === bootstrapAuthorityRoot.actorReceiptId &&
+        actor?.actor_kind === "plugin" && actor.project_id === projectId && actor.verification_state === "verified" &&
+        actor.receipt_digest === bootstrapAuthorityRoot.actorReceiptDigest;
+      if (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || (!pluginActor && !bootstrapPluginActor && !["role", "operator"].includes(actor.actor_kind))) {
         issues.push({ decisionId: decision.decision_id, reason: "decision_actor_invalid" });
       } else {
         const receiptDigest = actorReceiptDigest({
