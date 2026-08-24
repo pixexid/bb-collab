@@ -9969,6 +9969,53 @@ else printf '%s\\n' '[]'; fi
     }
   });
 
+  it("recognizes a ledgered v31 success without replaying the repair and refuses an unledgered v31", () => {
+    const makeDatabase = (ledgerThrough: number) => {
+      const database = new Database(":memory:");
+      databaseIsReady(database);
+      database.transaction(() => {
+        for (const statement of MIGRATIONS.slice(0, -1)) database.exec(statement);
+      })();
+      database.exec("CREATE TABLE _bb_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)");
+      const record = database.prepare("INSERT INTO _bb_migrations (id, applied_at) VALUES (?, 1)");
+      for (let id = 0; id <= ledgerThrough; id += 1) record.run(id);
+      return database;
+    };
+    const sdkMigrate = (database: Database.Database, statements: string[], executed: number[]) => {
+      const applied = new Set((database.prepare("SELECT id FROM _bb_migrations").all() as Array<{ id: number }>).map(({ id }) => id));
+      database.transaction(() => statements.forEach((statement, id) => {
+        if (applied.has(id)) return;
+        executed.push(id);
+        database.exec(statement);
+        database.prepare("INSERT INTO _bb_migrations (id, applied_at) VALUES (?, 1)").run(id);
+      }))();
+    };
+
+    const succeeded = makeDatabase(GH636_PREVIOUS_MIGRATION_ID);
+    try {
+      const executed: number[] = [];
+      migrateCanonicalStore(succeeded, (database, statements) => sdkMigrate(database, statements, executed));
+      expect(executed).toEqual([]);
+      expect(succeeded.prepare("SELECT id FROM _bb_migrations ORDER BY id").all()).toEqual(
+        Array.from({ length: GH636_REPAIR_MIGRATION_ID + 1 }, (_, id) => ({ id })),
+      );
+      expect(succeeded.pragma("integrity_check", { simple: true })).toBe("ok");
+      expect(succeeded.pragma("foreign_key_check")).toEqual([]);
+    } finally {
+      succeeded.close();
+    }
+
+    const ambiguous = makeDatabase(GH636_PREVIOUS_MIGRATION_ID - 1);
+    try {
+      const executed: number[] = [];
+      expect(() => migrateCanonicalStore(ambiguous, (database, statements) => sdkMigrate(database, statements, executed))).toThrow(/schema 31 exists without migration 43/iu);
+      expect(executed).toEqual([]);
+      expect(ambiguous.prepare("SELECT MAX(id) AS id FROM _bb_migrations").get()).toEqual({ id: GH636_PREVIOUS_MIGRATION_ID - 1 });
+    } finally {
+      ambiguous.close();
+    }
+  });
+
   it("refuses v22 rollout evidence when one cached consumer did not execute", async () => {
     const { db, directory } = directDatabase();
     try {
