@@ -2494,18 +2494,24 @@ const roleRequirementSchema = z
       ctx.addIssue({ code: "custom", path: ["roleRequirementId"], message: "standby profile and writing capacity are reserved for director-seat" });
     }
   });
-const roleRequirementsSchema = z.array(roleRequirementSchema).max(ROLE_IDS.length).superRefine((requirements, ctx) => {
+const roleRequirementsSchema = z.array(roleRequirementSchema).max(128).superRefine((requirements, ctx) => {
   const requirementIds = new Set<string>();
-  const roleIds = new Set<string>();
+  const seatRoleIds = new Set<string>();
+  const selectors = new Set<string>();
   requirements.forEach((requirement, index) => {
     if (requirementIds.has(requirement.roleRequirementId)) {
       ctx.addIssue({ code: "custom", path: [index, "roleRequirementId"], message: "duplicate role requirement" });
     }
-    if (roleIds.has(requirement.roleId)) {
+    if (["director", "project-orchestrator"].includes(requirement.roleId) && seatRoleIds.has(requirement.roleId)) {
       ctx.addIssue({ code: "custom", path: [index, "roleId"], message: "duplicate logical role" });
     }
+    const selector = canonicalJson([requirement.roleId, requirement.repoTargetId, requirement.executedProfile]);
+    if (selectors.has(selector)) {
+      ctx.addIssue({ code: "custom", path: [index], message: "duplicate indistinguishable role requirement selector" });
+    }
     requirementIds.add(requirement.roleRequirementId);
-    roleIds.add(requirement.roleId);
+    if (["director", "project-orchestrator"].includes(requirement.roleId)) seatRoleIds.add(requirement.roleId);
+    selectors.add(selector);
   });
 });
 const domainSchema = z.object({
@@ -3846,10 +3852,10 @@ function dispatchTargetIdentity(row: Record<string, unknown>): Record<string, un
   };
 }
 
-function dispatchRoleRequirement(db: SqliteDatabase, projectId: string, configRevision: number, repoTargetId: string, domainId: string, taskClass: string, assignmentKind: "write" | "review" | "probe" = "write"): RoleRequirement & { domainId: string } {
+function dispatchRoleRequirement(db: SqliteDatabase, projectId: string, configRevision: number, repoTargetId: string, domainId: string, taskClass: string, requestedProfile: ExecutionProfile, assignmentKind: "write" | "review" | "probe" = "write"): RoleRequirement & { domainId: string } {
   const domain = domainForTaskClass(configuredDomains(db, projectId, configRevision), taskClass, domainId);
   const roleId = assignmentKind === "review" ? "independent-reviewer" : "worker";
-  const requirements = domain.roleRequirements.filter((requirement) => requirement.roleId === roleId && requirement.repoTargetId === repoTargetId);
+  const requirements = domain.roleRequirements.filter((requirement) => requirement.roleId === roleId && requirement.repoTargetId === repoTargetId && dispatchProfileMatches(requestedProfile, requirement.executedProfile));
   if (requirements.length !== 1) throw refusal("PROJECT_CONFIG_STALE", "the exact worker role requirement is missing or ambiguous across the config revision");
   return { ...requirements[0]!, domainId };
 }
@@ -3921,8 +3927,8 @@ export function proveWorkItemDispatchConfig(
 
   const assignmentKind = request.assignmentKind ?? "write";
   if (assignmentKind === "probe") throw refusal("WORK_ITEM_STATE_INVALID", "probe cannot use WorkItem lane dispatch");
-  const historicalRole = dispatchRoleRequirement(db, request.projectId, workItem.config_revision, request.repoTargetId, workItem.domain_id, workItem.task_class, assignmentKind);
-  const currentRole = dispatchRoleRequirement(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, workItem.task_class, assignmentKind);
+  const historicalRole = dispatchRoleRequirement(db, request.projectId, workItem.config_revision, request.repoTargetId, workItem.domain_id, workItem.task_class, request.requestedProfile, assignmentKind);
+  const currentRole = dispatchRoleRequirement(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, workItem.task_class, request.requestedProfile, assignmentKind);
   const reviewerAuthority = assignmentKind === "review" && request.candidateKind === "local"
     ? dispatchReviewerAuthority(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, currentRole)
     : undefined;

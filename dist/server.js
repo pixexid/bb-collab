@@ -17041,18 +17041,24 @@ var roleRequirementSchema = external_exports.object({
     ctx.addIssue({ code: "custom", path: ["roleRequirementId"], message: "standby profile and writing capacity are reserved for director-seat" });
   }
 });
-var roleRequirementsSchema = external_exports.array(roleRequirementSchema).max(ROLE_IDS.length).superRefine((requirements, ctx) => {
+var roleRequirementsSchema = external_exports.array(roleRequirementSchema).max(128).superRefine((requirements, ctx) => {
   const requirementIds = /* @__PURE__ */ new Set();
-  const roleIds = /* @__PURE__ */ new Set();
+  const seatRoleIds = /* @__PURE__ */ new Set();
+  const selectors = /* @__PURE__ */ new Set();
   requirements.forEach((requirement, index) => {
     if (requirementIds.has(requirement.roleRequirementId)) {
       ctx.addIssue({ code: "custom", path: [index, "roleRequirementId"], message: "duplicate role requirement" });
     }
-    if (roleIds.has(requirement.roleId)) {
+    if (["director", "project-orchestrator"].includes(requirement.roleId) && seatRoleIds.has(requirement.roleId)) {
       ctx.addIssue({ code: "custom", path: [index, "roleId"], message: "duplicate logical role" });
     }
+    const selector = canonicalJson([requirement.roleId, requirement.repoTargetId, requirement.executedProfile]);
+    if (selectors.has(selector)) {
+      ctx.addIssue({ code: "custom", path: [index], message: "duplicate indistinguishable role requirement selector" });
+    }
     requirementIds.add(requirement.roleRequirementId);
-    roleIds.add(requirement.roleId);
+    if (["director", "project-orchestrator"].includes(requirement.roleId)) seatRoleIds.add(requirement.roleId);
+    selectors.add(selector);
   });
 });
 var domainSchema = external_exports.object({
@@ -17771,10 +17777,10 @@ function dispatchTargetIdentity(row) {
     targetDigest: row.target_digest
   };
 }
-function dispatchRoleRequirement(db, projectId, configRevision, repoTargetId, domainId, taskClass, assignmentKind = "write") {
+function dispatchRoleRequirement(db, projectId, configRevision, repoTargetId, domainId, taskClass, requestedProfile, assignmentKind = "write") {
   const domain2 = domainForTaskClass(configuredDomains(db, projectId, configRevision), taskClass, domainId);
   const roleId = assignmentKind === "review" ? "independent-reviewer" : "worker";
-  const requirements = domain2.roleRequirements.filter((requirement) => requirement.roleId === roleId && requirement.repoTargetId === repoTargetId);
+  const requirements = domain2.roleRequirements.filter((requirement) => requirement.roleId === roleId && requirement.repoTargetId === repoTargetId && dispatchProfileMatches(requestedProfile, requirement.executedProfile));
   if (requirements.length !== 1) throw refusal("PROJECT_CONFIG_STALE", "the exact worker role requirement is missing or ambiguous across the config revision");
   return { ...requirements[0], domainId };
 }
@@ -17831,8 +17837,8 @@ function proveWorkItemDispatchConfig(db, request, committedConfigRevision) {
   if (!currentTarget || !historicalTarget) throw refusal("PROJECT_CONFIG_STALE", "the exact WorkItem target is missing from a config revision");
   const assignmentKind = request.assignmentKind ?? "write";
   if (assignmentKind === "probe") throw refusal("WORK_ITEM_STATE_INVALID", "probe cannot use WorkItem lane dispatch");
-  const historicalRole = dispatchRoleRequirement(db, request.projectId, workItem.config_revision, request.repoTargetId, workItem.domain_id, workItem.task_class, assignmentKind);
-  const currentRole = dispatchRoleRequirement(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, workItem.task_class, assignmentKind);
+  const historicalRole = dispatchRoleRequirement(db, request.projectId, workItem.config_revision, request.repoTargetId, workItem.domain_id, workItem.task_class, request.requestedProfile, assignmentKind);
+  const currentRole = dispatchRoleRequirement(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, workItem.task_class, request.requestedProfile, assignmentKind);
   const reviewerAuthority = assignmentKind === "review" && request.candidateKind === "local" ? dispatchReviewerAuthority(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, currentRole) : void 0;
   const requestedProfile = dispatchProfileIdentity(request.requestedProfile);
   if (!dispatchProfileMatches(request.requestedProfile, historicalRole.executedProfile) || !dispatchProfileMatches(request.requestedProfile, currentRole.executedProfile)) {
