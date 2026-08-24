@@ -99,6 +99,61 @@ the same current root.
    and exact repository target all agree. Do not deploy, reload, create
    external projections, or mutate the amiga repository as part of bootstrap.
 
+## Watcher binding and verification default
+
+Watcher binding is derived, never separately configured. For every registered
+project, query the canonical `project_config_heads` inventory and verify that
+the current project is covered by Companion, fleet-watchdog, and Stall Guard
+through their existing watcher seams:
+
+- Companion uses BB's native project inventory, reads that project's canonical
+  export, and routes a finding to that project's current
+  `project-orchestrator` or `director` head.
+- Fleet-watchdog evaluates the same canonical project population and routes
+  queue, lane, wait, and recovery findings to that project's current role
+  holder.
+- Stall Guard evaluates the same canonical project population and exact current
+  holder. Its tenant alerts are low severity and probationary until a
+  project-specific graduation check supplies discriminating evidence; low
+  severity still emits the alert and does not suppress the wake.
+
+Record one healthy no-finding cycle and one synthetic, project-scoped finding
+route for each watcher. Evidence names the subject, mechanism,
+expected/attempted/verified counts, and the negative control; it does not copy
+tenant content or a project list into the runbook. A finding must reach the
+tenant's current canonical director/orchestrator, never a source-fleet relay.
+Routine BenchBait review verdicts remain suppressed at the source; deployment
+holds and explicit peer requests remain routable.
+
+`startable-queue-unreadable` is a blind/degraded result, not an empty queue and
+not a healthy cycle. Preserve the exact reason, correct or verify the
+project-exact repository mapping and complete queue inventory, then rerun the
+coverage check. If it cannot be resolved, record the project-local bootstrap
+hold and do not declare watcher coverage complete. Enumeration alone never
+closes this hold.
+
+Doctor and export are rerun after the watcher checks. If bootstrap fails or is
+abandoned, preserve peer projects, stop the target from receiving new work, and
+rollback only the target's exact canonical config/governorship/role changes
+through their existing fenced seams. Because watcher binding is derived from
+canonical inventory, there is no second binding record to delete: an
+unregistered target has no watcher binding; a registered but ungraduated target
+remains explicitly held until its canonical project lifecycle is rolled back or
+retired. Rerun Doctor/export after rollback and before any peer action.
+
+## Standard domain question
+
+Ask during every bootstrap:
+
+> Name the project's domains and the task classes each domain owns.
+
+If the answer names more than one domain, record day-one domain-scoped
+planning for queue ownership, surface boundaries, profile FIT, and intended
+role requirements. Until GH-637 lands, that planning is descriptive only: it
+does not authorize concurrent duplicate orchestrator-class seats or duplicate
+unscoped worker requirements. Runtime authority remains one current
+project-scoped orchestrator acting on director-frozen work orders.
+
 ## Domain-scoped seat topology
 
 The schema keys `role_generation_heads` by `project_id`, role, and configured

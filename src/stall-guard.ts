@@ -21,6 +21,18 @@ export interface StallGuardArtifact {
   value: unknown;
 }
 
+export type StallGuardTrust = "probationary" | "graduated";
+
+export interface StallGuardAlert {
+  projectId: string;
+  roleId: string;
+  roleGeneration: number;
+  executionAttemptId: string;
+  threadId: string;
+  severity: "low" | "routine";
+  probationary: boolean;
+}
+
 export interface StallGuardCycleOptions {
   readRoleHolders: () => RoleHolderState[];
   /** Canonical tenant inventory; role holders are not a tenant population. */
@@ -28,6 +40,9 @@ export interface StallGuardCycleOptions {
   readArtifact: (projectId: string) => Promise<StallGuardArtifact[] | null>;
   readQueueHead?: (projectId: string) => { workItemId: string; resourceRevision: number } | null;
   wakeRole: (role: RoleIdleView) => Promise<RoleWakeResult>;
+  /** Missing graduation evidence is deliberately probationary, never silent. */
+  readTenantTrust?: (projectId: string) => StallGuardTrust;
+  onAlert?: (alert: StallGuardAlert) => void;
   persistence: StallGuardPersistence;
   onAmbiguous?: (message: string) => void;
 }
@@ -251,6 +266,17 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
             queueHeadId: queueHead?.workItemId ?? holder.execution_attempt_id,
             idleAgeMs: 0,
           };
+          const trust = options.readTenantTrust?.(currentProjectId) ?? "probationary";
+          const alert: StallGuardAlert = {
+            projectId: currentProjectId,
+            roleId: holder.role_id,
+            roleGeneration: holder.role_generation,
+            executionAttemptId: holder.execution_attempt_id,
+            threadId: holder.thread_id,
+            severity: trust === "graduated" ? "routine" : "low",
+            probationary: trust !== "graduated",
+          };
+          try { options.onAlert?.(alert); } catch { /* alert reporting cannot suppress the wake attempt */ }
           let result: RoleWakeResult;
           try {
             result = await options.wakeRole(role);

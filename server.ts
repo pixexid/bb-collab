@@ -4645,6 +4645,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
 
   const stallGuardCycle = createStallGuardCycle({
     onAmbiguous: (message) => bb.log.warn(message),
+    onAlert: (alert) => bb.log.warn(`stall-guard alert severity=${alert.severity} probationary=${alert.probationary} project=${alert.projectId} role=${alert.roleId}@${alert.roleGeneration}`),
     readProjectIds: () => db
       ? (db.prepare("SELECT project_id FROM project_config_heads ORDER BY project_id").all() as Array<{ project_id: string }>).map((row) => row.project_id)
       : [],

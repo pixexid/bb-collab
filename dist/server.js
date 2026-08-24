@@ -25068,6 +25068,20 @@ function createStallGuardCycle(options) {
             queueHeadId: queueHead?.workItemId ?? holder.execution_attempt_id,
             idleAgeMs: 0
           };
+          const trust = options.readTenantTrust?.(currentProjectId) ?? "probationary";
+          const alert = {
+            projectId: currentProjectId,
+            roleId: holder.role_id,
+            roleGeneration: holder.role_generation,
+            executionAttemptId: holder.execution_attempt_id,
+            threadId: holder.thread_id,
+            severity: trust === "graduated" ? "routine" : "low",
+            probationary: trust !== "graduated"
+          };
+          try {
+            options.onAlert?.(alert);
+          } catch {
+          }
           let result2;
           try {
             result2 = await options.wakeRole(role);
@@ -29792,6 +29806,7 @@ ${thread.titleFallback ?? ""}`);
   });
   const stallGuardCycle = createStallGuardCycle({
     onAmbiguous: (message) => bb.log.warn(message),
+    onAlert: (alert) => bb.log.warn(`stall-guard alert severity=${alert.severity} probationary=${alert.probationary} project=${alert.projectId} role=${alert.roleId}@${alert.roleGeneration}`),
     readProjectIds: () => db ? db.prepare("SELECT project_id FROM project_config_heads ORDER BY project_id").all().map((row) => row.project_id) : [],
     readRoleHolders: readProjectQueueRoleHolders,
     readArtifact: async (projectId) => {
