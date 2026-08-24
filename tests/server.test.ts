@@ -15715,6 +15715,7 @@ exit 1
     const negativeCases: Array<[string, (events: NativeEvent[], host: Awaited<ReturnType<typeof loadedHost>>) => void, (report: any) => any]> = [
       ["missing request", (events) => { events.splice(0, 1); }, (report) => report],
       ["duplicate request ID", (events) => { events.splice(1, 0, { ...events[0]!, id: "gh643-request-duplicate", seq: 11 }); }, (report) => report],
+      ["same-page unordered sequence", (events) => { events.splice(0, events.length, events[0]!, events[2]!, events[1]!, events[3]!); }, (report) => report],
       ["request after start", (events) => { events[0]!.seq = 21; events.splice(0, events.length, events[1]!, events[0]!, events[2]!, events[3]!); }, (report) => report],
       ["request after accepted", (events) => { events[0]!.seq = 31; events.splice(0, events.length, events[1]!, events[2]!, events[0]!, events[3]!); }, (report) => report],
       ["accepted after completion", (events) => { events[2]!.seq = 41; events.splice(0, events.length, events[0]!, events[1]!, events[3]!, events[2]!); }, (report) => report],

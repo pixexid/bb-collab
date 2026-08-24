@@ -1679,12 +1679,16 @@ async function completeNativeThreadEvents(sdk: BbPluginApi["sdk"], threadId: str
   let afterSeq = 0;
   for (;;) {
     const page = await sdk.threads.events.list({ threadId, afterSeq: String(afterSeq), limit: "1000" });
-    if (page.some((event) => event.threadId !== threadId || !Number.isSafeInteger(event.seq) || event.seq <= afterSeq)) {
-      throw new Error("native event inventory is foreign, unordered, or incomplete");
+    let pageAfterSeq = afterSeq;
+    for (const event of page) {
+      if (event.threadId !== threadId || !Number.isSafeInteger(event.seq) || event.seq <= pageAfterSeq) {
+        throw new Error("native event inventory is foreign, unordered, or incomplete");
+      }
+      pageAfterSeq = event.seq;
     }
     events.push(...page);
     if (page.length < 1000) return events;
-    const next = page.at(-1)?.seq ?? afterSeq;
+    const next = pageAfterSeq;
     if (next <= afterSeq) throw new Error("native event inventory did not advance");
     afterSeq = next;
   }
