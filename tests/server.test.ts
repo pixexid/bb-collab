@@ -5499,6 +5499,23 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       return _attempt;
     }],
     ["foreign bb server", (attempt: Record<string, unknown>) => ({ ...attempt, reviewCandidateEnvironment: { ...(attempt.reviewCandidateEnvironment as Record<string, unknown>), bbServerId: "foreign-server" } })],
+    ["candidate source drift", (attempt: Record<string, unknown>) => ({ ...attempt, reviewCandidateEnvironment: { ...(attempt.reviewCandidateEnvironment as Record<string, unknown>), sourceId: "source-foreign" } })],
+    ["candidate host drift", (attempt: Record<string, unknown>, fixture: Awaited<ReturnType<typeof assignmentFixture>>) => {
+      fixture.host.harness.sdk.stub("environments.get", (async () => ({
+        id: ROLE_ENVIRONMENT_ID, projectId: PROJECT_ID, hostId: "host-foreign", path: "/workspace/project",
+        managed: true, isGitRepo: true, isWorktree: true, workspaceProvisionType: "managed-worktree",
+        branchName: "bb/local-review", baseBranch: BASE_SHA, defaultBranch: "main", mergeBaseBranch: BASE_SHA, status: "ready",
+      })) as never);
+      return { ...attempt, reviewCandidateEnvironment: { ...(attempt.reviewCandidateEnvironment as Record<string, unknown>), hostId: "host-foreign" } };
+    }],
+    ["candidate checkout path drift", (attempt: Record<string, unknown>, fixture: Awaited<ReturnType<typeof assignmentFixture>>) => {
+      fixture.host.harness.sdk.stub("environments.get", (async () => ({
+        id: ROLE_ENVIRONMENT_ID, projectId: PROJECT_ID, hostId: "host-main", path: "/workspace/project",
+        managed: true, isGitRepo: true, isWorktree: true, workspaceProvisionType: "managed-worktree",
+        branchName: "bb/local-review", baseBranch: BASE_SHA, defaultBranch: "main", mergeBaseBranch: BASE_SHA, status: "ready",
+      })) as never);
+      return { ...attempt, reviewCandidateEnvironment: { ...(attempt.reviewCandidateEnvironment as Record<string, unknown>), path: "/workspace/worktrees/foreign-review" } };
+    }],
     ["ancestry drift", (_attempt: Record<string, unknown>, _fixture: Awaited<ReturnType<typeof assignmentFixture>>, status: Record<string, unknown>) => ({ ..._attempt, _status: { ...status, workspace: { ...(status.workspace as Record<string, unknown>), mergeBase: { ...(status.workspace as Record<string, unknown>).mergeBase as Record<string, unknown>, behindCount: 1 } } } })],
     ["target drift", (_attempt: Record<string, unknown>, fixture: Awaited<ReturnType<typeof assignmentFixture>>) => { fixture.host.harness.sdk.stub("projects.get", (async () => ({ ...projectFacts(), sources: [{ ...projectFacts().sources[0]!, path: "/workspace/foreign" }] })) as never); return _attempt; }],
     ["reviewer generation drift", (attempt: Record<string, unknown>) => ({ ...attempt, reviewRoleGeneration: 1 })],
