@@ -115,7 +115,12 @@ through their existing watcher seams:
 - Stall Guard evaluates the same canonical project population and exact current
   holder. Its tenant alerts are low severity and probationary until a
   project-specific graduation check supplies discriminating evidence; low
-  severity still emits the alert and does not suppress the wake.
+  severity still emits the alert and does not suppress the wake. Source-project
+  behavior is unchanged: non-tenant source projects retain routine severity.
+  The production graduation authority is the current project's governed
+  `stall-guard-graduation` evidence attached to the latest adopted
+  `stall_guard_trust_graduation` decision; absent evidence is probationary for
+  bootstrap-derived tenants.
 
 Record one healthy no-finding cycle and one synthetic, project-scoped finding
 route for each watcher. Evidence names the subject, mechanism,
@@ -126,11 +131,13 @@ Routine BenchBait review verdicts remain suppressed at the source; deployment
 holds and explicit peer requests remain routable.
 
 `startable-queue-unreadable` is a blind/degraded result, not an empty queue and
-not a healthy cycle. Preserve the exact reason, correct or verify the
-project-exact repository mapping and complete queue inventory, then rerun the
-coverage check. If it cannot be resolved, record the project-local bootstrap
-hold and do not declare watcher coverage complete. Enumeration alone never
-closes this hold.
+not a healthy cycle. The reader derives repository/connector identity from the
+current canonical `repository_targets` rows when the optional GitHub mapping
+extension is absent; it must not invent a second config key. Preserve the exact
+reason, correct or verify the project-exact repository mapping and complete
+queue inventory, then rerun the coverage check. If it cannot be resolved,
+record the project-local bootstrap hold and do not declare watcher coverage
+complete. Enumeration alone never closes this hold.
 
 Doctor and export are rerun after the watcher checks. If bootstrap fails or is
 abandoned, preserve peer projects, stop the target from receiving new work, and

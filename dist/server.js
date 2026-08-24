@@ -24879,6 +24879,9 @@ var STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME = "stall-guard.alerted";
 function stallGuardStateDir() {
   return process.env.BB_COLLAB_STALL_GUARD_STATE_DIR ?? join2(homedir(), ".bb", "bb-collab");
 }
+function stallGuardTrustFromCanonical(evidence) {
+  return !evidence.bootstrapDerived || evidence.adoptedGraduation ? "graduated" : "probationary";
+}
 function stateFromUnknown(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   return Object.fromEntries(Object.entries(value).filter((entry) => typeof entry[1] === "string"));
@@ -26022,9 +26025,15 @@ var fleetWatchdogScopeMessage = (scope) => {
   }
 };
 var fleetWatchdogReopenKey = (projectId, workItemId, externalRevision) => fleetWatchdogCompositeKey(...[projectId, workItemId, externalRevision].filter((value) => value !== void 0));
+function githubRepositoryTarget(remoteUrl) {
+  const match = remoteUrl?.match(/^(?:https:\/\/([^/]+)\/|git@([^/:]+):)([^/]+)\/([^/]+?)(?:\.git)?$/u);
+  const connectorHost = match?.[1] ?? match?.[2];
+  if (!connectorHost || !match?.[3] || !match[4] || !githubConnectorHostPattern.test(connectorHost) || !githubRefPartPattern.test(match[3]) || !githubRefPartPattern.test(match[4])) return null;
+  return { owner: match[3], repo: match[4], connectorHost };
+}
 function githubRepository(remoteUrl) {
-  const match = remoteUrl?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([^/]+)\/([^/]+?)(?:\.git)?$/u);
-  return match?.[1] && match[2] ? `${match[1]}/${match[2]}` : null;
+  const target = githubRepositoryTarget(remoteUrl);
+  return target ? `${target.owner}/${target.repo}` : null;
 }
 var ROLE_QUEUE_MAX_REPOSITORIES = 4;
 var ROLE_QUEUE_REFRESH_TIMEOUT_MS = 8e3;
@@ -26039,17 +26048,26 @@ function validGithubConnectorHost(value) {
 }
 function githubRepositoryMappings(db, projectId) {
   if (!db) return null;
-  const row = db.prepare(
-    `SELECT revisions.canonical_config_json
+  const rows = db.prepare(
+    `SELECT targets.repo_target_id, targets.remote_url, revisions.canonical_config_json
      FROM project_config_heads AS heads
      JOIN project_config_revisions AS revisions
        ON revisions.project_id = heads.project_id AND revisions.config_revision = heads.config_revision
+     JOIN repository_targets AS targets
+       ON targets.project_id = heads.project_id AND targets.config_revision = heads.config_revision
      WHERE heads.project_id = ?`
-  ).get(projectId);
-  if (!row || typeof row.canonical_config_json !== "string") return null;
+  ).all(projectId);
+  if (rows.length === 0 || rows.some((row) => typeof row.repo_target_id !== "string" || typeof row.canonical_config_json !== "string")) return null;
   try {
-    const config2 = JSON.parse(row.canonical_config_json);
+    const config2 = JSON.parse(rows[0].canonical_config_json);
     const rawMappings = config2.extensions?.bbCollab?.githubIssues?.repositoryMappings;
+    if (rawMappings === void 0) {
+      const targetMappings = rows.map((row) => {
+        const target = typeof row.remote_url === "string" ? githubRepositoryTarget(row.remote_url) : null;
+        return target ? { repoTargetId: row.repo_target_id, ...target } : null;
+      });
+      return targetMappings.some((mapping) => mapping === null) ? null : targetMappings;
+    }
     if (!Array.isArray(rawMappings)) return null;
     const mappings = rawMappings.map((candidate) => {
       if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
@@ -29807,6 +29825,28 @@ ${thread.titleFallback ?? ""}`);
   const stallGuardCycle = createStallGuardCycle({
     onAmbiguous: (message) => bb.log.warn(message),
     onAlert: (alert) => bb.log.warn(`stall-guard alert severity=${alert.severity} probationary=${alert.probationary} project=${alert.projectId} role=${alert.roleId}@${alert.roleGeneration}`),
+    readTenantTrust: (projectId) => {
+      if (!db) return "probationary";
+      const tenant = db.prepare("SELECT 1 FROM bootstrap_derivation_receipts WHERE project_id = ?").get(projectId) !== void 0;
+      const graduation = db.prepare(
+        `SELECT 1
+         FROM evidence_artifacts AS artifacts
+         JOIN decision_evidence AS evidence
+           ON evidence.project_id = artifacts.project_id AND evidence.evidence_id = artifacts.evidence_id
+         JOIN decision_dispositions AS dispositions
+           ON dispositions.decision_id = evidence.decision_id AND dispositions.disposition_sequence = evidence.disposition_sequence
+         JOIN decisions
+           ON decisions.decision_id = evidence.decision_id AND decisions.project_id = artifacts.project_id
+         WHERE artifacts.project_id = ?
+           AND artifacts.evidence_id = 'stall-guard-graduation'
+           AND evidence.relation_kind = 'supporting'
+           AND dispositions.disposition = 'adopted'
+           AND dispositions.disposition_sequence = (SELECT MAX(current.disposition_sequence) FROM decision_dispositions AS current WHERE current.decision_id = dispositions.decision_id)
+           AND json_extract(decisions.scope_json, '$.operation') = 'stall_guard_trust_graduation'
+         LIMIT 1`
+      ).get(projectId);
+      return stallGuardTrustFromCanonical({ bootstrapDerived: tenant, adoptedGraduation: graduation !== void 0 });
+    },
     readProjectIds: () => db ? db.prepare("SELECT project_id FROM project_config_heads ORDER BY project_id").all().map((row) => row.project_id) : [],
     readRoleHolders: readProjectQueueRoleHolders,
     readArtifact: async (projectId) => {

@@ -763,8 +763,8 @@ async function loadedDistHost() {
   return host;
 }
 
-async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, writingLaneCeiling?: number, withoutGithubIssues = true, projectId = PROJECT_ID, connectorHost = CONNECTOR_HOST, githubIssueNumber?: number) {
-  const fixture = await assignmentFixture({ projectId, connectorHost, directorSeat: true, orchestratorSeat: true, withoutGithubIssues: false, targetRemoteUrl: includeGithubRemote ? "https://github.com/example/project.git" : undefined, writingLaneCeiling, githubIssueNumber });
+async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, writingLaneCeiling?: number, withoutGithubIssues = false, projectId = PROJECT_ID, connectorHost = CONNECTOR_HOST, githubIssueNumber?: number) {
+  const fixture = await assignmentFixture({ projectId, connectorHost, directorSeat: true, orchestratorSeat: true, withoutGithubIssues, targetRemoteUrl: includeGithubRemote ? "https://github.com/example/project.git" : undefined, writingLaneCeiling, githubIssueNumber });
   const pathHead = process.env.PATH?.split(":")[0];
   if (!includeGithubRemote && !(pathHead && pathHead.startsWith(tmpdir()))) pendingReviewQueueCleanups.push(installEmptyGithubQueue());
   const director = fixture.db.prepare(
@@ -5135,6 +5135,31 @@ exec /bin/cat '${inventory}'
       service?.controller.abort();
       await service?.done;
       clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("derives queue repository identity from canonical targets when optional mappings are absent", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-role-queue-canonical-target-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\nif [ \"$1\" = api ]; then printf '%s\\n' '[[{\"number\":205,\"labels\":[{\"name\":\"queue:startable\"}]}]]'; else printf '%s\\n' '[{\"number\":205,\"labels\":[{\"name\":\"queue:startable\"}]}]'; fi\n");
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    let service: ReturnType<Awaited<ReturnType<typeof fleetWatchdogFixture>>["host"]["harness"]["runService"]> | undefined;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, undefined, true);
+      service = fixture.host.harness.runService("lane-watcher");
+      await vi.waitFor(() => expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: `role queue coverage=degraded project=${PROJECT_ID} reason=startable-queue-head-bindings:0`,
+      })));
+      expect(fixture.host.harness.inspection.logEntries.some((entry) => entry.message === `role queue coverage=degraded project=${PROJECT_ID} reason=startable-queue-unreadable`)).toBe(false);
+    } finally {
+      service?.controller.abort();
+      await service?.done;
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
       rmSync(bin, { recursive: true, force: true });

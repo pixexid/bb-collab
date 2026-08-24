@@ -8,7 +8,7 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import plugin from "../server.js";
 import { createLaneWatcher, type RoleHolderState } from "../src/awareness.js";
 import { PLUGIN_ID } from "../src/foundation.js";
-import { createStallGuardCycle, type StallGuardArtifact } from "../src/stall-guard.js";
+import { createStallGuardCycle, stallGuardTrustFromCanonical, type StallGuardArtifact } from "../src/stall-guard.js";
 
 const PROJECT_ID = "project-1";
 
@@ -51,6 +51,12 @@ function absentArtifact() {
 }
 
 describe("stall-guard artifact cycle", () => {
+  it("keeps source routine, tenant probation, and adopted graduation project-exact", () => {
+    expect(stallGuardTrustFromCanonical({ bootstrapDerived: false, adoptedGraduation: false })).toBe("graduated");
+    expect(stallGuardTrustFromCanonical({ bootstrapDerived: true, adoptedGraduation: false })).toBe("probationary");
+    expect(stallGuardTrustFromCanonical({ bootstrapDerived: true, adoptedGraduation: true })).toBe("graduated");
+  });
+
   it("retries a transient initial persistence read", async () => {
     let reads = 0;
     const cycle = createStallGuardCycle({

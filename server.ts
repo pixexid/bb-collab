@@ -90,6 +90,7 @@ import {
   STALL_GUARD_LIVENESS_ALERT_FLAG_FILENAME,
   STALL_GUARD_LIVENESS_MARKER_FILENAME,
   stallGuardStateDir,
+  stallGuardTrustFromCanonical,
 } from "./src/stall-guard.js";
 import {
   LIVENESS_ALERT_FLAG_FILENAME,
@@ -244,9 +245,17 @@ const fleetWatchdogScopeMessage = (scope: string) => {
 export const fleetWatchdogReopenKey = (projectId: string, workItemId: string, externalRevision?: string) =>
   fleetWatchdogCompositeKey(...[projectId, workItemId, externalRevision].filter((value): value is string => value !== undefined));
 
+function githubRepositoryTarget(remoteUrl: string | null): Omit<GithubRepositoryMapping, "repoTargetId"> | null {
+  const match = remoteUrl?.match(/^(?:https:\/\/([^/]+)\/|git@([^/:]+):)([^/]+)\/([^/]+?)(?:\.git)?$/u);
+  const connectorHost = match?.[1] ?? match?.[2];
+  if (!connectorHost || !match?.[3] || !match[4] || !githubConnectorHostPattern.test(connectorHost)
+    || !githubRefPartPattern.test(match[3]) || !githubRefPartPattern.test(match[4])) return null;
+  return { owner: match[3], repo: match[4], connectorHost };
+}
+
 function githubRepository(remoteUrl: string | null): string | null {
-  const match = remoteUrl?.match(/^(?:https:\/\/github\.com\/|git@github\.com:)([^/]+)\/([^/]+?)(?:\.git)?$/u);
-  return match?.[1] && match[2] ? `${match[1]}/${match[2]}` : null;
+  const target = githubRepositoryTarget(remoteUrl);
+  return target ? `${target.owner}/${target.repo}` : null;
 }
 
 type GithubQueueIssue = { repository: string; number: number };
@@ -270,17 +279,26 @@ type GithubRepositoryMapping = { repoTargetId: string; owner: string; repo: stri
 
 function githubRepositoryMappings(db: SqliteDatabase | null, projectId: string): GithubRepositoryMapping[] | null {
   if (!db) return null;
-  const row = db.prepare(
-    `SELECT revisions.canonical_config_json
+  const rows = db.prepare(
+    `SELECT targets.repo_target_id, targets.remote_url, revisions.canonical_config_json
      FROM project_config_heads AS heads
      JOIN project_config_revisions AS revisions
        ON revisions.project_id = heads.project_id AND revisions.config_revision = heads.config_revision
+     JOIN repository_targets AS targets
+       ON targets.project_id = heads.project_id AND targets.config_revision = heads.config_revision
      WHERE heads.project_id = ?`,
-  ).get(projectId) as { canonical_config_json?: unknown } | undefined;
-  if (!row || typeof row.canonical_config_json !== "string") return null;
+  ).all(projectId) as Array<{ repo_target_id?: unknown; remote_url?: unknown; canonical_config_json?: unknown }>;
+  if (rows.length === 0 || rows.some((row) => typeof row.repo_target_id !== "string" || typeof row.canonical_config_json !== "string")) return null;
   try {
-    const config = JSON.parse(row.canonical_config_json) as { extensions?: { bbCollab?: { githubIssues?: { repositoryMappings?: unknown } } } };
+    const config = JSON.parse(rows[0]!.canonical_config_json as string) as { extensions?: { bbCollab?: { githubIssues?: { repositoryMappings?: unknown } } } };
     const rawMappings = config.extensions?.bbCollab?.githubIssues?.repositoryMappings;
+    if (rawMappings === undefined) {
+      const targetMappings = rows.map((row): GithubRepositoryMapping | null => {
+        const target = typeof row.remote_url === "string" ? githubRepositoryTarget(row.remote_url) : null;
+        return target ? { repoTargetId: row.repo_target_id as string, ...target } : null;
+      });
+      return targetMappings.some((mapping) => mapping === null) ? null : targetMappings as GithubRepositoryMapping[];
+    }
     if (!Array.isArray(rawMappings)) return null;
     const mappings = rawMappings.map((candidate): GithubRepositoryMapping | null => {
       if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
@@ -4646,6 +4664,28 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   const stallGuardCycle = createStallGuardCycle({
     onAmbiguous: (message) => bb.log.warn(message),
     onAlert: (alert) => bb.log.warn(`stall-guard alert severity=${alert.severity} probationary=${alert.probationary} project=${alert.projectId} role=${alert.roleId}@${alert.roleGeneration}`),
+    readTenantTrust: (projectId) => {
+      if (!db) return "probationary";
+      const tenant = db.prepare("SELECT 1 FROM bootstrap_derivation_receipts WHERE project_id = ?").get(projectId) !== undefined;
+      const graduation = db.prepare(
+        `SELECT 1
+         FROM evidence_artifacts AS artifacts
+         JOIN decision_evidence AS evidence
+           ON evidence.project_id = artifacts.project_id AND evidence.evidence_id = artifacts.evidence_id
+         JOIN decision_dispositions AS dispositions
+           ON dispositions.decision_id = evidence.decision_id AND dispositions.disposition_sequence = evidence.disposition_sequence
+         JOIN decisions
+           ON decisions.decision_id = evidence.decision_id AND decisions.project_id = artifacts.project_id
+         WHERE artifacts.project_id = ?
+           AND artifacts.evidence_id = 'stall-guard-graduation'
+           AND evidence.relation_kind = 'supporting'
+           AND dispositions.disposition = 'adopted'
+           AND dispositions.disposition_sequence = (SELECT MAX(current.disposition_sequence) FROM decision_dispositions AS current WHERE current.decision_id = dispositions.decision_id)
+           AND json_extract(decisions.scope_json, '$.operation') = 'stall_guard_trust_graduation'
+         LIMIT 1`,
+      ).get(projectId);
+      return stallGuardTrustFromCanonical({ bootstrapDerived: tenant, adoptedGraduation: graduation !== undefined });
+    },
     readProjectIds: () => db
       ? (db.prepare("SELECT project_id FROM project_config_heads ORDER BY project_id").all() as Array<{ project_id: string }>).map((row) => row.project_id)
       : [],

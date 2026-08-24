@@ -23,6 +23,10 @@ export interface StallGuardArtifact {
 
 export type StallGuardTrust = "probationary" | "graduated";
 
+export function stallGuardTrustFromCanonical(evidence: { bootstrapDerived: boolean; adoptedGraduation: boolean }): StallGuardTrust {
+  return !evidence.bootstrapDerived || evidence.adoptedGraduation ? "graduated" : "probationary";
+}
+
 export interface StallGuardAlert {
   projectId: string;
   roleId: string;
