@@ -25713,7 +25713,7 @@ function liveTerminalReader(sdk, db, request) {
       if (starts.length !== 1) throw new Error("native completion start correlation is missing or ambiguous");
       const started = starts[0];
       const startedData = nativeEventData(started);
-      if (started.seq <= acceptedEvent.seq || started.seq >= completion.seq || startedData.providerThreadId !== providerThreadId) throw new Error("native completion start correlation is foreign or unordered");
+      if (requestEvent.seq >= acceptedEvent.seq || requestEvent.seq >= started.seq || acceptedEvent.seq >= completion.seq || started.seq >= completion.seq || startedData.providerThreadId !== providerThreadId) throw new Error("native completion start correlation is foreign or unordered");
       if (events.some((event) => event.type === "provider/modelFallback" && (nativeTurnId(event) === turnId || nativeEventData(event).providerThreadId === providerThreadId))) throw new Error("native completion correlation is ambiguous");
       const profile = {
         providerId: thread.providerId,
