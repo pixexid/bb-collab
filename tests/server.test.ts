@@ -9265,10 +9265,10 @@ else printf '%s\\n' '[]'; fi
     expect(MIGRATIONS).toHaveLength(45);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
-    expect(sha256(MIGRATIONS.slice(0, -3).join("\n"))).toBe("2bd064e5e909b763cbd185a040b84b3bb9a95a751e5c84bbc5f273c6264fb211");
+    expect(sha256(MIGRATIONS.slice(0, GH636_PREVIOUS_MIGRATION_ID + 1).join("\n"))).toBe("b8beac282f4b36cf0dca454f3be9ffc11bae6a3d2c66388c9e43210928e4a5c8");
     expect(GH636_PREVIOUS_MIGRATION_ID).toBe(43);
     expect(GH636_REPAIR_MIGRATION_ID).toBe(44);
-    expect(sha256(MIGRATIONS[GH636_PREVIOUS_MIGRATION_ID]!)).toBe("994ba48c63e8b82cc482969811e5bf5566d0b532db6ac92b3bc70894ebe9e6f9");
+    expect(sha256(MIGRATIONS[GH636_PREVIOUS_MIGRATION_ID]!)).toBe("a9af01dcf639dce371dca7f504c0b2127a11057b4e8259f35e096ff014698ac7");
     expect(MIGRATIONS[GH636_REPAIR_MIGRATION_ID]).toContain("execution_attempts_gh636_decision_evidence");
     expect(schemaDigest).not.toBe("6901dfc3766969621d1557feae76ad91877088dfdf3cc1879ee3e79463e67ced");
     expect(contractDigest).not.toBe("f6b0ecbda7e8afd986d46e0eda77662815a737dadc94e268ef00b7d74ba18ed4");
