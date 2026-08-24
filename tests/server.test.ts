@@ -49,6 +49,7 @@ import {
   probeV21NewLegacyApplyProvenanceRefusal,
   probeV21ConsumedLegacyReplay,
   parseApplyRequest,
+  proveWorkItemDispatchConfig,
   requestedProfileDigest,
   reconcilePreparedWorkItemDispatches,
   schemaDigest,
@@ -59,6 +60,7 @@ import {
   type ExportPayload,
   type FoundationResult,
   type NativeAssignmentInspection,
+  type WorkItemDispatchConfigRequest,
 } from "../src/foundation.js";
 import {
   applyWithFixtureReceipt,
@@ -98,6 +100,14 @@ const ROLE_PROFILE = {
   visibility: "visible" as const,
 };
 const ROLE_PROFILE_DIGEST = requestedProfileDigest(ROLE_PROFILE);
+const CLAUDE_PROFILE = {
+  providerId: "claude-code",
+  model: "claude-opus-5",
+  reasoningLevel: "medium",
+  permissionMode: "full",
+  serviceTier: "default",
+  visibility: "visible" as const,
+};
 const EXPLICIT_EXECUTION_INPUT_SOURCES = {
   providerId: "explicit",
   model: "explicit",
@@ -236,6 +246,16 @@ function roleConfig(connector: "required" | "optional" | "prohibited" = "optiona
   config.extensions.bbCollab.reviewPolicy = {
     connectors: [{ repoTargetId: TARGET_ID, connectorId: "connector-review", policy: connector }],
   };
+  return config;
+}
+
+function multiProfileRoleConfig() {
+  const config = roleConfig();
+  const requirements = config.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>;
+  requirements.push(
+    { roleRequirementId: "worker-claude-v1", roleId: "worker", repoTargetId: TARGET_ID, executedProfile: CLAUDE_PROFILE },
+    { roleRequirementId: "reviewer-claude-v1", roleId: "independent-reviewer", repoTargetId: TARGET_ID, executedProfile: CLAUDE_PROFILE },
+  );
   return config;
 }
 
@@ -12316,6 +12336,94 @@ else printf '%s\\n' '[]'; fi
     }));
     expect(foreignSelector.outcome).toBe("REPO_TARGET_FOREIGN");
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("selects exact worker and reviewer profiles and binds config continuation to that selector", async () => {
+    const host = await loadedHost();
+    const config = multiProfileRoleConfig();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config });
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    const prove = (overrides: Partial<WorkItemDispatchConfigRequest> = {}) => proveWorkItemDispatchConfig(db, {
+      projectId: PROJECT_ID,
+      workItemId: WORK_ITEM_ID,
+      repoTargetId: TARGET_ID,
+      expectedConfigRevision: 1,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fenceToken,
+      requestedProfile: ROLE_PROFILE,
+      ...overrides,
+    });
+
+    expect(prove()).toMatchObject({ assignmentKind: "write", continued: false });
+    expect(prove({ requestedProfile: CLAUDE_PROFILE })).toMatchObject({ assignmentKind: "write", continued: false });
+    expect(prove({ assignmentKind: "review" })).toMatchObject({ assignmentKind: "review", continued: false });
+    expect(prove({ assignmentKind: "review", requestedProfile: CLAUDE_PROFILE })).toMatchObject({ assignmentKind: "review", continued: false });
+
+    const beforeRefusals = exportFoundation(db, PROJECT_ID);
+    for (const overrides of [
+      { requestedProfile: { ...ROLE_PROFILE, model: "wrong-profile" } },
+      { repoTargetId: SECOND_TARGET_ID },
+      { domainId: "foreign-domain" },
+      { taskClass: "foreign-task" },
+      { expectedConfigRevision: 2 },
+    ]) {
+      expect(() => prove(overrides)).toThrow();
+    }
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusals);
+
+    const continuationConfig = structuredClone(config) as typeof config;
+    (continuationConfig.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>).push({
+      roleRequirementId: "worker-luna-v1",
+      roleId: "worker",
+      repoTargetId: TARGET_ID,
+      executedProfile: STANDBY_PROFILE,
+    });
+    const target = bootstrapRequest().targets![0]!;
+    expect(applyWithFixtureReceipt(db, {
+      ...bootstrapRequest(),
+      operationClass: "config_revision",
+      idempotencyKey: "gh654-config-2",
+      expectedConfigRevision: 1,
+      configRevision: 2,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fenceToken,
+      config: continuationConfig,
+      targets: [target],
+    }).outcome).toBe("OK");
+    expect(prove({ expectedConfigRevision: 2 })).toMatchObject({ continued: true, currentConfigRevision: 2 });
+
+    const changedConfig = structuredClone(continuationConfig) as typeof continuationConfig;
+    const changedWorker = (changedConfig.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>).find((requirement) => requirement.roleRequirementId === "worker-v1")!;
+    changedWorker.executedProfile = { ...ROLE_PROFILE, model: "changed-selected-profile" };
+    expect(applyWithFixtureReceipt(db, {
+      ...bootstrapRequest(),
+      operationClass: "config_revision",
+      idempotencyKey: "gh654-config-3",
+      expectedConfigRevision: 2,
+      configRevision: 3,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fenceToken,
+      config: changedConfig,
+      targets: [target],
+    }).outcome).toBe("OK");
+    expect(() => prove({ expectedConfigRevision: 3 })).toThrow();
+  });
+
+  it("rejects duplicate requirement IDs and indistinguishable selectors before config commit", async () => {
+    for (const [suffix, duplicate] of [
+      ["id", { roleRequirementId: "worker-claude-v1", roleId: "worker", repoTargetId: TARGET_ID, executedProfile: { ...CLAUDE_PROFILE, model: "different-profile" } }],
+      ["selector", { roleRequirementId: "worker-duplicate-selector", roleId: "worker", repoTargetId: TARGET_ID, executedProfile: ROLE_PROFILE }],
+    ] as const) {
+      const projectId = `proj_gh654_${suffix}`;
+      const host = await loadedHost(projectId);
+      const db = host.bb.storage.database();
+      seedVerifiedFixtureReceipt(db, { projectId, receiptId: RECEIPT_ID });
+      const invalidConfig = multiProfileRoleConfig();
+      (invalidConfig.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>).push(duplicate);
+      const before = exportFoundation(db, projectId);
+      expect(applyWithFixtureReceipt(db, bootstrapRequest(projectId, { idempotencyKey: `gh654-duplicate-${suffix}`, config: invalidConfig })).outcome).toBe("INVALID_INPUT");
+      expect(exportFoundation(db, projectId)).toEqual(before);
+    }
   });
 
   it("supports an immutable config revision and stable target id", async () => {
