@@ -14772,8 +14772,8 @@ function assertGithubIssueBriefBinding(brief, expected) {
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var RUNTIME_CONTRACT_VERSION = 30;
-var SCHEMA_VERSION = 35;
+var RUNTIME_CONTRACT_VERSION = 29;
+var SCHEMA_VERSION = 34;
 var PREVIOUS_RUNTIME_CONTRACT_VERSION = 27;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
@@ -16204,14 +16204,6 @@ var GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION = `
     CHECK (review_candidate_kind IS NULL OR review_candidate_kind IN ('pull-request', 'local'));
   ALTER TABLE execution_attempts ADD COLUMN review_candidate_json TEXT
     CHECK (review_candidate_json IS NULL OR json_valid(review_candidate_json));
-  UPDATE execution_attempts
-  SET review_candidate_kind = 'pull-request',
-      review_candidate_json = json_object('candidateKind', 'pull-request', 'headSha', review_pr_head_sha, 'prNumber', review_pr_number)
-  WHERE assignment_kind = 'review' AND review_pr_number IS NOT NULL AND review_pr_head_sha IS NOT NULL;
-`;
-MIGRATIONS.push(GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION);
-var GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID = MIGRATIONS.length - 1;
-var GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION = `
   ALTER TABLE execution_attempts ADD COLUMN review_role_requirement_id TEXT;
   ALTER TABLE execution_attempts ADD COLUMN review_role_id TEXT;
   ALTER TABLE execution_attempts ADD COLUMN review_role_generation INTEGER
@@ -16225,9 +16217,13 @@ var GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION = `
     CHECK (review_return_path_json IS NULL OR json_valid(review_return_path_json));
   ALTER TABLE execution_attempts ADD COLUMN dispatch_input_digest TEXT
     CHECK (dispatch_input_digest IS NULL OR dispatch_input_digest GLOB '[0-9a-f]*');
+  UPDATE execution_attempts
+  SET review_candidate_kind = 'pull-request',
+      review_candidate_json = json_object('candidateKind', 'pull-request', 'headSha', review_pr_head_sha, 'prNumber', review_pr_number)
+  WHERE assignment_kind = 'review' AND review_pr_number IS NOT NULL AND review_pr_head_sha IS NOT NULL;
 `;
-MIGRATIONS.push(GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION);
-var GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION_ID = MIGRATIONS.length - 1;
+MIGRATIONS.push(GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION);
+var GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID = MIGRATIONS.length - 1;
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
 var GH300_BACKFILL_MIGRATION_ID = MIGRATIONS.findIndex((statement) => statement.includes("CREATE TABLE execution_attempts_gh300"));
 var CACHED_CONSUMERS = [
@@ -23623,11 +23619,8 @@ function migrateCanonicalStore(db, migrate) {
   assertMigratedSchema(db);
   if (!has(GH637_DOMAIN_MIGRATION_ID)) throw new Error("GH637 migration ledger is incomplete");
   assertGh637MigratedSchema(db);
-  if (!has(GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID) || !tableColumns(db, "execution_attempts").includes("review_candidate_kind") || !tableColumns(db, "execution_attempts").includes("review_candidate_json")) {
+  if (!has(GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID) || !["review_candidate_kind", "review_candidate_json", "review_role_requirement_id", "review_role_id", "review_role_generation", "review_frozen_brief_version", "review_frozen_brief_content", "review_frozen_brief_digest", "review_return_path_json", "dispatch_input_digest"].every((column) => tableColumns(db, "execution_attempts").includes(column))) {
     throw new Error("GH644 migration ledger is incomplete");
-  }
-  if (!has(GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION_ID) || !["review_role_requirement_id", "review_role_id", "review_role_generation", "review_frozen_brief_version", "review_frozen_brief_content", "review_frozen_brief_digest", "review_return_path_json", "dispatch_input_digest"].every((column) => tableColumns(db, "execution_attempts").includes(column))) {
-    throw new Error("GH644 authority migration ledger is incomplete");
   }
 }
 function databaseIsReady(db) {
@@ -25888,7 +25881,7 @@ async function dispatchEnvironmentPreflight(bb, projectId, environment, proof, w
         bb.sdk.environments.get({ environmentId: candidateEnvironment.environmentId }),
         bb.sdk.projects.get({ projectId })
       ]);
-      if (facts.id !== candidateEnvironment.environmentId || facts.projectId !== projectId || facts.hostId !== candidateEnvironment.hostId || candidateEnvironment.bbServerId !== bb.server.loopbackBaseUrl || facts.path !== candidateEnvironment.path || facts.managed !== true || facts.isWorktree !== true || facts.workspaceProvisionType !== "managed-worktree" || project.sources.filter((source) => source.id === candidateEnvironment.sourceId && source.projectId === projectId && source.hostId === candidateEnvironment.hostId && source.path === candidateEnvironment.path).length !== 1) return { outcome: "REPO_TARGET_FOREIGN", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "local candidate environment identity is foreign or incomplete" };
+      if (facts.id !== candidateEnvironment.environmentId || facts.projectId !== projectId || facts.hostId !== candidateEnvironment.hostId || candidateEnvironment.sourceId !== proof.sourceId || candidateEnvironment.hostId !== proof.hostId || candidateEnvironment.bbServerId !== bb.server.loopbackBaseUrl || facts.path !== candidateEnvironment.path || facts.managed !== true || facts.isWorktree !== true || facts.workspaceProvisionType !== "managed-worktree" || project.sources.filter((source) => source.id === proof.sourceId && source.projectId === projectId && source.hostId === proof.hostId && source.path === proof.path).length !== 1) return { outcome: "REPO_TARGET_FOREIGN", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "local candidate environment identity is foreign or incomplete" };
       const base = workAttempt.reviewBaseSha;
       const [baseCommit, candidateCommit, status] = await Promise.all([
         bb.sdk.environments.diff({ environmentId: candidateEnvironment.environmentId, target: "commit", sha: base }),

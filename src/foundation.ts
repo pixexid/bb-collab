@@ -10,8 +10,8 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
-export const RUNTIME_CONTRACT_VERSION = 30;
-export const SCHEMA_VERSION = 35;
+export const RUNTIME_CONTRACT_VERSION = 29;
+export const SCHEMA_VERSION = 34;
 // v27 records correlated terminal evidence and first-class interrupted attempts.
 const PREVIOUS_RUNTIME_CONTRACT_VERSION = 27;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
@@ -1453,17 +1453,6 @@ const GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION = `
     CHECK (review_candidate_kind IS NULL OR review_candidate_kind IN ('pull-request', 'local'));
   ALTER TABLE execution_attempts ADD COLUMN review_candidate_json TEXT
     CHECK (review_candidate_json IS NULL OR json_valid(review_candidate_json));
-  UPDATE execution_attempts
-  SET review_candidate_kind = 'pull-request',
-      review_candidate_json = json_object('candidateKind', 'pull-request', 'headSha', review_pr_head_sha, 'prNumber', review_pr_number)
-  WHERE assignment_kind = 'review' AND review_pr_number IS NOT NULL AND review_pr_head_sha IS NOT NULL;
-`;
-MIGRATIONS.push(GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION);
-export const GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID = MIGRATIONS.length - 1;
-
-// GH644 authority: local review attempts retain the selected reviewer generation,
-// frozen brief/return path, and the exact native input digest used for dispatch.
-const GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION = `
   ALTER TABLE execution_attempts ADD COLUMN review_role_requirement_id TEXT;
   ALTER TABLE execution_attempts ADD COLUMN review_role_id TEXT;
   ALTER TABLE execution_attempts ADD COLUMN review_role_generation INTEGER
@@ -1477,9 +1466,13 @@ const GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION = `
     CHECK (review_return_path_json IS NULL OR json_valid(review_return_path_json));
   ALTER TABLE execution_attempts ADD COLUMN dispatch_input_digest TEXT
     CHECK (dispatch_input_digest IS NULL OR dispatch_input_digest GLOB '[0-9a-f]*');
+  UPDATE execution_attempts
+  SET review_candidate_kind = 'pull-request',
+      review_candidate_json = json_object('candidateKind', 'pull-request', 'headSha', review_pr_head_sha, 'prNumber', review_pr_number)
+  WHERE assignment_kind = 'review' AND review_pr_number IS NOT NULL AND review_pr_head_sha IS NOT NULL;
 `;
-MIGRATIONS.push(GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION);
-export const GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION_ID = MIGRATIONS.length - 1;
+MIGRATIONS.push(GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION);
+export const GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID = MIGRATIONS.length - 1;
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
 export const GH300_BACKFILL_MIGRATION_ID = MIGRATIONS.findIndex((statement) => statement.includes("CREATE TABLE execution_attempts_gh300"));
@@ -10955,11 +10948,8 @@ export function migrateCanonicalStore(
   assertMigratedSchema(db);
   if (!has(GH637_DOMAIN_MIGRATION_ID)) throw new Error("GH637 migration ledger is incomplete");
   assertGh637MigratedSchema(db);
-  if (!has(GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID) || !tableColumns(db, "execution_attempts").includes("review_candidate_kind") || !tableColumns(db, "execution_attempts").includes("review_candidate_json")) {
+  if (!has(GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID) || !["review_candidate_kind", "review_candidate_json", "review_role_requirement_id", "review_role_id", "review_role_generation", "review_frozen_brief_version", "review_frozen_brief_content", "review_frozen_brief_digest", "review_return_path_json", "dispatch_input_digest"].every((column) => tableColumns(db, "execution_attempts").includes(column))) {
     throw new Error("GH644 migration ledger is incomplete");
-  }
-  if (!has(GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION_ID) || !["review_role_requirement_id", "review_role_id", "review_role_generation", "review_frozen_brief_version", "review_frozen_brief_content", "review_frozen_brief_digest", "review_return_path_json", "dispatch_input_digest"].every((column) => tableColumns(db, "execution_attempts").includes(column))) {
-    throw new Error("GH644 authority migration ledger is incomplete");
   }
 }
 

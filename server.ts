@@ -1589,9 +1589,10 @@ async function dispatchEnvironmentPreflight(
       ]);
       if (
         facts.id !== candidateEnvironment.environmentId || facts.projectId !== projectId || facts.hostId !== candidateEnvironment.hostId ||
+        candidateEnvironment.sourceId !== proof.sourceId || candidateEnvironment.hostId !== proof.hostId ||
         candidateEnvironment.bbServerId !== bb.server.loopbackBaseUrl ||
         facts.path !== candidateEnvironment.path || facts.managed !== true || facts.isWorktree !== true || facts.workspaceProvisionType !== "managed-worktree" ||
-        project.sources.filter((source) => source.id === candidateEnvironment.sourceId && source.projectId === projectId && source.hostId === candidateEnvironment.hostId && source.path === candidateEnvironment.path).length !== 1
+        project.sources.filter((source) => source.id === proof.sourceId && source.projectId === projectId && source.hostId === proof.hostId && source.path === proof.path).length !== 1
       ) return { outcome: "REPO_TARGET_FOREIGN", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "local candidate environment identity is foreign or incomplete" };
       const base = workAttempt.reviewBaseSha!;
       const [baseCommit, candidateCommit, status] = await Promise.all([
