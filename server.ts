@@ -1568,13 +1568,14 @@ async function dispatchEnvironmentPreflight(
       const workspace = status.workspace;
       const checkout = workspace?.checkout;
       const workingTree = workspace?.workingTree as { state?: string; hasUncommittedChanges?: boolean; files?: unknown[]; insertions?: number; deletions?: number } | undefined;
-      const clean = workingTree?.state === "clean" && workingTree.hasUncommittedChanges === false
-        || Array.isArray(workingTree?.files) && workingTree.files.length === 0 && workingTree.insertions === 0 && workingTree.deletions === 0;
+      const clean = (workingTree?.state === "clean" || workingTree?.state === "committed_unmerged") &&
+        workingTree.hasUncommittedChanges === false && Array.isArray(workingTree.files) &&
+        workingTree.files.length === 0 && workingTree.insertions === 0 && workingTree.deletions === 0;
       const mergeBase = workspace.mergeBase;
       if (
         !checkout || checkout.kind !== "branch" || checkout.headSha !== workAttempt.reviewCandidateSha ||
         checkout.branchName !== workAttempt.reviewCandidateCheckout?.branchName || !clean ||
-        !mergeBase || mergeBase.baseRef !== base || mergeBase.mergeBaseBranch !== base || mergeBase.behindCount !== 0 || mergeBase.hasCommittedUnmergedChanges !== false || mergeBase.lineStatsComplete !== true
+        !mergeBase || mergeBase.baseRef !== base || mergeBase.mergeBaseBranch !== base || mergeBase.behindCount !== 0 || mergeBase.lineStatsComplete !== true
       ) return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "local candidate is not the exact reachable clean frozen checkout based on the frozen base" };
     } catch (error) {
       return { outcome: "EXTERNAL_UNAVAILABLE", subject: projectId, expected: 1, attempted: 1, verified: 0, message: `local candidate observation is unavailable: ${String(error)}` };

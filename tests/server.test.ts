@@ -5440,8 +5440,8 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       outcome: "available",
       workspace: {
         checkout: { kind: "branch", branchName: "bb/local-review", headSha: CANDIDATE_SHA },
-        mergeBase: { aheadCount: 1, baseRef: BASE_SHA, behindCount: 0, commits: [], deletions: 0, files: [], hasCommittedUnmergedChanges: false, insertions: 0, lineStatsComplete: true, mergeBaseBranch: BASE_SHA },
-        workingTree: { deletions: 0, files: [], hasUncommittedChanges: false, insertions: 0, lineStatsComplete: true, state: "clean" },
+        mergeBase: { aheadCount: 1, baseRef: BASE_SHA, behindCount: 0, commits: [], deletions: 0, files: [], hasCommittedUnmergedChanges: true, insertions: 0, lineStatsComplete: true, mergeBaseBranch: BASE_SHA },
+        workingTree: { deletions: 0, files: [], hasUncommittedChanges: false, insertions: 0, lineStatsComplete: true, state: "committed_unmerged" },
       },
     })) as never);
     const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
@@ -5471,8 +5471,8 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       outcome: "available",
       workspace: {
         checkout: { kind: "branch", branchName: "bb/local-review", headSha: CANDIDATE_SHA },
-        mergeBase: { aheadCount: 1, baseRef: BASE_SHA, behindCount: 0, commits: [], deletions: 0, files: [], hasCommittedUnmergedChanges: false, insertions: 0, lineStatsComplete: true, mergeBaseBranch: BASE_SHA },
-        workingTree: { deletions: 0, files: [], hasUncommittedChanges: false, insertions: 0, lineStatsComplete: true, state: "clean" },
+        mergeBase: { aheadCount: 1, baseRef: BASE_SHA, behindCount: 0, commits: [], deletions: 0, files: [], hasCommittedUnmergedChanges: true, insertions: 0, lineStatsComplete: true, mergeBaseBranch: BASE_SHA },
+        workingTree: { deletions: 0, files: [], hasUncommittedChanges: false, insertions: 0, lineStatsComplete: true, state: "committed_unmerged" },
       },
     };
     fixture.host.harness.sdk.stub("environments.diff", (async () => ({ outcome: "available" })) as never);
@@ -9602,7 +9602,7 @@ else printf '%s\\n' '[]'; fi
 
   it("appends authority-root schema and bumps the runtime contract", () => {
     expect(SCHEMA_VERSION).toBe(34);
-    expect(RUNTIME_CONTRACT_VERSION).toBe(30);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(29);
     expect(MIGRATIONS).toHaveLength(47);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
@@ -9629,7 +9629,7 @@ else printf '%s\\n' '[]'; fi
       oldSchemaVersion: 32,
       newSchemaVersion: 34,
       oldContractVersion: 27,
-      newContractVersion: 30,
+      newContractVersion: 29,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -9639,20 +9639,20 @@ else printf '%s\\n' '[]'; fi
       oldSchemaVersion: 32,
       newSchemaVersion: 34,
       oldContractVersion: 27,
-      newContractVersion: 30,
+      newContractVersion: 29,
       action: "refused",
       expected: 4,
       attempted: 4,
       verified: 0,
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ action: "refused", verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(34, 30))).toMatchObject({ action: "reread", verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(34, 29))).toMatchObject({ action: "reread", verified: 4 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 32,
       newSchemaVersion: 34,
       oldContractVersion: 27,
-      newContractVersion: 30,
+      newContractVersion: 29,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -9921,7 +9921,7 @@ else printf '%s\\n' '[]'; fi
   });
 
   it("assembles the production v22 cached-consumer rollout receipt with stale-v21 refusal semantics", async () => {
-    expect(RUNTIME_CONTRACT_VERSION).toBe(30);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(29);
     expect(SCHEMA_VERSION).toBe(34);
     expect(MIGRATIONS).toHaveLength(47);
     expect(contractDigest).not.toBe("d4e51b0b1fd68957120cea5febb7762d6c3b9eddab76f67916e556830b062b83");
@@ -9940,7 +9940,7 @@ else printf '%s\\n' '[]'; fi
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 34, observedContractVersion: 30 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 34, observedContractVersion: 29 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -10565,7 +10565,7 @@ else printf '%s\\n' '[]'; fi
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
       observedSchemaVersion: 34,
-      observedContractVersion: 30,
+      observedContractVersion: 29,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -10647,7 +10647,7 @@ else printf '%s\\n' '[]'; fi
       evidence: {
         cachedConsumers: {
           oldContractVersion: 27,
-          newContractVersion: 30,
+          newContractVersion: 29,
           action: "unknown",
           expected: 4,
           attempted: 0,
@@ -10795,7 +10795,7 @@ else printf '%s\\n' '[]'; fi
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 34, schemaDigest, contractVersion: 30, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 34, schemaDigest, contractVersion: 29, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -14646,10 +14646,10 @@ else printf '%s\\n' '[]'; fi
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 30, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 30, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 30, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(34, 30))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 30, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 29, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 29, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 29, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(34, 29))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 29, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 
