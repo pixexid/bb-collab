@@ -16035,15 +16035,119 @@ var GH637_DOMAIN_MIGRATION = `
   ALTER TABLE execution_attempts ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'default';
   ALTER TABLE lane_capacity_intervals ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'default';
   ALTER TABLE lane_capacity_refresh_evidence ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'default';
-  CREATE UNIQUE INDEX role_generations_domain_identity
-    ON role_generations(project_id, role_id, generation, domain_id);
   INSERT INTO orchestration_domains
     (project_id, config_revision, domain_id, task_classes_json, role_requirements_json, domain_digest)
   SELECT project_id, config_revision, 'default', '["default"]',
          COALESCE(json_extract(canonical_config_json, '$.extensions.bbCollab.roleRequirements'), '[]'),
          config_digest
     FROM project_config_revisions;
-  ALTER TABLE role_generation_heads RENAME TO role_generation_heads_gh637_old;
+  PRAGMA defer_foreign_keys = ON;
+  CREATE TEMP TABLE gh637_role_generations AS SELECT * FROM role_generations;
+  CREATE TEMP TABLE gh637_assignments AS SELECT * FROM assignments;
+  CREATE TEMP TABLE gh637_role_generation_heads AS SELECT * FROM role_generation_heads;
+  CREATE TEMP TABLE gh637_execution_attempts AS SELECT * FROM execution_attempts;
+  CREATE TEMP TABLE gh637_evidence_artifacts AS SELECT * FROM evidence_artifacts;
+  CREATE TEMP TABLE gh637_decision_evidence AS SELECT * FROM decision_evidence;
+  CREATE TEMP TABLE gh637_lane_capacity_refresh_evidence AS SELECT * FROM lane_capacity_refresh_evidence;
+  DROP TRIGGER IF EXISTS lane_capacity_refresh_evidence_immutable_update;
+  DROP TRIGGER IF EXISTS lane_capacity_refresh_evidence_immutable_delete;
+  DELETE FROM decision_evidence;
+  DELETE FROM evidence_artifacts;
+  DELETE FROM lane_capacity_refresh_evidence;
+  DELETE FROM execution_attempts;
+  DELETE FROM assignments;
+  DELETE FROM role_generation_heads;
+  DELETE FROM role_generations;
+  DROP TABLE role_generation_heads;
+  DROP TABLE assignments;
+  DROP TABLE role_generations;
+  CREATE TABLE role_generations (
+    project_id TEXT NOT NULL,
+    role_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    role_requirement_id TEXT NOT NULL,
+    config_revision INTEGER NOT NULL,
+    repo_target_id TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'draining', 'retired', 'invalidated')),
+    predecessor_generation INTEGER,
+    holder_execution_attempt_id TEXT NOT NULL,
+    holder_context_digest TEXT NOT NULL,
+    holder_requested_profile_digest TEXT NOT NULL,
+    qualification_id TEXT NOT NULL,
+    eligibility_derivation_digest TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    activated_at_ms INTEGER NOT NULL,
+    retired_at_ms INTEGER,
+    standby_profile_json TEXT CHECK (standby_profile_json IS NULL OR json_valid(standby_profile_json)),
+    domain_id TEXT NOT NULL DEFAULT 'default',
+    PRIMARY KEY (project_id, role_id, generation, domain_id),
+    FOREIGN KEY (project_id, config_revision)
+      REFERENCES project_config_revisions(project_id, config_revision),
+    FOREIGN KEY (project_id, repo_target_id, config_revision)
+      REFERENCES repository_targets(project_id, repo_target_id, config_revision),
+    FOREIGN KEY (project_id, qualification_id)
+      REFERENCES qualification_observations(project_id, qualification_id),
+    FOREIGN KEY (project_id, role_id, predecessor_generation, domain_id)
+      REFERENCES role_generations(project_id, role_id, generation, domain_id),
+    CHECK ((generation = 1 AND predecessor_generation IS NULL) OR
+           (generation > 1 AND predecessor_generation = generation - 1))
+  );
+  CREATE TABLE assignments (
+    project_id TEXT NOT NULL,
+    assignment_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL,
+    assignment_kind TEXT NOT NULL CHECK (assignment_kind IN ('write', 'review', 'probe')),
+    lane_id TEXT NOT NULL,
+    role_requirement_id TEXT NOT NULL,
+    role_id TEXT NOT NULL,
+    role_generation INTEGER NOT NULL CHECK (role_generation > 0),
+    config_revision INTEGER NOT NULL,
+    governance_epoch INTEGER NOT NULL CHECK (governance_epoch > 0),
+    work_item_revision INTEGER NOT NULL CHECK (work_item_revision > 0),
+    repo_target_id TEXT NOT NULL,
+    branch_name TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    candidate_semantics TEXT NOT NULL CHECK (candidate_semantics IN ('base', 'frozen')),
+    candidate_sha TEXT,
+    bb_server_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    environment_path TEXT NOT NULL,
+    environment_mode TEXT NOT NULL CHECK (environment_mode = 'managed-worktree'),
+    frozen_brief_version INTEGER NOT NULL CHECK (frozen_brief_version = 1),
+    frozen_brief_digest TEXT NOT NULL,
+    requested_provider_id TEXT NOT NULL,
+    requested_model TEXT NOT NULL,
+    requested_reasoning_level TEXT NOT NULL,
+    requested_permission_mode TEXT NOT NULL CHECK (requested_permission_mode = 'full'),
+    requested_service_tier TEXT NOT NULL,
+    requested_visibility TEXT NOT NULL CHECK (requested_visibility = 'visible'),
+    requested_profile_digest TEXT NOT NULL,
+    dispatch_kind TEXT NOT NULL CHECK (dispatch_kind IN ('spawn', 'attach')),
+    attach_thread_id TEXT,
+    parent_assignment_id TEXT,
+    depth INTEGER NOT NULL CHECK (depth = 0),
+    deadline_at_ms INTEGER NOT NULL CHECK (deadline_at_ms >= 0),
+    assignment_digest TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    creation_event_sequence INTEGER NOT NULL CHECK (creation_event_sequence > 0),
+    created_at_ms INTEGER NOT NULL,
+    domain_id TEXT NOT NULL DEFAULT 'default',
+    PRIMARY KEY (project_id, assignment_id),
+    FOREIGN KEY (project_id, work_item_id)
+      REFERENCES work_items(project_id, work_item_id),
+    FOREIGN KEY (project_id, repo_target_id, config_revision)
+      REFERENCES repository_targets(project_id, repo_target_id, config_revision),
+    FOREIGN KEY (project_id, role_id, role_generation, domain_id)
+      REFERENCES role_generations(project_id, role_id, generation, domain_id),
+    FOREIGN KEY (project_id, parent_assignment_id)
+      REFERENCES assignments(project_id, assignment_id),
+    CHECK ((candidate_semantics = 'base' AND candidate_sha IS NULL) OR
+           (candidate_semantics = 'frozen' AND candidate_sha IS NOT NULL)),
+    CHECK ((dispatch_kind = 'spawn' AND attach_thread_id IS NULL) OR
+           (dispatch_kind = 'attach' AND attach_thread_id IS NOT NULL))
+  );
   CREATE TABLE role_generation_heads (
     project_id TEXT NOT NULL,
     role_id TEXT NOT NULL,
@@ -16054,10 +16158,42 @@ var GH637_DOMAIN_MIGRATION = `
     FOREIGN KEY (project_id, role_id, current_generation, domain_id)
       REFERENCES role_generations(project_id, role_id, generation, domain_id)
   );
+  INSERT INTO role_generations (
+    project_id, role_id, generation, role_requirement_id, config_revision, repo_target_id, status,
+    predecessor_generation, holder_execution_attempt_id, holder_context_digest, holder_requested_profile_digest,
+    qualification_id, eligibility_derivation_digest, created_at_ms, activated_at_ms, retired_at_ms,
+    standby_profile_json, domain_id
+  ) SELECT project_id, role_id, generation, role_requirement_id, config_revision, repo_target_id, status,
+    predecessor_generation, holder_execution_attempt_id, holder_context_digest, holder_requested_profile_digest,
+    qualification_id, eligibility_derivation_digest, created_at_ms, activated_at_ms, retired_at_ms,
+    standby_profile_json, COALESCE(domain_id, 'default') FROM gh637_role_generations;
+  INSERT INTO assignments SELECT project_id, assignment_id, work_item_id, assignment_kind, lane_id,
+    role_requirement_id, role_id, role_generation, config_revision, governance_epoch, work_item_revision,
+    repo_target_id, branch_name, base_sha, candidate_semantics, candidate_sha, bb_server_id, environment_id,
+    source_id, host_id, environment_path, environment_mode, frozen_brief_version, frozen_brief_digest,
+    requested_provider_id, requested_model, requested_reasoning_level, requested_permission_mode,
+    requested_service_tier, requested_visibility, requested_profile_digest, dispatch_kind, attach_thread_id,
+    parent_assignment_id, depth, deadline_at_ms, assignment_digest, idempotency_key, creation_event_sequence,
+    created_at_ms, COALESCE(domain_id, 'default') FROM gh637_assignments;
   INSERT INTO role_generation_heads (project_id, role_id, domain_id, current_generation, updated_at_ms)
-    SELECT project_id, role_id, 'default', current_generation, updated_at_ms
-      FROM role_generation_heads_gh637_old;
-  DROP TABLE role_generation_heads_gh637_old;
+    SELECT project_id, role_id, 'default', current_generation, updated_at_ms FROM gh637_role_generation_heads;
+  INSERT INTO execution_attempts SELECT * FROM gh637_execution_attempts;
+  INSERT INTO evidence_artifacts SELECT * FROM gh637_evidence_artifacts;
+  INSERT INTO decision_evidence SELECT * FROM gh637_decision_evidence;
+  INSERT INTO lane_capacity_refresh_evidence SELECT * FROM gh637_lane_capacity_refresh_evidence;
+  CREATE TRIGGER lane_capacity_refresh_evidence_immutable_update
+    BEFORE UPDATE ON lane_capacity_refresh_evidence
+    BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;
+  CREATE TRIGGER lane_capacity_refresh_evidence_immutable_delete
+    BEFORE DELETE ON lane_capacity_refresh_evidence
+    BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;
+  DROP TABLE gh637_lane_capacity_refresh_evidence;
+  DROP TABLE gh637_decision_evidence;
+  DROP TABLE gh637_evidence_artifacts;
+  DROP TABLE gh637_execution_attempts;
+  DROP TABLE gh637_role_generation_heads;
+  DROP TABLE gh637_assignments;
+  DROP TABLE gh637_role_generations;
 `;
 MIGRATIONS.push(GH637_DOMAIN_MIGRATION);
 var GH637_DOMAIN_MIGRATION_ID = MIGRATIONS.length - 1;
@@ -20064,7 +20200,7 @@ function applyRoleGenerationSuccession(db, request, digest2, context) {
   let nextGeneration;
   if (first) {
     if (head) throw refusal("ROLE_GENERATION_STALE", "first generation requires no current role head", { currentResourceRevision: head.current_generation });
-    nextGeneration = db.prepare("SELECT COALESCE(MAX(generation), 0) AS generation FROM role_generations WHERE project_id = ? AND role_id = ?").get(request.projectId, request.roleId).generation + 1;
+    nextGeneration = db.prepare("SELECT COALESCE(MAX(generation), 0) AS generation FROM role_generations WHERE project_id = ? AND role_id = ? AND domain_id = ?").get(request.projectId, request.roleId, resolved.domainId).generation + 1;
   } else {
     if (request.expectedGeneration === null || request.predecessorGeneration === null) {
       throw refusal("ROLE_PREDECESSOR_MISMATCH", "successor requires matching expected and predecessor generations");
@@ -22348,7 +22484,7 @@ function tableRows(db, table, projectId, offset) {
     assignments: "assignment_id",
     execution_attempts: "execution_attempt_id",
     role_generations: "role_id, generation",
-    role_generation_heads: "role_id",
+    role_generation_heads: "role_id, domain_id",
     lane_capacity_intervals: "interval_id",
     lane_capacity_refresh_evidence: "lane_capacity_observation_id, execution_attempt_id",
     operator_messages: "message_id"
@@ -22837,7 +22973,8 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
     const observationCount = asRow(
       db.prepare("SELECT COUNT(*) AS count FROM qualification_observations WHERE project_id = ?").get(projectId)
     )?.count ?? 0;
-    const configuredRequirements = flatDomainRequirements(storedConfigJson(db, projectId, configHead.config_revision));
+    const configuredDomainInventory = configuredDomains(db, projectId, configHead.config_revision);
+    const configuredRequirements = configuredDomainInventory.flatMap((domain2) => domain2.roleRequirements.map((requirement) => ({ ...requirement, domainId: domain2.domainId })));
     const hasDomainEligibility = tableColumns(db, "eligibility_projections").includes("domain_id");
     const eligibility = db.prepare(
       `SELECT role_requirement_id, ${hasDomainEligibility ? "domain_id," : "'default' AS domain_id,"} requested_profile_digest, current_qualification_id, effective_status,
@@ -22923,6 +23060,11 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
         unresolvedRoleHolders,
         routing,
         qualificationObservationCount: observationCount,
+        domains: configuredDomainInventory.map((domain2) => ({
+          domainId: domain2.domainId,
+          taskClasses: domain2.taskClasses,
+          roleRequirementIds: domain2.roleRequirements.map((requirement) => requirement.roleRequirementId)
+        })),
         eligibility,
         assignments: assignmentAttempts,
         profileAudit,
@@ -22953,6 +23095,7 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
       }
     });
   } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult(projectId, error48.data);
     return result("BB_FACTS_UNAVAILABLE", projectId, 1, 0, 0, { message: String(error48) });
   }
 }
@@ -24351,6 +24494,14 @@ async function startableQueueStateAsync(db, projectId, repositories) {
   let blockedCount = 0;
   let waitingExternalCount = 0;
   const heads = [];
+  const domainStates = {};
+  try {
+    const configHead = db?.prepare("SELECT config_revision FROM project_config_heads WHERE project_id = ?").get(projectId);
+    if (!db || !configHead) return null;
+    for (const domain2 of configuredDomains(db, projectId, configHead.config_revision)) domainStates[domain2.domainId] = { count: 0, head: null, known: true, reason: null };
+  } catch {
+    return null;
+  }
   const dispatched = [];
   const isIssue = (issue2) => Boolean(issue2 && typeof issue2 === "object" && !Array.isArray(issue2) && typeof issue2.number === "number" && Number.isSafeInteger(issue2.number) && issue2.number > 0 && Array.isArray(issue2.labels) && issue2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string"));
   const inventories = await Promise.all(repositories.map(async (repository, index) => ({
@@ -24371,8 +24522,30 @@ async function startableQueueStateAsync(db, projectId, repositories) {
     dispatched.push(...issues.filter((issue2) => issue2.labels.filter((label) => label.name.startsWith("queue:")).every((label) => label.name === "queue:dispatched") && issue2.labels.some((label) => label.name === "queue:dispatched")).map((issue2) => ({ repository, number: issue2.number })));
     const numbers = exactStartable.map((issue2) => issue2.number);
     if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
+    for (const issue2 of exactStartable) {
+      const [owner, repo] = repository.split("/");
+      const matches = db.prepare(
+        `SELECT items.domain_id
+           FROM work_items AS items JOIN external_work_refs AS refs
+             ON refs.project_id = items.project_id AND refs.work_item_id = items.work_item_id
+          WHERE items.project_id = ? AND items.lifecycle_state IN ('proposed', 'ready')
+            AND refs.provider = 'github' AND refs.owner = ? AND refs.repo = ? AND refs.issue_number = ?`
+      ).all(projectId, owner, repo, issue2.number);
+      if (matches.length !== 1) {
+        continue;
+      }
+      const domainId = matches[0].domain_id ?? "default";
+      const state = domainStates[domainId];
+      if (!state) {
+        continue;
+      }
+      if (!state.known) continue;
+      state.count += 1;
+      const issueHead = `${repository}#${issue2.number}`;
+      if (state.head === null || issueHead < state.head) state.head = issueHead;
+    }
   }
-  return { count, head: heads.sort()[0] ?? null, unlabelledCount, blockedCount, waitingExternalCount, dispatched: dispatched.sort((left, right) => left.repository.localeCompare(right.repository) || left.number - right.number) };
+  return { count, head: heads.sort()[0] ?? null, domains: domainStates, unlabelledCount, blockedCount, waitingExternalCount, dispatched: dispatched.sort((left, right) => left.repository.localeCompare(right.repository) || left.number - right.number) };
 }
 function dispatchedWithoutLiveLane(db, projectId, issues, lanes) {
   const visibleThreadIds = new Set(lanes.map((lane) => lane.id));
@@ -26846,34 +27019,48 @@ ${thread.titleFallback ?? ""}`);
     }
   };
   const bindRoleQueueHead = (projectId, configIdentity, queue, observedAtMs) => {
-    let head = null;
-    let reason = null;
-    if (queue.head !== null) {
-      const match = queue.head.match(/^([^/]+)\/([^/#]+)#([1-9][0-9]*)$/u);
-      const issueNumber = match?.[3] === void 0 ? Number.NaN : Number(match[3]);
-      if (!match?.[1] || !match[2] || !Number.isSafeInteger(issueNumber)) {
-        reason = "startable-queue-head-malformed";
-      } else {
-        const matches = db?.prepare(
-          `SELECT items.work_item_id, items.resource_revision
-           FROM work_items AS items JOIN external_work_refs AS refs
-             ON refs.project_id = items.project_id AND refs.work_item_id = items.work_item_id
-           WHERE items.project_id = ? AND items.lifecycle_state IN ('proposed', 'ready')
-             AND refs.provider = 'github' AND refs.owner = ? AND refs.repo = ? AND refs.issue_number = ?`
-        ).all(projectId, match[1], match[2], issueNumber);
-        if (!matches || matches.length !== 1) reason = `startable-queue-head-bindings:${matches?.length ?? 0}`;
-        else head = { workItemId: matches[0].work_item_id, resourceRevision: matches[0].resource_revision };
+    const bind = (queueHead, domainId) => {
+      let head = null;
+      let reason2 = null;
+      if (queueHead !== null) {
+        const match = queueHead.match(/^([^/]+)\/([^/#]+)#([1-9][0-9]*)$/u);
+        const issueNumber = match?.[3] === void 0 ? Number.NaN : Number(match[3]);
+        if (!match?.[1] || !match[2] || !Number.isSafeInteger(issueNumber)) {
+          reason2 = "startable-queue-head-malformed";
+        } else {
+          const matches = db?.prepare(
+            `SELECT items.work_item_id, items.resource_revision
+             FROM work_items AS items JOIN external_work_refs AS refs
+               ON refs.project_id = items.project_id AND refs.work_item_id = items.work_item_id
+             WHERE items.project_id = ? AND items.lifecycle_state IN ('proposed', 'ready')
+               AND refs.provider = 'github' AND refs.owner = ? AND refs.repo = ? AND refs.issue_number = ?`
+          ).all(projectId, match[1], match[2], issueNumber);
+          if (!matches || matches.length !== 1) reason2 = `startable-queue-head-bindings:${matches?.length ?? 0}`;
+          else if (domainId !== void 0) {
+            const item = db?.prepare("SELECT domain_id FROM work_items WHERE project_id = ? AND work_item_id = ?").get(projectId, matches[0].work_item_id);
+            if ((item?.domain_id ?? "default") !== domainId) reason2 = `startable-queue-head-out-of-domain:${domainId}`;
+            else head = { workItemId: matches[0].work_item_id, resourceRevision: matches[0].resource_revision };
+          } else {
+            head = { workItemId: matches[0].work_item_id, resourceRevision: matches[0].resource_revision };
+          }
+        }
       }
-    }
-    return { observedAtMs, configIdentity, known: reason === null, reason, head };
+      return { head, reason: reason2 };
+    };
+    const domains = Object.fromEntries(Object.entries(queue.domains).map(([domainId, state]) => {
+      if (!state.known) return [domainId, { known: false, reason: state.reason, head: null }];
+      const bound = bind(state.head, domainId);
+      return [domainId, { known: bound.reason === null, reason: bound.reason, head: bound.head }];
+    }));
+    const global = bind(queue.head);
+    const domainReason = Object.values(domains).find((state) => state.reason !== null)?.reason ?? null;
+    const reason = global.reason ?? domainReason;
+    return { observedAtMs, configIdentity, known: reason === null, reason, head: global.head, domains };
   };
   const scopeRoleQueueRead = (projectId, domainId, queue) => {
-    if (!queue.head || !db) return queue;
-    const item = db.prepare("SELECT domain_id FROM work_items WHERE project_id = ? AND work_item_id = ?").get(projectId, queue.head.workItemId);
-    if ((item?.domain_id ?? "default") !== domainId) {
-      return { ...queue, known: false, reason: `role-queue-head-out-of-domain:${domainId}`, head: null };
-    }
-    return queue;
+    const scoped = queue.domains[domainId];
+    if (!scoped) return { ...queue, known: false, reason: `role-queue-domain-unknown:${domainId}`, head: null };
+    return { ...queue, known: scoped.known, reason: scoped.reason, head: scoped.head };
   };
   const readProjectRoleQueue = async (projectId, refresh = false) => {
     const now2 = Date.now();
@@ -26886,11 +27073,12 @@ ${thread.titleFallback ?? ""}`);
       if (refreshing.configIdentity === config2.identity) return refreshing.promise;
       const reason = "project-config-superseded-in-flight";
       bb.log.warn(`role queue coverage=degraded project=${projectId} reason=${reason}`);
-      return { observedAtMs: now2, configIdentity: config2.identity, known: false, reason, head: null };
+      return { observedAtMs: now2, configIdentity: config2.identity, known: false, reason, head: null, domains: {} };
     }
     const next = (async () => {
       let reason = config2.reason;
       let head = null;
+      let domains = {};
       try {
         if (reason === null) {
           if (!db) throw new Error("canonical-store-unavailable");
@@ -26900,7 +27088,10 @@ ${thread.titleFallback ?? ""}`);
           } else if (queue.head !== null) {
             const bound = bindRoleQueueHead(projectId, config2.identity, queue, Date.now());
             head = bound.head;
+            domains = bound.domains;
             reason = bound.reason;
+          } else if (queue !== null) {
+            domains = Object.fromEntries(Object.entries(queue.domains).map(([domainId, state]) => [domainId, { known: state.known, reason: state.reason, head: null }]));
           }
         }
       } catch (error48) {
@@ -26910,8 +27101,9 @@ ${thread.titleFallback ?? ""}`);
       if (currentConfig2.identity !== config2.identity) {
         reason = "project-config-moved-during-refresh";
         head = null;
+        domains = {};
       }
-      const result2 = { observedAtMs: Date.now(), configIdentity: config2.identity, known: reason === null, reason, head };
+      const result2 = { observedAtMs: Date.now(), configIdentity: config2.identity, known: reason === null, reason, head, domains };
       if (currentConfig2.identity === config2.identity) roleQueueCache.set(projectId, result2);
       if (reason !== null) bb.log.warn(`role queue coverage=degraded project=${projectId} reason=${reason}`);
       return result2;
@@ -27480,7 +27672,7 @@ ${thread.titleFallback ?? ""}`);
       return queue?.known === true && queue.configIdentity === readRoleQueueConfig(projectId).identity && ageMs >= 0 && ageMs < ROLE_QUEUE_CACHE_MS ? queue.head : null;
     },
     wakeRole: async (role) => {
-      const queue = await readProjectRoleQueue(role.projectId, true);
+      const queue = scopeRoleQueueRead(role.projectId, role.domainId ?? "default", await readProjectRoleQueue(role.projectId, true));
       const result2 = queue.head ? await steerRole({ ...role, queueHeadId: queue.head.workItemId }) : queue.known ? false : "error";
       return result2 === true ? { attempted: true, delivered: true } : { attempted: false, delivered: false, refusal: result2 === "error" ? "error" : "policy" };
     },
@@ -28959,6 +29151,7 @@ export {
   isLiveCachedConsumerRolloutArtifact,
   readLiveRoleFactReader,
   reportProjectWorktreeCleanup,
-  rpcContract
+  rpcContract,
+  startableQueueStateAsync
 };
 //# sourceMappingURL=server.js.map

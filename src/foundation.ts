@@ -1281,15 +1281,119 @@ const GH637_DOMAIN_MIGRATION = `
   ALTER TABLE execution_attempts ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'default';
   ALTER TABLE lane_capacity_intervals ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'default';
   ALTER TABLE lane_capacity_refresh_evidence ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'default';
-  CREATE UNIQUE INDEX role_generations_domain_identity
-    ON role_generations(project_id, role_id, generation, domain_id);
   INSERT INTO orchestration_domains
     (project_id, config_revision, domain_id, task_classes_json, role_requirements_json, domain_digest)
   SELECT project_id, config_revision, 'default', '["default"]',
          COALESCE(json_extract(canonical_config_json, '$.extensions.bbCollab.roleRequirements'), '[]'),
          config_digest
     FROM project_config_revisions;
-  ALTER TABLE role_generation_heads RENAME TO role_generation_heads_gh637_old;
+  PRAGMA defer_foreign_keys = ON;
+  CREATE TEMP TABLE gh637_role_generations AS SELECT * FROM role_generations;
+  CREATE TEMP TABLE gh637_assignments AS SELECT * FROM assignments;
+  CREATE TEMP TABLE gh637_role_generation_heads AS SELECT * FROM role_generation_heads;
+  CREATE TEMP TABLE gh637_execution_attempts AS SELECT * FROM execution_attempts;
+  CREATE TEMP TABLE gh637_evidence_artifacts AS SELECT * FROM evidence_artifacts;
+  CREATE TEMP TABLE gh637_decision_evidence AS SELECT * FROM decision_evidence;
+  CREATE TEMP TABLE gh637_lane_capacity_refresh_evidence AS SELECT * FROM lane_capacity_refresh_evidence;
+  DROP TRIGGER IF EXISTS lane_capacity_refresh_evidence_immutable_update;
+  DROP TRIGGER IF EXISTS lane_capacity_refresh_evidence_immutable_delete;
+  DELETE FROM decision_evidence;
+  DELETE FROM evidence_artifacts;
+  DELETE FROM lane_capacity_refresh_evidence;
+  DELETE FROM execution_attempts;
+  DELETE FROM assignments;
+  DELETE FROM role_generation_heads;
+  DELETE FROM role_generations;
+  DROP TABLE role_generation_heads;
+  DROP TABLE assignments;
+  DROP TABLE role_generations;
+  CREATE TABLE role_generations (
+    project_id TEXT NOT NULL,
+    role_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    role_requirement_id TEXT NOT NULL,
+    config_revision INTEGER NOT NULL,
+    repo_target_id TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'draining', 'retired', 'invalidated')),
+    predecessor_generation INTEGER,
+    holder_execution_attempt_id TEXT NOT NULL,
+    holder_context_digest TEXT NOT NULL,
+    holder_requested_profile_digest TEXT NOT NULL,
+    qualification_id TEXT NOT NULL,
+    eligibility_derivation_digest TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    activated_at_ms INTEGER NOT NULL,
+    retired_at_ms INTEGER,
+    standby_profile_json TEXT CHECK (standby_profile_json IS NULL OR json_valid(standby_profile_json)),
+    domain_id TEXT NOT NULL DEFAULT 'default',
+    PRIMARY KEY (project_id, role_id, generation, domain_id),
+    FOREIGN KEY (project_id, config_revision)
+      REFERENCES project_config_revisions(project_id, config_revision),
+    FOREIGN KEY (project_id, repo_target_id, config_revision)
+      REFERENCES repository_targets(project_id, repo_target_id, config_revision),
+    FOREIGN KEY (project_id, qualification_id)
+      REFERENCES qualification_observations(project_id, qualification_id),
+    FOREIGN KEY (project_id, role_id, predecessor_generation, domain_id)
+      REFERENCES role_generations(project_id, role_id, generation, domain_id),
+    CHECK ((generation = 1 AND predecessor_generation IS NULL) OR
+           (generation > 1 AND predecessor_generation = generation - 1))
+  );
+  CREATE TABLE assignments (
+    project_id TEXT NOT NULL,
+    assignment_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL,
+    assignment_kind TEXT NOT NULL CHECK (assignment_kind IN ('write', 'review', 'probe')),
+    lane_id TEXT NOT NULL,
+    role_requirement_id TEXT NOT NULL,
+    role_id TEXT NOT NULL,
+    role_generation INTEGER NOT NULL CHECK (role_generation > 0),
+    config_revision INTEGER NOT NULL,
+    governance_epoch INTEGER NOT NULL CHECK (governance_epoch > 0),
+    work_item_revision INTEGER NOT NULL CHECK (work_item_revision > 0),
+    repo_target_id TEXT NOT NULL,
+    branch_name TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    candidate_semantics TEXT NOT NULL CHECK (candidate_semantics IN ('base', 'frozen')),
+    candidate_sha TEXT,
+    bb_server_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    environment_path TEXT NOT NULL,
+    environment_mode TEXT NOT NULL CHECK (environment_mode = 'managed-worktree'),
+    frozen_brief_version INTEGER NOT NULL CHECK (frozen_brief_version = 1),
+    frozen_brief_digest TEXT NOT NULL,
+    requested_provider_id TEXT NOT NULL,
+    requested_model TEXT NOT NULL,
+    requested_reasoning_level TEXT NOT NULL,
+    requested_permission_mode TEXT NOT NULL CHECK (requested_permission_mode = 'full'),
+    requested_service_tier TEXT NOT NULL,
+    requested_visibility TEXT NOT NULL CHECK (requested_visibility = 'visible'),
+    requested_profile_digest TEXT NOT NULL,
+    dispatch_kind TEXT NOT NULL CHECK (dispatch_kind IN ('spawn', 'attach')),
+    attach_thread_id TEXT,
+    parent_assignment_id TEXT,
+    depth INTEGER NOT NULL CHECK (depth = 0),
+    deadline_at_ms INTEGER NOT NULL CHECK (deadline_at_ms >= 0),
+    assignment_digest TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    creation_event_sequence INTEGER NOT NULL CHECK (creation_event_sequence > 0),
+    created_at_ms INTEGER NOT NULL,
+    domain_id TEXT NOT NULL DEFAULT 'default',
+    PRIMARY KEY (project_id, assignment_id),
+    FOREIGN KEY (project_id, work_item_id)
+      REFERENCES work_items(project_id, work_item_id),
+    FOREIGN KEY (project_id, repo_target_id, config_revision)
+      REFERENCES repository_targets(project_id, repo_target_id, config_revision),
+    FOREIGN KEY (project_id, role_id, role_generation, domain_id)
+      REFERENCES role_generations(project_id, role_id, generation, domain_id),
+    FOREIGN KEY (project_id, parent_assignment_id)
+      REFERENCES assignments(project_id, assignment_id),
+    CHECK ((candidate_semantics = 'base' AND candidate_sha IS NULL) OR
+           (candidate_semantics = 'frozen' AND candidate_sha IS NOT NULL)),
+    CHECK ((dispatch_kind = 'spawn' AND attach_thread_id IS NULL) OR
+           (dispatch_kind = 'attach' AND attach_thread_id IS NOT NULL))
+  );
   CREATE TABLE role_generation_heads (
     project_id TEXT NOT NULL,
     role_id TEXT NOT NULL,
@@ -1300,10 +1404,42 @@ const GH637_DOMAIN_MIGRATION = `
     FOREIGN KEY (project_id, role_id, current_generation, domain_id)
       REFERENCES role_generations(project_id, role_id, generation, domain_id)
   );
+  INSERT INTO role_generations (
+    project_id, role_id, generation, role_requirement_id, config_revision, repo_target_id, status,
+    predecessor_generation, holder_execution_attempt_id, holder_context_digest, holder_requested_profile_digest,
+    qualification_id, eligibility_derivation_digest, created_at_ms, activated_at_ms, retired_at_ms,
+    standby_profile_json, domain_id
+  ) SELECT project_id, role_id, generation, role_requirement_id, config_revision, repo_target_id, status,
+    predecessor_generation, holder_execution_attempt_id, holder_context_digest, holder_requested_profile_digest,
+    qualification_id, eligibility_derivation_digest, created_at_ms, activated_at_ms, retired_at_ms,
+    standby_profile_json, COALESCE(domain_id, 'default') FROM gh637_role_generations;
+  INSERT INTO assignments SELECT project_id, assignment_id, work_item_id, assignment_kind, lane_id,
+    role_requirement_id, role_id, role_generation, config_revision, governance_epoch, work_item_revision,
+    repo_target_id, branch_name, base_sha, candidate_semantics, candidate_sha, bb_server_id, environment_id,
+    source_id, host_id, environment_path, environment_mode, frozen_brief_version, frozen_brief_digest,
+    requested_provider_id, requested_model, requested_reasoning_level, requested_permission_mode,
+    requested_service_tier, requested_visibility, requested_profile_digest, dispatch_kind, attach_thread_id,
+    parent_assignment_id, depth, deadline_at_ms, assignment_digest, idempotency_key, creation_event_sequence,
+    created_at_ms, COALESCE(domain_id, 'default') FROM gh637_assignments;
   INSERT INTO role_generation_heads (project_id, role_id, domain_id, current_generation, updated_at_ms)
-    SELECT project_id, role_id, 'default', current_generation, updated_at_ms
-      FROM role_generation_heads_gh637_old;
-  DROP TABLE role_generation_heads_gh637_old;
+    SELECT project_id, role_id, 'default', current_generation, updated_at_ms FROM gh637_role_generation_heads;
+  INSERT INTO execution_attempts SELECT * FROM gh637_execution_attempts;
+  INSERT INTO evidence_artifacts SELECT * FROM gh637_evidence_artifacts;
+  INSERT INTO decision_evidence SELECT * FROM gh637_decision_evidence;
+  INSERT INTO lane_capacity_refresh_evidence SELECT * FROM gh637_lane_capacity_refresh_evidence;
+  CREATE TRIGGER lane_capacity_refresh_evidence_immutable_update
+    BEFORE UPDATE ON lane_capacity_refresh_evidence
+    BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;
+  CREATE TRIGGER lane_capacity_refresh_evidence_immutable_delete
+    BEFORE DELETE ON lane_capacity_refresh_evidence
+    BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;
+  DROP TABLE gh637_lane_capacity_refresh_evidence;
+  DROP TABLE gh637_decision_evidence;
+  DROP TABLE gh637_evidence_artifacts;
+  DROP TABLE gh637_execution_attempts;
+  DROP TABLE gh637_role_generation_heads;
+  DROP TABLE gh637_assignments;
+  DROP TABLE gh637_role_generations;
 `;
 MIGRATIONS.push(GH637_DOMAIN_MIGRATION);
 
@@ -3403,7 +3539,7 @@ function persistOrchestrationDomains(db: SqliteDatabase, projectId: string, conf
   }
 }
 
-function configuredDomains(db: SqliteDatabase, projectId: string, configRevision: number): OrchestrationDomain[] {
+export function configuredDomains(db: SqliteDatabase, projectId: string, configRevision: number): OrchestrationDomain[] {
   const configJson = storedConfigJson(db, projectId, configRevision);
   const configured = domainDefinitionsFromConfigJson(configJson);
   if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orchestration_domains'").get() === undefined) return [{ domainId: "default", taskClasses: ["default"], roleRequirements: configured.flatMap((domain) => domain.roleRequirements) }];
@@ -6580,7 +6716,7 @@ function applyRoleGenerationSuccession(
   let nextGeneration: number;
   if (first) {
     if (head) throw refusal("ROLE_GENERATION_STALE", "first generation requires no current role head", { currentResourceRevision: head.current_generation });
-    nextGeneration = ((db.prepare("SELECT COALESCE(MAX(generation), 0) AS generation FROM role_generations WHERE project_id = ? AND role_id = ?").get(request.projectId, request.roleId) as { generation: number }).generation) + 1;
+    nextGeneration = ((db.prepare("SELECT COALESCE(MAX(generation), 0) AS generation FROM role_generations WHERE project_id = ? AND role_id = ? AND domain_id = ?").get(request.projectId, request.roleId, resolved.domainId) as { generation: number }).generation) + 1;
   } else {
     if (request.expectedGeneration === null || request.predecessorGeneration === null) {
       throw refusal("ROLE_PREDECESSOR_MISMATCH", "successor requires matching expected and predecessor generations");
@@ -9506,7 +9642,7 @@ function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId
     assignments: "assignment_id",
     execution_attempts: "execution_attempt_id",
     role_generations: "role_id, generation",
-    role_generation_heads: "role_id",
+    role_generation_heads: "role_id, domain_id",
     lane_capacity_intervals: "interval_id",
     lane_capacity_refresh_evidence: "lane_capacity_observation_id, execution_attempt_id",
     operator_messages: "message_id",
@@ -10123,7 +10259,8 @@ export async function doctor(
     const observationCount = asRow<{ count: number }>(
       db.prepare("SELECT COUNT(*) AS count FROM qualification_observations WHERE project_id = ?").get(projectId),
     )?.count ?? 0;
-    const configuredRequirements = flatDomainRequirements(storedConfigJson(db, projectId, configHead.config_revision));
+    const configuredDomainInventory = configuredDomains(db, projectId, configHead.config_revision);
+    const configuredRequirements = configuredDomainInventory.flatMap((domain) => domain.roleRequirements.map((requirement) => ({ ...requirement, domainId: domain.domainId })));
     const hasDomainEligibility = tableColumns(db, "eligibility_projections").includes("domain_id");
     const eligibility = (db.prepare(
       `SELECT role_requirement_id, ${hasDomainEligibility ? "domain_id," : "'default' AS domain_id,"} requested_profile_digest, current_qualification_id, effective_status,
@@ -10219,6 +10356,11 @@ export async function doctor(
         unresolvedRoleHolders,
         routing,
         qualificationObservationCount: observationCount,
+        domains: configuredDomainInventory.map((domain) => ({
+          domainId: domain.domainId,
+          taskClasses: domain.taskClasses,
+          roleRequirementIds: domain.roleRequirements.map((requirement) => requirement.roleRequirementId),
+        })),
         eligibility,
         assignments: assignmentAttempts,
         profileAudit,
@@ -10249,6 +10391,7 @@ export async function doctor(
       },
     });
   } catch (error) {
+    if (error instanceof Refusal) return refusalResult(projectId, error.data);
     return result("BB_FACTS_UNAVAILABLE", projectId, 1, 0, 0, { message: String(error) });
   }
 }

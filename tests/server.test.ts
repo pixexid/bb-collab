@@ -8,7 +8,7 @@ import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import plugin, { cliSchemaError, deployedDistFailureDetail, fleetWatchdogBlockerFiredKey, fleetWatchdogCompositeKey, fleetWatchdogEpisodeKey, fleetWatchdogIssueReopenedKey, fleetWatchdogMergeCloseKey, fleetWatchdogReopenKey, fleetWatchdogRoleLivenessKey, fleetWatchdogScope, IDLE_FLEET_ATTEMPT_STALE_MS, ROLE_QUEUE_CACHE_MS, ROLE_QUEUE_DECISION_BOUND_MS, ROLE_QUEUE_IDLE_THRESHOLD_MS, ROLE_QUEUE_MAX_REPOSITORIES, ROLE_QUEUE_OBSERVATION_MS, ROLE_QUEUE_REFRESH_TIMEOUT_MS, rpcContract, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
+import plugin, { cliSchemaError, deployedDistFailureDetail, fleetWatchdogBlockerFiredKey, fleetWatchdogCompositeKey, fleetWatchdogEpisodeKey, fleetWatchdogIssueReopenedKey, fleetWatchdogMergeCloseKey, fleetWatchdogReopenKey, fleetWatchdogRoleLivenessKey, fleetWatchdogScope, IDLE_FLEET_ATTEMPT_STALE_MS, ROLE_QUEUE_CACHE_MS, ROLE_QUEUE_DECISION_BOUND_MS, ROLE_QUEUE_IDLE_THRESHOLD_MS, ROLE_QUEUE_MAX_REPOSITORIES, ROLE_QUEUE_OBSERVATION_MS, ROLE_QUEUE_REFRESH_TIMEOUT_MS, rpcContract, startableQueueStateAsync, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
 import { canonicalWorktreePath } from "../src/worktree-cleanup.js";
 import {
   CACHED_CONSUMERS,
@@ -1157,6 +1157,15 @@ function cloneProject(db: Database.Database, sourceProjectId: string, targetProj
   };
   clone("project_config_revisions");
   clone("project_config_heads");
+  clone("orchestration_domains", "", (row) => {
+    row.domain_digest = sha256(canonicalJson({
+      projectId: targetProjectId,
+      configRevision: row.config_revision,
+      domainId: row.domain_id,
+      taskClasses: JSON.parse(String(row.task_classes_json)),
+      roleRequirements: JSON.parse(String(row.role_requirements_json)),
+    }));
+  });
   clone("repository_targets");
   clone("work_items");
   clone("qualification_observations");
@@ -2381,6 +2390,88 @@ describe("bb-collab plugin boundary", () => {
       taskClass: "code",
       domainId: "code",
     }))).toMatchObject({ outcome: "DOMAIN_CONFIG_STALE", attempted: 0, verified: 0 });
+    db.prepare("DELETE FROM orchestration_domains WHERE project_id = ? AND config_revision = 1 AND domain_id = 'editorial'").run(PROJECT_ID);
+    expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({ outcome: "DOMAIN_CONFIG_STALE", attempted: 0, verified: 0 });
+  });
+
+  it("seats interleaved generations independently for each configured domain", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: domainRoleConfig() });
+    const seat = (domainId: "editorial" | "code", suffix: string, expectedGeneration: number | null, predecessorGeneration: number | null) => {
+      const roleRequirementId = `orchestrator-v1-${domainId}`;
+      const qualificationId = `qualification-${suffix}`;
+      const roleContext = {
+        threadId: `thread-${suffix}`,
+        requestEventId: `request-${suffix}`,
+        requestEventSeq: 1,
+        completionEventId: `completion-${suffix}`,
+        completionEventSeq: 4,
+      };
+      const facts = roleReader((value) => {
+        value.thread.id = roleContext.threadId;
+        value.thread.environmentId = `environment-${suffix}`;
+        value.environment.id = roleContext.threadId.replace("thread", "environment");
+        value.events[0]!.id = roleContext.requestEventId;
+        value.events[0]!.data.requestId = `request-id-${suffix}`;
+        value.events[1]!.data.clientRequestId = `request-id-${suffix}`;
+        value.events[3]!.id = roleContext.completionEventId;
+      });
+      expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+        idempotencyKey: `${suffix}-qualification`, domainId, roleRequirementId, qualificationId, roleContext,
+      }), null, facts).outcome).toBe("OK");
+      const succession = applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+        idempotencyKey: `${suffix}-succession`, domainId, roleRequirementId, qualificationId,
+        expectedGeneration, predecessorGeneration, roleContext,
+      }), null, facts);
+      expect(succession.outcome).toBe("OK");
+    };
+
+    seat("editorial", "editorial-one", null, null);
+    seat("code", "code-one", null, null);
+    seat("code", "code-two", 1, 1);
+    seat("editorial", "editorial-two", 1, 1);
+    expect(db.prepare(
+      "SELECT domain_id, generation FROM role_generations WHERE project_id = ? AND role_id = 'project-orchestrator' ORDER BY domain_id, generation",
+    ).all(PROJECT_ID)).toEqual([
+      { domain_id: "code", generation: 1 }, { domain_id: "code", generation: 2 },
+      { domain_id: "editorial", generation: 1 }, { domain_id: "editorial", generation: 2 },
+    ]);
+  });
+
+  it("reports complete per-domain queue heads while retaining one project-wide count", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-domain-queue-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[[{\"number\":301,\"labels\":[{\"name\":\"queue:startable\"}]},{\"number\":302,\"labels\":[{\"name\":\"queue:startable\"}]}]]'\n");
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const host = await loadedHost();
+      const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: domainRoleConfig() });
+      for (const item of [
+        { workItemId: "domain-editorial-queue", taskClass: "editorial", domainId: "editorial", issue: 301 },
+        { workItemId: "domain-code-queue", taskClass: "code", domainId: "code", issue: 302 },
+      ]) {
+        expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+          idempotencyKey: `${item.workItemId}-create`, taskClass: item.taskClass, domainId: item.domainId,
+          workItem: { workItemId: item.workItemId, title: item.workItemId, body: item.workItemId, taskClass: item.taskClass, domainId: item.domainId },
+        })).outcome).toBe("OK");
+        expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1, {
+          idempotencyKey: `${item.workItemId}-ready`, workItemId: item.workItemId,
+        })).outcome).toBe("OK");
+        bindFixtureGithubIssue(db, item.issue, item.workItemId);
+      }
+      const queue = await startableQueueStateAsync(db, PROJECT_ID, ["example/project"]);
+      expect(queue).toMatchObject({ count: 2, head: "example/project#301", domains: {
+        editorial: { count: 1, head: "example/project#301", known: true },
+        code: { count: 1, head: "example/project#302", known: true },
+      }});
+      expect(queue!.count).toBe(Object.values(queue!.domains).reduce((total, state) => total + state.count, 0));
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
   });
 
   it("loads one CLI/RPC seam and refuses production apply before any write", async () => {
@@ -9821,6 +9912,17 @@ else printf '%s\\n' '[]'; fi
         { domain_id: "default", task_class: "default" },
         { domain_id: "default", task_class: "default" },
       ]);
+      expect((db.prepare("PRAGMA table_info(role_generations)").all() as Array<{ name: string; pk: number }>).filter((column) => column.pk > 0).map((column) => column.name)).toEqual([
+        "project_id", "role_id", "generation", "domain_id",
+      ]);
+      expect(db.prepare("PRAGMA foreign_key_list(role_generations)").all()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ table: "role_generations", from: "domain_id", to: "domain_id" }),
+        expect.objectContaining({ table: "role_generations", from: "predecessor_generation", to: "generation" }),
+      ]));
+      expect(db.prepare("PRAGMA foreign_key_list(assignments)").all()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ table: "role_generations", from: "domain_id", to: "domain_id" }),
+        expect.objectContaining({ table: "role_generations", from: "role_generation", to: "generation" }),
+      ]));
       expect(db.pragma("integrity_check", { simple: true })).toBe("ok");
       expect(db.pragma("foreign_key_check")).toEqual([]);
     } finally {
@@ -13260,6 +13362,10 @@ else printf '%s\\n' '[]'; fi
     db.prepare(
       "UPDATE project_config_revisions SET canonical_config_json = ?, config_digest = ? WHERE project_id = ? AND config_revision = 1",
     ).run(historicalConfig, sha256(historicalConfig), PROJECT_ID);
+    const historicalRoleRequirements = (directorSeatConfig(DIRECTOR_K3_PROFILE, DIRECTOR_PROFILE).extensions.bbCollab as { roleRequirements?: unknown }).roleRequirements ?? [];
+    const historicalIdentity = { projectId: PROJECT_ID, configRevision: 1, domainId: "default", taskClasses: ["default"], roleRequirements: historicalRoleRequirements };
+    db.prepare("UPDATE orchestration_domains SET role_requirements_json = ?, domain_digest = ? WHERE project_id = ? AND config_revision = 1 AND domain_id = 'default'")
+      .run(canonicalJson(historicalRoleRequirements), sha256(canonicalJson(historicalIdentity)), PROJECT_ID);
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({ outcome: "OK" });
     expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
       roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
