@@ -10322,6 +10322,65 @@ else printf '%s\\n' '[]'; fi
     }
   });
 
+  it("applies the appended domain migration when both GH636 statements are already ledgered", () => {
+    const directory = mkdtempSync(join(tmpdir(), "bb-collab-gh647-"));
+    const path = join(directory, "data.db");
+    const db = new Database(path);
+    databaseIsReady(db);
+    const projectId = "proj_gh647_production_shape";
+    const config = canonicalJson({ extensions: { bbCollab: { roleRequirements: [] } } });
+    const migrateWithLedger = (database: Database.Database, statements: string[], executed: number[]) => {
+      const applied = new Set((database.prepare("SELECT id FROM _bb_migrations").all() as Array<{ id: number }>).map(({ id }) => id));
+      database.transaction(() => statements.forEach((statement, id) => {
+        if (applied.has(id)) return;
+        executed.push(id);
+        database.exec(statement);
+        database.prepare("INSERT INTO _bb_migrations (id, applied_at) VALUES (?, 1)").run(id);
+      }))();
+    };
+    try {
+      db.transaction(() => {
+        for (const statement of MIGRATIONS.slice(0, GH636_PREVIOUS_MIGRATION_ID)) db.exec(statement);
+        db.exec(MIGRATIONS[GH636_PREVIOUS_MIGRATION_ID]!);
+        db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, ?, ?, 1)").run(projectId, config, sha256(config));
+        db.prepare("INSERT INTO project_config_heads (project_id, config_revision, updated_at_ms) VALUES (?, 1, 1)").run(projectId);
+        db.prepare("INSERT INTO repository_targets (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest) VALUES (?, 'target', 1, 'source', 'host', '/gh647', NULL, 'main', 'target')").run(projectId);
+        db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, 'work', 1, 'target', 'legacy', 'legacy', 'proposed', 1, 1, 1)").run(projectId);
+        db.exec(MIGRATIONS[GH636_REPAIR_MIGRATION_ID]!);
+        db.exec("CREATE TABLE _bb_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)");
+        const record = db.prepare("INSERT INTO _bb_migrations (id, applied_at) VALUES (?, 1)");
+        for (let id = 0; id <= GH636_REPAIR_MIGRATION_ID; id += 1) record.run(id);
+      })();
+
+      const executed: number[] = [];
+      migrateCanonicalStore(db, (database, statements) => migrateWithLedger(database, statements, executed));
+      expect(executed).toEqual([GH637_DOMAIN_MIGRATION_ID]);
+      expect(db.prepare("SELECT project_id, config_revision, domain_id FROM orchestration_domains").all()).toEqual([
+        { project_id: projectId, config_revision: 1, domain_id: "default" },
+      ]);
+      expect(db.prepare("SELECT domain_id, task_class FROM work_items").get()).toEqual({ domain_id: "default", task_class: "default" });
+      expect(db.prepare("SELECT id FROM _bb_migrations ORDER BY id").all()).toEqual(
+        Array.from({ length: GH637_DOMAIN_MIGRATION_ID + 1 }, (_, id) => ({ id })),
+      );
+      expect(db.pragma("integrity_check", { simple: true })).toBe("ok");
+      expect(db.pragma("foreign_key_check")).toEqual([]);
+      db.close();
+
+      const reopened = new Database(path);
+      databaseIsReady(reopened);
+      const replayed: number[] = [];
+      migrateCanonicalStore(reopened, (database, statements) => migrateWithLedger(database, statements, replayed));
+      expect(replayed).toEqual([]);
+      expect(reopened.prepare("SELECT COUNT(*) AS count FROM orchestration_domains").get()).toEqual({ count: 1 });
+      expect(reopened.pragma("integrity_check", { simple: true })).toBe("ok");
+      expect(reopened.pragma("foreign_key_check")).toEqual([]);
+      reopened.close();
+    } finally {
+      if (db.open) db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("refuses v22 rollout evidence when one cached consumer did not execute", async () => {
     const { db, directory } = directDatabase();
     try {
