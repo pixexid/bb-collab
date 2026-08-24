@@ -1,0 +1,33 @@
+{
+  "name": "bb-plugin-external-trigger",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "bb": ">=0.37.0",
+    "bbPluginSdk": ">=0.4.8"
+  },
+  "bb": {
+    "name": "External Trigger",
+    "description": "Token-authenticated doorbells for exact existing BB threads.",
+    "branding": { "icon": "Bell" },
+    "server": "./server.ts",
+    "skills": []
+  },
+  "scripts": {
+    "build": "bb plugin build && node ../../scripts/normalize-plugin-dist.mjs external-trigger --strip-trailing",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.4.8",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.0.0",
+    "better-sqlite3": "^12.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.1"
+  }
+}
