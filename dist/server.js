@@ -14746,11 +14746,11 @@ var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
 var RUNTIME_CONTRACT_VERSION = 27;
-var SCHEMA_VERSION = 31;
+var SCHEMA_VERSION = 32;
 var PREVIOUS_RUNTIME_CONTRACT_VERSION = 26;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
-var PREVIOUS_SCHEMA_VERSION = 30;
+var PREVIOUS_SCHEMA_VERSION = 31;
 var ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"];
 var DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat";
 var directorSeatPrimaryProfile = {
@@ -15865,6 +15865,127 @@ var MIGRATIONS = [
      WHEN OLD.lane_capacity_observation_id IS NOT NULL AND NEW.lane_capacity_observation_id IS NOT OLD.lane_capacity_observation_id
      BEGIN SELECT RAISE(ABORT, 'lane capacity observation identifier is immutable'); END;`
 ];
+var GH636_REPAIR_CHILD_TABLES = `   ALTER TABLE decision_evidence RENAME TO execution_attempts_gh636_decision_evidence;
+   ALTER TABLE evidence_artifacts RENAME TO execution_attempts_gh636_evidence_artifacts;
+   ALTER TABLE lane_capacity_refresh_evidence RENAME TO execution_attempts_gh636_lane_capacity_refresh_evidence;
+   DROP TRIGGER lane_capacity_refresh_evidence_immutable_update;
+   DROP TRIGGER lane_capacity_refresh_evidence_immutable_delete;
+   CREATE TABLE evidence_artifacts (
+     project_id TEXT NOT NULL,
+     evidence_id TEXT NOT NULL,
+     evidence_kind TEXT NOT NULL CHECK (evidence_kind IN
+       ('advisory_read', 'delegated_action_receipt', 'legacy_claim', 'connector', 'test', 'export', 'release', 'review_ready')),
+     source_kind TEXT NOT NULL CHECK (source_kind IN
+       ('helper', 'pro', 'legacy_claim', 'delegated_action', 'connector', 'test', 'export', 'release', 'review_ready')),
+     source_ref TEXT NOT NULL,
+     execution_attempt_id TEXT,
+     content_digest TEXT NOT NULL,
+     redacted_json TEXT NOT NULL CHECK (json_valid(redacted_json)),
+     redacted_digest TEXT NOT NULL,
+     durable_ref_json TEXT NOT NULL CHECK (json_valid(durable_ref_json)),
+     artifact_identity_digest TEXT NOT NULL,
+     created_at_ms INTEGER NOT NULL,
+     PRIMARY KEY (project_id, evidence_id),
+     FOREIGN KEY (project_id, execution_attempt_id)
+       REFERENCES execution_attempts(project_id, execution_attempt_id),
+     CHECK ((evidence_kind = 'delegated_action_receipt' AND source_kind = 'delegated_action' AND execution_attempt_id IS NOT NULL) OR
+            (evidence_kind != 'delegated_action_receipt' AND source_kind != 'delegated_action' AND execution_attempt_id IS NULL))
+   );
+   INSERT INTO evidence_artifacts (
+     project_id, evidence_id, evidence_kind, source_kind, source_ref, execution_attempt_id,
+     content_digest, redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest, created_at_ms
+   ) SELECT project_id, evidence_id, evidence_kind, source_kind, source_ref, execution_attempt_id,
+     content_digest, redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest, created_at_ms
+   FROM execution_attempts_gh636_evidence_artifacts;
+   CREATE TABLE decision_evidence (
+     project_id TEXT NOT NULL,
+     decision_id TEXT NOT NULL,
+     evidence_sequence INTEGER NOT NULL CHECK (evidence_sequence > 0),
+     evidence_id TEXT NOT NULL,
+     disposition_sequence INTEGER NOT NULL CHECK (disposition_sequence > 0),
+     relation_kind TEXT NOT NULL CHECK (relation_kind IN
+       ('advisory_read', 'delegated_action_receipt', 'legacy_claim', 'supporting')),
+     relation_json TEXT NOT NULL CHECK (json_valid(relation_json)),
+     created_at_ms INTEGER NOT NULL,
+     idempotency_key TEXT NOT NULL,
+     PRIMARY KEY (project_id, decision_id, evidence_sequence),
+     FOREIGN KEY (decision_id, disposition_sequence)
+       REFERENCES decision_dispositions(decision_id, disposition_sequence),
+     FOREIGN KEY (project_id, evidence_id)
+       REFERENCES evidence_artifacts(project_id, evidence_id)
+   );
+   INSERT INTO decision_evidence (
+     project_id, decision_id, evidence_sequence, evidence_id, disposition_sequence,
+     relation_kind, relation_json, created_at_ms, idempotency_key
+   ) SELECT project_id, decision_id, evidence_sequence, evidence_id, disposition_sequence,
+     relation_kind, relation_json, created_at_ms, idempotency_key
+   FROM execution_attempts_gh636_decision_evidence;
+   CREATE TABLE lane_capacity_refresh_evidence (
+     project_id TEXT NOT NULL CHECK (length(project_id) > 0),
+     lane_capacity_observation_id TEXT NOT NULL CHECK (length(lane_capacity_observation_id) > 0),
+     execution_attempt_id TEXT NOT NULL CHECK (length(execution_attempt_id) > 0),
+     observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
+     PRIMARY KEY (project_id, lane_capacity_observation_id, execution_attempt_id),
+     FOREIGN KEY (project_id, execution_attempt_id)
+       REFERENCES execution_attempts(project_id, execution_attempt_id)
+   );
+   INSERT INTO lane_capacity_refresh_evidence (
+     project_id, lane_capacity_observation_id, execution_attempt_id, observed_at_ms
+   ) SELECT project_id, lane_capacity_observation_id, execution_attempt_id, observed_at_ms
+   FROM execution_attempts_gh636_lane_capacity_refresh_evidence;
+   DROP TABLE execution_attempts_gh636_decision_evidence;
+   DROP TABLE execution_attempts_gh636_evidence_artifacts;
+   DROP TABLE execution_attempts_gh636_lane_capacity_refresh_evidence;
+   CREATE TRIGGER lane_capacity_refresh_evidence_immutable_update
+     BEFORE UPDATE ON lane_capacity_refresh_evidence
+     BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;
+   CREATE TRIGGER lane_capacity_refresh_evidence_immutable_delete
+     BEFORE DELETE ON lane_capacity_refresh_evidence
+     BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;`;
+var SHIPPED_SCHEMA31_MIGRATION = MIGRATIONS.at(-1);
+var schema31Prefix = SHIPPED_SCHEMA31_MIGRATION.slice(0, SHIPPED_SCHEMA31_MIGRATION.indexOf("   DROP TABLE execution_attempts;"));
+var GH636_SCHEMA30_REPAIR_MIGRATION = `${schema31Prefix}
+   ALTER TABLE execution_attempts RENAME TO execution_attempts_gh636_old;
+   DROP INDEX execution_attempts_active_assignment;
+   DROP INDEX execution_attempts_active_writer_lane;
+   DROP INDEX execution_attempts_active_writer_thread;
+   DROP INDEX execution_attempts_active_work_item;
+   DROP INDEX execution_attempts_native_request;
+   DROP INDEX execution_attempts_project_state;
+   DROP TRIGGER execution_attempts_lane_capacity_observation_immutable;
+   ALTER TABLE execution_attempts_gh624 RENAME TO execution_attempts;
+${GH636_REPAIR_CHILD_TABLES}
+   DROP TABLE execution_attempts_gh636_old;
+   CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_active_assignment
+     ON execution_attempts(project_id, assignment_digest)
+     WHERE origin = 'assignment' AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown');
+   CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_active_writer_lane
+     ON execution_attempts(project_id, lane_id)
+     WHERE origin IN ('assignment', 'work_item') AND assignment_kind = 'write'
+       AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown');
+   CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_active_work_item
+     ON execution_attempts(project_id, work_item_id)
+     WHERE origin = 'work_item' AND assignment_kind = 'write'
+       AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown');
+   CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_active_writer_thread
+     ON execution_attempts(project_id, thread_id)
+     WHERE origin = 'work_item' AND assignment_kind = 'write' AND thread_id IS NOT NULL
+       AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown');
+   CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_native_request
+     ON execution_attempts(bb_server_id, thread_id, native_request_id)
+     WHERE thread_id IS NOT NULL AND native_request_id IS NOT NULL;
+   CREATE INDEX IF NOT EXISTS execution_attempts_project_state
+     ON execution_attempts(project_id, state, assignment_kind, lane_id);
+   CREATE INDEX IF NOT EXISTS execution_attempts_interrupted_pending
+     ON execution_attempts(project_id, work_item_id, attempt_ordinal)
+     WHERE origin = 'work_item' AND state = 'interrupted';
+   CREATE TRIGGER execution_attempts_lane_capacity_observation_immutable
+     BEFORE UPDATE OF lane_capacity_observation_id ON execution_attempts
+     WHEN OLD.lane_capacity_observation_id IS NOT NULL AND NEW.lane_capacity_observation_id IS NOT OLD.lane_capacity_observation_id
+     BEGIN SELECT RAISE(ABORT, 'lane capacity observation identifier is immutable'); END;`;
+MIGRATIONS.push(GH636_REPAIR_CHILD_TABLES);
+var GH636_PREVIOUS_MIGRATION_ID = MIGRATIONS.length - 2;
+var GH636_REPAIR_MIGRATION_ID = MIGRATIONS.length - 1;
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
 var GH300_BACKFILL_MIGRATION_ID = MIGRATIONS.findIndex((statement) => statement.includes("CREATE TABLE execution_attempts_gh300"));
 var CACHED_CONSUMERS = [
@@ -22588,6 +22709,171 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
     return result("BB_FACTS_UNAVAILABLE", projectId, 1, 0, 0, { message: String(error48) });
   }
 }
+var EXECUTION_ATTEMPT_BASE_COLUMNS = [
+  "project_id",
+  "execution_attempt_id",
+  "assignment_id",
+  "origin",
+  "assignment_digest",
+  "lane_id",
+  "assignment_kind",
+  "attempt_ordinal",
+  "dispatch_kind",
+  "config_revision",
+  "governance_epoch",
+  "work_item_id",
+  "repo_target_id",
+  "role_id",
+  "role_generation",
+  "state",
+  "bb_server_id",
+  "environment_id",
+  "source_id",
+  "host_id",
+  "environment_path",
+  "thread_id",
+  "provider_thread_id",
+  "native_request_id",
+  "request_event_id",
+  "request_event_seq",
+  "accepted_event_id",
+  "accepted_event_seq",
+  "first_action_event_id",
+  "first_action_event_seq",
+  "content_event_id",
+  "content_event_seq",
+  "completion_event_id",
+  "completion_event_seq",
+  "terminal_event_id",
+  "terminal_event_seq",
+  "frozen_brief_digest",
+  "content_receipt_digest",
+  "requested_provider_id",
+  "requested_model",
+  "requested_reasoning_level",
+  "requested_permission_mode",
+  "requested_service_tier",
+  "requested_visibility",
+  "requested_profile_digest",
+  "branch_name",
+  "base_sha",
+  "candidate_sha",
+  "environment_digest",
+  "native_receipt_digest",
+  "terminal_result",
+  "reported_outcome",
+  "terminal_report_digest",
+  "conflicting_terminal_digest",
+  "reason_code",
+  "last_event_seq",
+  "progress_json",
+  "lease_owner_thread_id",
+  "lease_expires_at_ms",
+  "continuation_of_attempt_id",
+  "created_at_ms",
+  "observed_at_ms",
+  "completed_at_ms",
+  "attempt_digest",
+  "review_pr_number",
+  "review_pr_head_sha",
+  "lane_capacity_observation_id"
+];
+var EXECUTION_ATTEMPT_V31_COLUMNS = [
+  ...EXECUTION_ATTEMPT_BASE_COLUMNS,
+  "terminalization_class",
+  "terminal_report_json",
+  "terminal_actual_profile_digest",
+  "interruption_reason",
+  "interruption_event_id",
+  "interruption_event_seq",
+  "interruption_turn_id",
+  "interruption_evidence_digest"
+];
+var CHILD_TABLE_COLUMNS = {
+  decision_evidence: ["project_id", "decision_id", "evidence_sequence", "evidence_id", "disposition_sequence", "relation_kind", "relation_json", "created_at_ms", "idempotency_key"],
+  evidence_artifacts: ["project_id", "evidence_id", "evidence_kind", "source_kind", "source_ref", "execution_attempt_id", "content_digest", "redacted_json", "redacted_digest", "durable_ref_json", "artifact_identity_digest", "created_at_ms"],
+  lane_capacity_refresh_evidence: ["project_id", "lane_capacity_observation_id", "execution_attempt_id", "observed_at_ms"]
+};
+function tableColumns(db, table) {
+  return db.prepare(`PRAGMA table_info(${table})`).all().map(({ name }) => name);
+}
+function tableExists(db, table) {
+  return db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) !== void 0;
+}
+function foreignKeyShape(db, table) {
+  return db.prepare(`PRAGMA foreign_key_list(${table})`).all().map(({ table: target, from, to }) => `${target}:${from}->${to}`).sort();
+}
+function migrationSchemaShape(db, version2) {
+  if (!tableExists(db, "execution_attempts") || !Object.keys(CHILD_TABLE_COLUMNS).every((table) => tableExists(db, table))) return false;
+  const expectedAttempts = version2 === "schema30" ? EXECUTION_ATTEMPT_BASE_COLUMNS : EXECUTION_ATTEMPT_V31_COLUMNS;
+  if (canonicalJson(tableColumns(db, "execution_attempts")) !== canonicalJson(expectedAttempts)) return false;
+  for (const [table, columns] of Object.entries(CHILD_TABLE_COLUMNS)) {
+    if (canonicalJson(tableColumns(db, table)) !== canonicalJson(columns)) return false;
+  }
+  if (foreignKeyShape(db, "evidence_artifacts").toString() !== [
+    "execution_attempts:execution_attempt_id->execution_attempt_id",
+    "execution_attempts:project_id->project_id"
+  ].sort().toString()) return false;
+  if (foreignKeyShape(db, "lane_capacity_refresh_evidence").toString() !== [
+    "execution_attempts:execution_attempt_id->execution_attempt_id",
+    "execution_attempts:project_id->project_id"
+  ].sort().toString()) return false;
+  if (foreignKeyShape(db, "decision_evidence").toString() !== [
+    "decision_dispositions:decision_id->decision_id",
+    "decision_dispositions:disposition_sequence->disposition_sequence",
+    "evidence_artifacts:evidence_id->evidence_id",
+    "evidence_artifacts:project_id->project_id"
+  ].sort().toString()) return false;
+  const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'execution_attempts' ORDER BY name").all().map(({ name }) => name);
+  const expectedIndexes = [
+    "execution_attempts_active_assignment",
+    "execution_attempts_active_work_item",
+    "execution_attempts_active_writer_lane",
+    "execution_attempts_active_writer_thread",
+    "execution_attempts_native_request",
+    "execution_attempts_project_state",
+    ...version2 === "schema31" ? ["execution_attempts_interrupted_pending"] : []
+  ];
+  return expectedIndexes.every((name) => indexes.includes(name)) && (version2 === "schema31" || !indexes.includes("execution_attempts_interrupted_pending"));
+}
+function assertMigratedSchema(db) {
+  if (!migrationSchemaShape(db, "schema31")) throw new Error("GH636 migration ledger is ambiguous: schema-31 shape is not exact");
+  if (db.pragma("integrity_check", { simple: true }) !== "ok") throw new Error("GH636 migration produced an integrity-check failure");
+  if (db.pragma("foreign_key_check").length !== 0) throw new Error("GH636 migration produced foreign-key violations");
+}
+function allMigrationIdsBefore(db, id2) {
+  const applied = new Set(db.prepare("SELECT id FROM _bb_migrations").all().map(({ id: rowId }) => rowId));
+  return Array.from({ length: id2 }, (_, index) => index).every((index) => applied.has(index));
+}
+function migrateCanonicalStore(db, migrate) {
+  db.exec("CREATE TABLE IF NOT EXISTS _bb_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)");
+  const has = (id2) => db.prepare("SELECT 1 FROM _bb_migrations WHERE id = ?").get(id2) !== void 0;
+  const previousApplied = has(GH636_PREVIOUS_MIGRATION_ID);
+  const repairApplied = has(GH636_REPAIR_MIGRATION_ID);
+  if (repairApplied && !previousApplied) throw new Error("GH636 migration ledger is ambiguous: repair is ledgered without schema 31");
+  if (!previousApplied && !repairApplied && migrationSchemaShape(db, "schema31")) {
+    throw new Error("GH636 migration ledger is ambiguous: schema 31 exists without migration 43");
+  }
+  if (!previousApplied && !repairApplied && db.prepare("SELECT 1 FROM _bb_migrations LIMIT 1").get() !== void 0 && !allMigrationIdsBefore(db, GH636_PREVIOUS_MIGRATION_ID)) {
+    throw new Error("GH636 migration ledger is ambiguous: prior migration ledger is incomplete");
+  }
+  migrate(db, MIGRATIONS.slice(0, GH636_PREVIOUS_MIGRATION_ID));
+  if (!previousApplied) {
+    if (!allMigrationIdsBefore(db, GH636_PREVIOUS_MIGRATION_ID) || !migrationSchemaShape(db, "schema30")) {
+      throw new Error("GH636 migration ledger is ambiguous: exact schema-30 pre-upgrade shape is absent");
+    }
+    migrate(db, [
+      ...MIGRATIONS.slice(0, GH636_PREVIOUS_MIGRATION_ID),
+      GH636_SCHEMA30_REPAIR_MIGRATION,
+      MIGRATIONS[GH636_REPAIR_MIGRATION_ID]
+    ]);
+  } else if (!repairApplied) {
+    if (!migrationSchemaShape(db, "schema31")) throw new Error("GH636 migration ledger is ambiguous: migration 43 is ledgered without schema 31");
+    migrate(db, MIGRATIONS);
+  }
+  if (!has(GH636_PREVIOUS_MIGRATION_ID) || !has(GH636_REPAIR_MIGRATION_ID)) throw new Error("GH636 migration ledger is incomplete");
+  assertMigratedSchema(db);
+}
 function databaseIsReady(db) {
   db.pragma("foreign_keys = ON");
   db.pragma("busy_timeout = 5000");
@@ -25976,7 +26262,7 @@ async function plugin(bb, options = {}) {
   try {
     db = bb.storage.database();
     databaseIsReady(db);
-    bb.storage.migrate(db, MIGRATIONS);
+    migrateCanonicalStore(db, (database, statements) => bb.storage.migrate(database, statements));
     try {
       backfillWorkItemAttempts(db);
     } catch (error48) {

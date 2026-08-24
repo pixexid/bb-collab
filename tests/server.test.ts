@@ -23,6 +23,8 @@ import {
   MAX_EXPORT_BYTES,
   MAX_SOURCE_EVIDENCE_MANIFEST_BYTES,
   MIGRATIONS,
+  GH636_PREVIOUS_MIGRATION_ID,
+  GH636_REPAIR_MIGRATION_ID,
   ROLE_CONTEXT_EVENT_PAGE_SIZE,
   MIGRATION_STATES,
   MIGRATION_STEPS,
@@ -39,6 +41,7 @@ import {
   mutationRequestDigest,
   contractDigest,
   databaseIsReady,
+  migrateCanonicalStore,
   doctor,
   exportFoundation,
   probeV21NewLegacyApplyProvenanceRefusal,
@@ -2776,7 +2779,7 @@ describe("bb-collab plugin boundary", () => {
     const legacyGenesis = "legacy-v28-genesis";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -3)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -4)) db.exec(statement);
       })();
       seedVerifiedFixtureReceipt(db, {
         projectId: legacyProject,
@@ -2791,8 +2794,8 @@ describe("bb-collab plugin boundary", () => {
       }));
       expect(bootstrapped).toMatchObject({ outcome: "OK" });
       const legacyFence = (bootstrapped.evidence as { fenceToken: string }).fenceToken;
+      db.exec(MIGRATIONS.at(-4)!);
       db.exec(MIGRATIONS.at(-3)!);
-      db.exec(MIGRATIONS.at(-2)!);
 
       const legacyRoleFacts = () => roleReader((facts) => {
         facts.thread.projectId = legacyProject;
@@ -9247,26 +9250,30 @@ else printf '%s\\n' '[]'; fi
     const db = new Database(":memory:");
     databaseIsReady(db);
     try {
-    for (const statement of MIGRATIONS.slice(0, -16)) db.exec(statement);
+    for (const statement of MIGRATIONS.slice(0, -17)) db.exec(statement);
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, '{}', ?, 1)").run(PROJECT_ID, sha256("{}"));
       db.prepare("INSERT INTO project_config_heads (project_id, config_revision, updated_at_ms) VALUES (?, 1, 1)").run(PROJECT_ID);
       db.prepare(`INSERT INTO operator_messages (project_id, recipient, sender_thread_id, severity, message_text, created_at_ms, reply_text, reply_delivery_error) VALUES (?, 'operator', 'fixture-thread', 'routine', 'failed delivery', 10, 'reply retained', 'delivery failed')`).run(PROJECT_ID);
-      db.exec(MIGRATIONS.at(-5)!);
+      db.exec(MIGRATIONS.at(-6)!);
       expect(db.prepare("SELECT reply_text, reply_delivery_error, replied_at_ms, archived_at_ms FROM operator_messages").get()).toEqual({ reply_text: "reply retained", reply_delivery_error: "delivery failed", replied_at_ms: null, archived_at_ms: null });
     } finally { db.close(); }
   });
 
   it("appends authority-root schema and bumps the runtime contract", () => {
-    expect(SCHEMA_VERSION).toBe(31);
+    expect(SCHEMA_VERSION).toBe(32);
     expect(RUNTIME_CONTRACT_VERSION).toBe(27);
-    expect(MIGRATIONS).toHaveLength(44);
+    expect(MIGRATIONS).toHaveLength(45);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
-    expect(sha256(MIGRATIONS.slice(0, -1).join("\n"))).toBe("bab7e93793b71e0c7348d17f747b90d50c9776381bfdb5f9f7fc1235e18c0400");
+    expect(sha256(MIGRATIONS.slice(0, GH636_PREVIOUS_MIGRATION_ID + 1).join("\n"))).toBe("b8beac282f4b36cf0dca454f3be9ffc11bae6a3d2c66388c9e43210928e4a5c8");
+    expect(GH636_PREVIOUS_MIGRATION_ID).toBe(43);
+    expect(GH636_REPAIR_MIGRATION_ID).toBe(44);
+    expect(sha256(MIGRATIONS[GH636_PREVIOUS_MIGRATION_ID]!)).toBe("a9af01dcf639dce371dca7f504c0b2127a11057b4e8259f35e096ff014698ac7");
+    expect(MIGRATIONS[GH636_REPAIR_MIGRATION_ID]).toContain("execution_attempts_gh636_decision_evidence");
     expect(schemaDigest).not.toBe("6901dfc3766969621d1557feae76ad91877088dfdf3cc1879ee3e79463e67ced");
     expect(contractDigest).not.toBe("f6b0ecbda7e8afd986d46e0eda77662815a737dadc94e268ef00b7d74ba18ed4");
-    expect(MIGRATIONS.at(-5)).toContain("ALTER TABLE operator_messages ADD COLUMN archived_at_ms");
-    expect(MIGRATIONS.at(-4)).toContain("CREATE TABLE IF NOT EXISTS bootstrap_derivation_receipts");
+    expect(MIGRATIONS[39]).toContain("ALTER TABLE operator_messages ADD COLUMN archived_at_ms");
+    expect(MIGRATIONS[40]).toContain("CREATE TABLE IF NOT EXISTS bootstrap_derivation_receipts");
     expect(TABLES).toContain("migration_runs");
     expect(TABLES).toContain("lane_capacity_intervals");
     expect(TABLES).toContain("operator_messages");
@@ -9278,8 +9285,8 @@ else printf '%s\\n' '[]'; fi
     ]);
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 30,
-      newSchemaVersion: 31,
+      oldSchemaVersion: 31,
+      newSchemaVersion: 32,
       oldContractVersion: 26,
       newContractVersion: 27,
       action: "refused",
@@ -9288,8 +9295,8 @@ else printf '%s\\n' '[]'; fi
       verified: 0,
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(20, 22))).toMatchObject({
-      oldSchemaVersion: 30,
-      newSchemaVersion: 31,
+      oldSchemaVersion: 31,
+      newSchemaVersion: 32,
       oldContractVersion: 26,
       newContractVersion: 27,
       action: "refused",
@@ -9298,11 +9305,11 @@ else printf '%s\\n' '[]'; fi
       verified: 0,
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ action: "refused", verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(31, 27))).toMatchObject({ action: "reread", verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(32, 27))).toMatchObject({ action: "reread", verified: 4 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 30,
-      newSchemaVersion: 31,
+      oldSchemaVersion: 31,
+      newSchemaVersion: 32,
       oldContractVersion: 26,
       newContractVersion: 27,
       action: "refused",
@@ -9348,7 +9355,7 @@ else printf '%s\\n' '[]'; fi
     databaseIsReady(db);
     const projectId = "proj_gh200_migration";
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -9)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -10)) db.exec(statement); })();
       for (const configRevision of [5, 6]) {
         db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, ?, '{}', ?, ?)")
           .run(projectId, configRevision, sha256("{}"), configRevision);
@@ -9385,7 +9392,7 @@ else printf '%s\\n' '[]'; fi
          WHERE work_items.project_id = ? ORDER BY work_items.work_item_id`,
       ).all(projectId);
       const before = snapshot();
-      db.transaction(() => db.exec(MIGRATIONS.at(-10)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-11)!))();
       expect(snapshot()).toEqual(before);
       expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
       expect(db.prepare("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
@@ -9402,15 +9409,15 @@ else printf '%s\\n' '[]'; fi
     const projectId = "proj_gh295_migration";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -14)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -15)) db.exec(statement);
       })();
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, '{}', ?, 1)").run(projectId, sha256("{}"));
       db.prepare("INSERT INTO repository_targets (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest) VALUES (?, 'target-main', 1, 'source', 'host', '/migration', NULL, 'main', 'target-digest')").run(projectId);
       db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, 'historical', 1, 'target-main', 'Historical', 'preserve me', 'in_progress', 3, 10, 20)").run(projectId);
       const beforeRows = db.prepare("SELECT * FROM work_items WHERE project_id = ?").all(projectId);
-      const priorStatementDigests = MIGRATIONS.slice(0, -14).map(sha256);
-      db.transaction(() => db.exec(MIGRATIONS.at(-15)!))();
-      expect(MIGRATIONS.slice(0, -14).map(sha256)).toEqual(priorStatementDigests);
+      const priorStatementDigests = MIGRATIONS.slice(0, -15).map(sha256);
+      db.transaction(() => db.exec(MIGRATIONS.at(-16)!))();
+      expect(MIGRATIONS.slice(0, -15).map(sha256)).toEqual(priorStatementDigests);
       expect(db.prepare("SELECT * FROM work_items WHERE project_id = ?").all(projectId)).toEqual(beforeRows);
       expect(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'work_items'").get()).toMatchObject({ sql: expect.stringContaining("review_pending") });
       db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, 'reviewable', 1, 'target-main', 'Reviewable', 'new state', 'review_pending', 1, 30, 30)").run(projectId);
@@ -9426,7 +9433,7 @@ else printf '%s\\n' '[]'; fi
     databaseIsReady(db);
     const projectId = "proj_review_linkage_migration";
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -12)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -13)) db.exec(statement); })();
       const configJson = "{}";
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, ?, ?, 1)").run(projectId, configJson, sha256(configJson));
       db.prepare("INSERT INTO project_config_heads (project_id, config_revision, updated_at_ms) VALUES (?, 1, 1)").run(projectId);
@@ -9441,7 +9448,7 @@ else printf '%s\\n' '[]'; fi
       const before = db.prepare(`SELECT ${existingColumns.join(", ")} FROM execution_attempts`).all();
       const rowCount = (db.prepare("SELECT COUNT(*) AS count FROM execution_attempts").get() as { count: number }).count;
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-12)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-13)!))();
 
       expect((db.prepare("SELECT COUNT(*) AS count FROM execution_attempts").get() as { count: number }).count).toBe(rowCount);
       expect(db.prepare(`SELECT ${existingColumns.join(", ")} FROM execution_attempts`).all()).toEqual(before);
@@ -9457,7 +9464,7 @@ else printf '%s\\n' '[]'; fi
     const db = new Database(":memory:");
     databaseIsReady(db);
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -11)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -12)) db.exec(statement); })();
       db.pragma("foreign_keys = OFF");
       db.prepare("INSERT INTO project_config_revisions VALUES ('project', 1, '{}', 'config-digest', 1)").run();
       db.prepare("INSERT INTO repository_targets VALUES ('project', 'target', 1, 'source', 'host', '/target', NULL, 'main', 'target-digest')").run();
@@ -9489,11 +9496,11 @@ else printf '%s\\n' '[]'; fi
         eligibility: db.prepare("SELECT profile_digest, derivation_digest FROM eligibility_projections").get(),
         generation: db.prepare("SELECT holder_executed_profile_digest, holder_context_digest, eligibility_derivation_digest FROM role_generations").get(),
       };
-      const priorStatementDigests = MIGRATIONS.slice(0, -10).map(sha256);
+      const priorStatementDigests = MIGRATIONS.slice(0, -11).map(sha256);
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-11)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-12)!))();
 
-      expect(MIGRATIONS.slice(0, -10).map(sha256)).toEqual(priorStatementDigests);
+      expect(MIGRATIONS.slice(0, -11).map(sha256)).toEqual(priorStatementDigests);
       expect(db.prepare("SELECT requested_provider_id, requested_model, requested_reasoning_level, requested_permission_mode, requested_service_tier, requested_visibility, requested_profile_digest, attempt_digest FROM execution_attempts").get()).toEqual(Object.fromEntries(Object.entries(before.attempt as Record<string, unknown>).map(([name, value]) => [name.replace(/^actual_/u, "requested_"), value])));
       expect(db.prepare("SELECT requested_profile_digest, requested_provider_id, requested_model, requested_reasoning_level, requested_permission_mode, requested_service_tier, requested_visibility, evidence_digest, observation_digest FROM qualification_observations").get()).toEqual({
         requested_profile_digest: "legacy-profile-digest", requested_provider_id: "provider", requested_model: "model",
@@ -9537,7 +9544,7 @@ else printf '%s\\n' '[]'; fi
     databaseIsReady(db);
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -13)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -14)) db.exec(statement);
       })();
       const legacyResult = JSON.stringify({
         projectId: "proj_backfill_legacy",
@@ -9558,7 +9565,7 @@ else printf '%s\\n' '[]'; fi
         "SELECT project_id, epoch_created_at_ms, state, result_json, created_at_ms, updated_at_ms FROM work_item_github_backfills",
       ).get();
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-13)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-14)!))();
 
       expect((db.prepare("PRAGMA table_info(work_item_github_backfills)").all() as Array<{ name: string }>).map((column) => column.name)).toEqual([
         "project_id", "epoch_created_at_ms", "state", "result_json", "created_at_ms", "updated_at_ms", "config_revision", "attempt_reason",
@@ -9574,8 +9581,8 @@ else printf '%s\\n' '[]'; fi
 
   it("assembles the production v22 cached-consumer rollout receipt with stale-v21 refusal semantics", async () => {
     expect(RUNTIME_CONTRACT_VERSION).toBe(27);
-    expect(SCHEMA_VERSION).toBe(31);
-    expect(MIGRATIONS).toHaveLength(44);
+    expect(SCHEMA_VERSION).toBe(32);
+    expect(MIGRATIONS).toHaveLength(45);
     expect(contractDigest).not.toBe("d4e51b0b1fd68957120cea5febb7762d6c3b9eddab76f67916e556830b062b83");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
@@ -9592,7 +9599,7 @@ else printf '%s\\n' '[]'; fi
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 31, observedContractVersion: 27 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 32, observedContractVersion: 27 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -9744,13 +9751,174 @@ else printf '%s\\n' '[]'; fi
     }
   });
 
+  it("atomically rebuilds attempts with populated production child FKs and rejects the parent-drop mutant", () => {
+    const directory = mkdtempSync(join(tmpdir(), "bb-collab-gh636-"));
+    const path = join(directory, "fixture.db");
+    const db = new Database(path);
+    databaseIsReady(db);
+    const projectId = "proj_gh636_production_shape";
+    const insert = (table: string, row: Record<string, unknown>) => {
+      const names = Object.keys(row);
+      db.prepare(`INSERT INTO ${table} (${names.join(", ")}) VALUES (${names.map((name) => `@${name}`).join(", ")})`).run(row);
+    };
+    const tableDigest = (table: string) => {
+      const columns = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(({ name }) => name)
+        .filter((name) => table !== "execution_attempts" || ![
+          "terminalization_class", "terminal_report_json", "terminal_actual_profile_digest", "interruption_reason",
+          "interruption_event_id", "interruption_event_seq", "interruption_turn_id", "interruption_evidence_digest",
+        ].includes(name));
+      const order = table === "execution_attempts"
+        ? "project_id, execution_attempt_id"
+        : table === "decision_evidence"
+          ? "project_id, decision_id, evidence_sequence"
+        : table === "evidence_artifacts"
+          ? "project_id, evidence_id"
+          : "project_id, lane_capacity_observation_id, execution_attempt_id";
+      return sha256(canonicalJson(db.prepare(`SELECT ${columns.join(", ")} FROM ${table} ORDER BY ${order}`).all()));
+    };
+    const childTables = ["execution_attempts", "decision_evidence", "evidence_artifacts", "lane_capacity_refresh_evidence"];
+    const decisionDigest = () => sha256(canonicalJson(db.prepare("SELECT decision_id, project_id, decision_identity_digest FROM decisions ORDER BY decision_id").all()));
+    const dispositionDigest = () => sha256(canonicalJson(db.prepare("SELECT decision_id, disposition_sequence, disposition, actor_receipt_id FROM decision_dispositions ORDER BY decision_id, disposition_sequence").all()));
+    try {
+      db.transaction(() => {
+        for (const statement of MIGRATIONS.slice(0, -2)) db.exec(statement);
+      })();
+      db.pragma("defer_foreign_keys = ON");
+      db.transaction(() => {
+        insert("project_config_revisions", { project_id: projectId, config_revision: 1, canonical_config_json: "{}", config_digest: sha256("{}"), created_at_ms: 1 });
+        insert("repository_targets", { project_id: projectId, repo_target_id: "target", config_revision: 1, source_id: "source", host_id: "host", path: "/fixture", remote_url: null, default_branch: "main", target_digest: "target" });
+        insert("work_items", { project_id: projectId, work_item_id: "work-item", config_revision: 1, repo_target_id: "target", title: "fixture", body: "production-shaped", lifecycle_state: "in_progress", resource_revision: 1, created_at_ms: 1, updated_at_ms: 2 });
+        insert("qualification_observations", {
+          project_id: projectId, qualification_id: "qualification", role_requirement_id: "worker-v1", config_revision: 1, repo_target_id: "target",
+          requested_profile_digest: "profile", requested_provider_id: "provider", requested_model: "model", requested_reasoning_level: "medium",
+          requested_permission_mode: "full", requested_service_tier: "default", requested_visibility: "visible", thread_id: "thread",
+          environment_id: "environment", source_id: "source", host_id: "host", provider_thread_id: "provider-thread", request_event_id: "request",
+          request_event_seq: 1, completion_event_id: "completion", completion_event_seq: 2, bb_version: "bb", plugin_sdk_version: "sdk",
+          role_requirement_digest: "requirement", qualification_context_digest: "context", fixture_context_digest: "fixture", outcome: "qualified",
+          observed_at_ms: 3, expires_at_ms: null, evidence_digest: "evidence", observation_digest: "observation", reason_code: "fixture",
+        });
+        insert("role_generations", {
+          project_id: projectId, role_id: "worker", generation: 1, role_requirement_id: "worker-v1", config_revision: 1, repo_target_id: "target",
+          status: "active", predecessor_generation: null, holder_execution_attempt_id: "holder-attempt", holder_context_digest: "context",
+          holder_requested_profile_digest: "profile", qualification_id: "qualification", eligibility_derivation_digest: "eligibility", created_at_ms: 4,
+          activated_at_ms: 5, retired_at_ms: null, standby_profile_json: null,
+        });
+        insert("assignments", {
+          project_id: projectId, assignment_id: "assignment", work_item_id: "work-item", assignment_kind: "write", lane_id: "lane",
+          role_requirement_id: "worker-v1", role_id: "worker", role_generation: 1, config_revision: 1, governance_epoch: 1, work_item_revision: 1,
+          repo_target_id: "target", branch_name: "main", base_sha: "a".repeat(40), candidate_semantics: "base", candidate_sha: null,
+          bb_server_id: "server", environment_id: "environment", source_id: "source", host_id: "host", environment_path: "/fixture",
+          environment_mode: "managed-worktree", frozen_brief_version: 1, frozen_brief_digest: "brief", requested_provider_id: "provider",
+          requested_model: "model", requested_reasoning_level: "medium", requested_permission_mode: "full", requested_service_tier: "default",
+          requested_visibility: "visible", requested_profile_digest: "profile", dispatch_kind: "spawn", attach_thread_id: null, parent_assignment_id: null,
+          depth: 0, deadline_at_ms: 10, assignment_digest: "assignment-digest", idempotency_key: "assignment-idempotency", creation_event_sequence: 1, created_at_ms: 1,
+        });
+        insert("decisions", {
+          decision_id: "decision", project_id: projectId, config_revision: 1, repo_target_id: "target", scope_json: "{}", scope_digest: sha256("{}"),
+          current_resource_revision: 1, decision_class: "migration", options_json: "{}", decision_identity_digest: "decision-identity",
+          authority_root_json: null, authority_root_digest: null,
+        });
+        insert("decision_dispositions", {
+          decision_id: "decision", disposition_sequence: 1, disposition: "adopted", actor_receipt_id: "actor-receipt", reason_json: "{}",
+          created_at_ms: 2, idempotency_key: "decision-disposition", conditions_json: "[]", hold_action: "none", hold_code: null,
+          hold_reference_sequence: null, supersedes_disposition_sequence: null, reverts_disposition_sequence: null,
+        });
+        insert("execution_attempts", {
+          project_id: projectId, execution_attempt_id: "holder-attempt", origin: "role_holder", attempt_ordinal: 1, config_revision: 1, governance_epoch: 1,
+          repo_target_id: "target", role_id: "worker", role_generation: 1, state: "done", bb_server_id: "server", environment_id: "environment",
+          source_id: "source", host_id: "host", environment_path: "/fixture", environment_digest: "environment-digest", created_at_ms: 1, attempt_digest: "holder-digest",
+        });
+        insert("execution_attempts", {
+          project_id: projectId, execution_attempt_id: "assignment-attempt", assignment_id: "assignment", origin: "assignment", assignment_digest: "assignment-digest",
+          lane_id: "lane", assignment_kind: "write", attempt_ordinal: 1, dispatch_kind: "spawn", config_revision: 1, governance_epoch: 1,
+          work_item_id: "work-item", repo_target_id: "target", role_id: "worker", role_generation: 1, state: "running", bb_server_id: "server",
+          environment_id: "environment", source_id: "source", host_id: "host", environment_path: "/fixture", environment_digest: "environment-digest",
+          created_at_ms: 2, attempt_digest: "assignment-digest-2",
+        });
+        insert("execution_attempts", {
+          project_id: projectId, execution_attempt_id: "work-item-attempt", origin: "work_item", attempt_ordinal: 1, config_revision: 1,
+          governance_epoch: null, work_item_id: "work-item", lane_id: "lane-work-item", assignment_kind: "review", state: "interrupted",
+          created_at_ms: 3, attempt_digest: "work-item-digest",
+        });
+        insert("evidence_artifacts", {
+          project_id: projectId, evidence_id: "attempt-evidence", evidence_kind: "delegated_action_receipt", source_kind: "delegated_action",
+          source_ref: "attempt", execution_attempt_id: "assignment-attempt", content_digest: "content", redacted_json: "{}", redacted_digest: "redacted",
+          durable_ref_json: "{}", artifact_identity_digest: "identity", created_at_ms: 4,
+        });
+        insert("decision_evidence", {
+          project_id: projectId, decision_id: "decision", evidence_sequence: 1, evidence_id: "attempt-evidence", disposition_sequence: 1,
+          relation_kind: "supporting", relation_json: "{}", created_at_ms: 5, idempotency_key: "decision-evidence",
+        });
+        insert("lane_capacity_refresh_evidence", {
+          project_id: projectId, lane_capacity_observation_id: "observation", execution_attempt_id: "work-item-attempt", observed_at_ms: 5,
+        });
+      })();
+      const before = {
+        counts: Object.fromEntries(childTables.map((table) => [table, (db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count])),
+        digests: Object.fromEntries(childTables.map((table) => [table, tableDigest(table)])),
+        decisionDigest: decisionDigest(),
+        dispositionDigest: dispositionDigest(),
+      };
+      db.exec("CREATE TABLE _bb_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)");
+      const appliedAt = 10;
+      const record = db.prepare("INSERT INTO _bb_migrations (id, applied_at) VALUES (?, ?)");
+      for (let id = 0; id < GH636_PREVIOUS_MIGRATION_ID; id += 1) record.run(id, appliedAt);
+      const sdkMigrate = (database: typeof db, statements: string[]) => {
+        const applied = new Set((database.prepare("SELECT id FROM _bb_migrations").all() as Array<{ id: number }>).map(({ id }) => id));
+        database.transaction(() => statements.forEach((statement, id) => {
+          if (applied.has(id)) return;
+          database.exec(statement);
+          database.prepare("INSERT INTO _bb_migrations (id, applied_at) VALUES (?, ?)").run(id, appliedAt);
+        }))();
+      };
+
+      expect(() => db.transaction(() => db.exec("PRAGMA defer_foreign_keys = ON; DROP TABLE execution_attempts"))()).toThrow(/FOREIGN KEY constraint failed/iu);
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'execution_attempts'").get()).toEqual({ name: "execution_attempts" });
+      expect(Object.fromEntries(childTables.map((table) => [table, (db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count]))).toEqual(before.counts);
+      expect({ decisionDigest: decisionDigest(), dispositionDigest: dispositionDigest() }).toEqual({ decisionDigest: before.decisionDigest, dispositionDigest: before.dispositionDigest });
+      const parentDropMutant = MIGRATIONS.map((statement, id) => id === GH636_PREVIOUS_MIGRATION_ID
+        ? statement.replace(
+          "   ALTER TABLE execution_attempts_gh624 RENAME TO execution_attempts;",
+          "   DROP TABLE execution_attempts_gh624_old;\n   ALTER TABLE execution_attempts_gh624 RENAME TO execution_attempts;",
+        )
+        : statement);
+      expect(() => sdkMigrate(db, parentDropMutant)).toThrow(/FOREIGN KEY constraint failed|no such table: execution_attempts_gh624_old/iu);
+      expect(db.prepare("SELECT MAX(id) AS id FROM _bb_migrations").get()).toEqual({ id: GH636_PREVIOUS_MIGRATION_ID - 1 });
+      expect(migrateCanonicalStore).toBeTypeOf("function");
+
+      migrateCanonicalStore(db, sdkMigrate);
+      expect(Object.fromEntries(childTables.map((table) => [table, (db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count]))).toEqual(before.counts);
+      expect(Object.fromEntries(childTables.map((table) => [table, tableDigest(table)]))).toEqual(before.digests);
+      expect({ decisionDigest: decisionDigest(), dispositionDigest: dispositionDigest() }).toEqual({ decisionDigest: before.decisionDigest, dispositionDigest: before.dispositionDigest });
+      expect(db.pragma("integrity_check", { simple: true })).toBe("ok");
+      expect(db.pragma("foreign_key_check")).toEqual([]);
+      expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
+      expect(db.prepare("SELECT state FROM execution_attempts WHERE execution_attempt_id = 'work-item-attempt'").get()).toEqual({ state: "interrupted" });
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'lane_capacity_refresh_evidence_immutable_%' ORDER BY name").all()).toEqual([
+        { name: "lane_capacity_refresh_evidence_immutable_delete" }, { name: "lane_capacity_refresh_evidence_immutable_update" },
+      ]);
+      db.close();
+      const reopened = new Database(path);
+      databaseIsReady(reopened);
+      expect(reopened.pragma("integrity_check", { simple: true })).toBe("ok");
+      expect(reopened.pragma("foreign_key_check")).toEqual([]);
+      expect(reopened.prepare("SELECT COUNT(*) AS count FROM decision_evidence").get()).toEqual({ count: before.counts.decision_evidence });
+      expect(sha256(canonicalJson(reopened.prepare("SELECT decision_id, project_id, decision_identity_digest FROM decisions ORDER BY decision_id").all()))).toBe(before.decisionDigest);
+      expect(sha256(canonicalJson(reopened.prepare("SELECT decision_id, disposition_sequence, disposition, actor_receipt_id FROM decision_dispositions ORDER BY decision_id, disposition_sequence").all()))).toBe(before.dispositionDigest);
+      reopened.close();
+    } finally {
+      if (db.open) db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("preserves every varying non-null prior execution_attempts value across the appended rebuild", () => {
     const db = new Database(":memory:");
     databaseIsReady(db);
     const projectId = "proj_gh300_rebuild";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -16)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -17)) db.exec(statement);
       })();
       db.pragma("foreign_keys = OFF");
       const insert = (table: string, row: Record<string, unknown>) => {
@@ -9808,7 +9976,7 @@ else printf '%s\\n' '[]'; fi
       const before = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
       expect(Object.values(before).every((value) => value !== null)).toBe(true);
       expect(new Set(Object.values(before).map((value) => String(value))).size).toBeGreaterThan(20);
-      db.transaction(() => db.exec(MIGRATIONS.at(-16)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-17)!))();
       const after = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
       expect(Object.fromEntries(columns.map((column) => [column, after[column]]))).toEqual(Object.fromEntries(columns.map((column) => [column, before[column]])));
       expect(after.progress_json).toBe("{}");
@@ -9816,6 +9984,76 @@ else printf '%s\\n' '[]'; fi
       expect(after.continuation_of_attempt_id).toBeNull();
     } finally {
       db.close();
+    }
+  });
+
+  it("recognizes a ledgered v31 success without replaying the repair and refuses an unledgered v31", () => {
+    const makeDatabase = (ledgerThrough: number, schema31Applied = false) => {
+      const database = new Database(":memory:");
+      databaseIsReady(database);
+      database.transaction(() => {
+        for (const statement of MIGRATIONS.slice(0, GH636_PREVIOUS_MIGRATION_ID)) database.exec(statement);
+        if (schema31Applied) database.exec(MIGRATIONS[GH636_PREVIOUS_MIGRATION_ID]!);
+      })();
+      database.exec("CREATE TABLE _bb_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)");
+      const record = database.prepare("INSERT INTO _bb_migrations (id, applied_at) VALUES (?, 1)");
+      for (let id = 0; id <= ledgerThrough; id += 1) record.run(id);
+      return database;
+    };
+    const sdkMigrate = (database: Database.Database, statements: string[], executed: number[]) => {
+      const applied = new Set((database.prepare("SELECT id FROM _bb_migrations").all() as Array<{ id: number }>).map(({ id }) => id));
+      database.transaction(() => statements.forEach((statement, id) => {
+        if (applied.has(id)) return;
+        executed.push(id);
+        database.exec(statement);
+        database.prepare("INSERT INTO _bb_migrations (id, applied_at) VALUES (?, 1)").run(id);
+      }))();
+    };
+
+    const succeeded = makeDatabase(GH636_PREVIOUS_MIGRATION_ID, true);
+    try {
+      const executed: number[] = [];
+      migrateCanonicalStore(succeeded, (database, statements) => sdkMigrate(database, statements, executed));
+      expect(executed).toEqual([GH636_REPAIR_MIGRATION_ID]);
+      expect(succeeded.prepare("SELECT id FROM _bb_migrations ORDER BY id").all()).toEqual(
+        Array.from({ length: GH636_REPAIR_MIGRATION_ID + 1 }, (_, id) => ({ id })),
+      );
+      expect(succeeded.pragma("integrity_check", { simple: true })).toBe("ok");
+      expect(succeeded.pragma("foreign_key_check")).toEqual([]);
+    } finally {
+      succeeded.close();
+    }
+
+    const ambiguous = makeDatabase(GH636_PREVIOUS_MIGRATION_ID - 1, true);
+    try {
+      const executed: number[] = [];
+      expect(() => migrateCanonicalStore(ambiguous, (database, statements) => sdkMigrate(database, statements, executed))).toThrow(/schema 31 exists without migration 43/iu);
+      expect(executed).toEqual([]);
+      expect(ambiguous.prepare("SELECT MAX(id) AS id FROM _bb_migrations").get()).toEqual({ id: GH636_PREVIOUS_MIGRATION_ID - 1 });
+    } finally {
+      ambiguous.close();
+    }
+
+    const partial = new Database(":memory:");
+    try {
+      databaseIsReady(partial);
+      partial.exec("CREATE TABLE _bb_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)");
+      partial.prepare("INSERT INTO _bb_migrations (id, applied_at) VALUES (0, 1)").run();
+      const executed: number[] = [];
+      expect(() => migrateCanonicalStore(partial, (database, statements) => sdkMigrate(database, statements, executed))).toThrow(/prior migration ledger is incomplete/iu);
+      expect(executed).toEqual([]);
+      expect(partial.prepare("SELECT MAX(id) AS id FROM _bb_migrations").get()).toEqual({ id: 0 });
+      expect(partial.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'execution_attempts'").get()).toBeUndefined();
+    } finally {
+      partial.close();
+    }
+
+    const skippedAppend = makeDatabase(GH636_PREVIOUS_MIGRATION_ID, true);
+    try {
+      expect(() => migrateCanonicalStore(skippedAppend, (database, statements) => sdkMigrate(database, statements.slice(0, GH636_REPAIR_MIGRATION_ID), []))).toThrow(/ledger is incomplete/iu);
+      expect(skippedAppend.prepare("SELECT MAX(id) AS id FROM _bb_migrations").get()).toEqual({ id: GH636_PREVIOUS_MIGRATION_ID });
+    } finally {
+      skippedAppend.close();
     }
   });
 
@@ -9862,7 +10100,7 @@ else printf '%s\\n' '[]'; fi
     const before = exportFoundation(db, PROJECT_ID);
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
-      observedSchemaVersion: 31,
+      observedSchemaVersion: 32,
       observedContractVersion: 27,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
@@ -10093,7 +10331,7 @@ else printf '%s\\n' '[]'; fi
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 31, schemaDigest, contractVersion: 27, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 32, schemaDigest, contractVersion: 27, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -11323,8 +11561,8 @@ else printf '%s\\n' '[]'; fi
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 30, newSchemaVersion: 31, action: "unknown", expected: 4, attempted: 0, verified: 0 },
-        schema: { version: 31 },
+        cachedConsumers: { oldSchemaVersion: 31, newSchemaVersion: 32, action: "unknown", expected: 4, attempted: 0, verified: 0 },
+        schema: { version: 32 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -13771,7 +14009,7 @@ else printf '%s\\n' '[]'; fi
     db.exec("DROP TABLE execution_attempts; DROP TABLE assignments");
     db.pragma("foreign_keys = ON");
     db.exec(MIGRATIONS.find((statement) => statement.includes("CREATE TABLE IF NOT EXISTS assignments"))!);
-    for (const statement of MIGRATIONS.at(-11)!.split(";").filter((statement) => statement.includes("ALTER TABLE execution_attempts"))) db.exec(statement);
+    for (const statement of MIGRATIONS.at(-12)!.split(";").filter((statement) => statement.includes("ALTER TABLE execution_attempts"))) db.exec(statement);
     expect(db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(exportFoundation(db, PROJECT_ID));
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
@@ -13791,10 +14029,10 @@ else printf '%s\\n' '[]'; fi
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 30, newSchemaVersion: 31, oldContractVersion: 26, newContractVersion: 27, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 30, newSchemaVersion: 31, oldContractVersion: 26, newContractVersion: 27, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 30, newSchemaVersion: 31, oldContractVersion: 26, newContractVersion: 27, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(31, 27))).toMatchObject({ oldSchemaVersion: 30, newSchemaVersion: 31, oldContractVersion: 26, newContractVersion: 27, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 31, newSchemaVersion: 32, oldContractVersion: 26, newContractVersion: 27, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 31, newSchemaVersion: 32, oldContractVersion: 26, newContractVersion: 27, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 31, newSchemaVersion: 32, oldContractVersion: 26, newContractVersion: 27, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(32, 27))).toMatchObject({ oldSchemaVersion: 31, newSchemaVersion: 32, oldContractVersion: 26, newContractVersion: 27, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 
