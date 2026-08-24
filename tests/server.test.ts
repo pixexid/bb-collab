@@ -15602,4 +15602,160 @@ exit 1
       clock.mockRestore();
     }
   });
+
+  it("terminalizes exactly once through a thread-scoped request and refuses ambiguous native evidence", async () => {
+    type NativeEvent = { id: string; threadId: string; seq: number; type: string; scope: { kind: "thread" } | { kind: "turn"; turnId: string }; data: unknown; createdAt: number };
+    const threadId = "thread-gh643-terminal";
+    const environmentId = "environment-gh643-terminal";
+    const turnId = "turn-gh643-terminal";
+    const providerThreadId = "provider-gh643-terminal";
+    const checkout = { kind: "branch" as const, branchName: "bb/gh643-terminal", headSha: CANDIDATE_SHA };
+    const workingTree = { files: [], insertions: 0, deletions: 0 };
+    const makeEvents = (requestScope: NativeEvent["scope"] = { kind: "thread" }): NativeEvent[] => [
+      { id: "gh643-request", threadId, seq: 10, type: "client/turn/requested", scope: requestScope, data: { requestId: "gh643-request-id", execution: { model: ROLE_PROFILE.model, reasoningLevel: ROLE_PROFILE.reasoningLevel, permissionMode: ROLE_PROFILE.permissionMode, serviceTier: ROLE_PROFILE.serviceTier, source: "client/turn/requested" } }, createdAt: 10 },
+      { id: "gh643-accepted", threadId, seq: 20, type: "turn/input/accepted", scope: { kind: "turn", turnId }, data: { clientRequestId: "gh643-request-id", providerThreadId }, createdAt: 20 },
+      { id: "gh643-started", threadId, seq: 30, type: "turn/started", scope: { kind: "turn", turnId }, data: { providerThreadId }, createdAt: 30 },
+      { id: "gh643-completed", threadId, seq: 40, type: "turn/completed", scope: { kind: "turn", turnId }, data: { providerThreadId, status: "completed" }, createdAt: 40 },
+    ];
+    const setup = async (mutate: (events: NativeEvent[], host: Awaited<ReturnType<typeof loadedHost>>) => void = () => undefined) => {
+      const host = await loadedHost();
+      const { db, fenceToken } = seedAndBootstrap(host);
+      expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1, { idempotencyKey: "gh643-ready" })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2, {
+        idempotencyKey: "gh643-in-progress",
+        workAttempt: { laneId: "gh643-lane", threadId, assignmentKind: "write", requestedProfile: ROLE_PROFILE },
+      })).outcome).toBe("OK");
+      const attempt = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state = 'running'").get(PROJECT_ID, WORK_ITEM_ID) as Record<string, unknown>;
+      db.prepare("UPDATE execution_attempts SET environment_id = ?, branch_name = ?, base_sha = ?, candidate_sha = ? WHERE project_id = ? AND execution_attempt_id = ?").run(environmentId, checkout.branchName, BASE_SHA, CANDIDATE_SHA, PROJECT_ID, attempt.execution_attempt_id);
+      const events = makeEvents();
+      host.harness.sdk.stub("threads.get", (async () => makeThreadResponse({ id: threadId, projectId: PROJECT_ID, environmentId, providerId: ROLE_PROFILE.providerId, status: "idle", visibility: "visible" })) as never);
+      host.harness.sdk.stub("threads.events.list", (async ({ afterSeq }: { afterSeq?: string }) => events.filter((event) => afterSeq === undefined || event.seq > Number(afterSeq))) as never);
+      host.harness.sdk.stub("environments.get", (async () => ({ id: environmentId, projectId: PROJECT_ID })) as never);
+      host.harness.sdk.stub("environments.status", (async () => ({ outcome: "available", workspace: { checkout, workingTree } })) as never);
+      mutate(events, host);
+      const workItem = db.prepare("SELECT * FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID) as Record<string, unknown>;
+      const profile = { ...ROLE_PROFILE };
+      const nativeReceipt = { projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: attempt.execution_attempt_id, threadId, turnId, requestEvent: { id: "gh643-request", seq: 10 }, acceptedEvent: { id: "gh643-accepted", seq: 20 }, startedEvent: { id: "gh643-started", seq: 30 }, completionEvent: { id: "gh643-completed", seq: 40, providerThreadId, status: "completed" } };
+      const candidateObservation = { projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: attempt.execution_attempt_id, repoTargetId: workItem.repo_target_id, resourceRevision: workItem.resource_revision, environmentId, branchName: checkout.branchName, baseSha: BASE_SHA, candidateSha: CANDIDATE_SHA, checkout, workingTree };
+      const actualProfileDigest = sha256(canonicalJson(profile));
+      const nativeReceiptDigest = sha256(canonicalJson(nativeReceipt));
+      const candidateObservationDigest = sha256(canonicalJson(candidateObservation));
+      const report = {
+        receiptVersion: 1 as const,
+        outcome: "DONE" as const,
+        projectId: PROJECT_ID,
+        assignmentId: (attempt.assignment_id as string | null) ?? null,
+        executionAttemptId: String(attempt.execution_attempt_id),
+        workItemId: WORK_ITEM_ID,
+        roleId: (attempt.role_id as "director" | "project-orchestrator" | "worker" | "independent-reviewer" | null) ?? null,
+        roleGeneration: (attempt.role_generation as number | null) ?? null,
+        repoTargetId: String(workItem.repo_target_id),
+        environmentId,
+        threadId,
+        branchName: checkout.branchName,
+        baseSha: BASE_SHA,
+        candidateSha: CANDIDATE_SHA,
+        nativeReceiptDigest,
+        actualProfileDigest,
+        candidateObservationDigest,
+        reasonCode: "gh643-test",
+        nativeEventId: "gh643-completed",
+        nativeEventSeq: 40,
+        nativeTurnId: turnId,
+        evidence: [
+          { kind: "native-completion", digest: sha256(canonicalJson({ id: "gh643-completed", seq: 40, threadId, turnId, status: "completed" })), ref: "gh643-completed" },
+          { kind: "native-profile", digest: actualProfileDigest, ref: "gh643-request" },
+          { kind: "native-candidate", digest: candidateObservationDigest, ref: environmentId },
+        ],
+        reportedAtMs: 41,
+        receiptEventId: "gh643-report",
+        receiptEventSeq: 41,
+        receivedAtMs: 42,
+      };
+      return { host, db, fenceToken, attempt, report };
+    };
+
+    for (const requestScope of [{ kind: "thread" } as const, { kind: "turn", turnId } as const]) {
+      const fixture = await setup((events) => { events[0]!.scope = requestScope; });
+      const result = await fixture.host.harness.callRpc("apply", {
+        projectId: PROJECT_ID,
+        operationClass: "execution_attempt_terminal_report",
+        idempotencyKey: `gh643-terminal-${requestScope.kind}`,
+        actorReceiptId: RECEIPT_ID,
+        expectedConfigRevision: 1,
+        expectedGovernanceEpoch: 1,
+        expectedFenceToken: fixture.fenceToken,
+        repoTargetId: TARGET_ID,
+        expectedResourceRevision: 3,
+        workItemId: WORK_ITEM_ID,
+        executionAttemptId: fixture.attempt.execution_attempt_id,
+        terminalReport: fixture.report,
+      });
+      expect(result).toMatchObject({ outcome: "OK", attempted: 1, verified: 1, evidence: { executionAttemptId: fixture.attempt.execution_attempt_id } });
+      expect(fixture.db.prepare("SELECT state, terminalization_class, native_receipt_digest, terminal_actual_profile_digest FROM execution_attempts WHERE execution_attempt_id = ?").get(fixture.attempt.execution_attempt_id)).toEqual({ state: "done", terminalization_class: "accepted-terminal-report", native_receipt_digest: fixture.report.nativeReceiptDigest, terminal_actual_profile_digest: fixture.report.actualProfileDigest });
+      const beforeReplay = exportFoundation(fixture.db, PROJECT_ID);
+      expect(await fixture.host.harness.callRpc("apply", {
+        projectId: PROJECT_ID,
+        operationClass: "execution_attempt_terminal_report",
+        idempotencyKey: `gh643-terminal-${requestScope.kind}`,
+        actorReceiptId: RECEIPT_ID,
+        expectedConfigRevision: 1,
+        expectedGovernanceEpoch: 1,
+        expectedFenceToken: fixture.fenceToken,
+        repoTargetId: TARGET_ID,
+        expectedResourceRevision: 3,
+        workItemId: WORK_ITEM_ID,
+        executionAttemptId: fixture.attempt.execution_attempt_id,
+        terminalReport: fixture.report,
+      })).toMatchObject({ outcome: "OK" });
+      expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(beforeReplay);
+    }
+
+    const negativeCases: Array<[string, (events: NativeEvent[], host: Awaited<ReturnType<typeof loadedHost>>) => void, (report: any) => any]> = [
+      ["missing request", (events) => { events.splice(0, 1); }, (report) => report],
+      ["duplicate request ID", (events) => { events.splice(1, 0, { ...events[0]!, id: "gh643-request-duplicate", seq: 11 }); }, (report) => report],
+      ["missing accepted", (events) => { events.splice(1, 1); }, (report) => report],
+      ["missing completion", (events) => { events.splice(3, 1); }, (report) => report],
+      ["duplicate accepted", (events) => { events.splice(2, 0, { ...events[1]!, id: "gh643-accepted-duplicate", seq: 21 }); }, (report) => report],
+      ["missing start", (events) => { events.splice(2, 1); }, (report) => report],
+      ["duplicate start", (events) => { events.splice(3, 0, { ...events[2]!, id: "gh643-started-duplicate", seq: 31 }); }, (report) => report],
+      ["duplicate completion", (events) => { events.push({ ...events[3]!, id: "gh643-completed-duplicate", seq: 41 }); }, (report) => report],
+      ["wrong request turn", (events) => { events[0]!.scope = { kind: "turn", turnId: "foreign-turn" }; }, (report) => report],
+      ["incomplete profile", (events) => { (events[0]!.data as Record<string, unknown>).execution = { ...(events[0]!.data as Record<string, unknown>).execution as Record<string, unknown>, model: "" }; }, (report) => report],
+      ["inferred profile", (events) => { (events[0]!.data as Record<string, unknown>).execution = { ...(events[0]!.data as Record<string, unknown>).execution as Record<string, unknown>, source: "requested-routing" }; }, (report) => report],
+      ["malformed request", (events) => { events[0]!.data = null; }, (report) => report],
+      ["wrong provider thread", (events) => { (events[1]!.data as Record<string, unknown>).providerThreadId = "foreign-provider-thread"; }, (report) => report],
+      ["fallback", (events) => { events.splice(3, 0, { id: "gh643-fallback", threadId, seq: 35, type: "provider/modelFallback", scope: { kind: "turn", turnId }, data: { providerThreadId }, createdAt: 35 }); }, (report) => report],
+      ["malformed completion", (events) => { events[3]!.data = null; }, (report) => report],
+      ["incomplete inventory", (events) => { events[0]!.threadId = FOREIGN_PROJECT_ID; }, (report) => report],
+      ["foreign project", (_events, host) => { host.harness.sdk.stub("threads.get", (async () => makeThreadResponse({ id: threadId, projectId: FOREIGN_PROJECT_ID, environmentId, providerId: ROLE_PROFILE.providerId, status: "idle", visibility: "visible" })) as never); }, (report) => report],
+      ["foreign environment", (_events, host) => { host.harness.sdk.stub("environments.get", (async () => ({ id: environmentId, projectId: FOREIGN_PROJECT_ID })) as never); }, (report) => report],
+      ["wrong candidate", (_events, host) => { host.harness.sdk.stub("environments.status", (async () => ({ outcome: "available", workspace: { checkout: { ...checkout, headSha: BASE_SHA }, workingTree } })) as never); }, (report) => report],
+      ["wrong WorkItem", () => undefined, (report) => ({ ...report, workItemId: "foreign-work-item" })],
+      ["wrong attempt", () => undefined, (report) => ({ ...report, executionAttemptId: "foreign-attempt" })],
+      ["wrong candidate identity", () => undefined, (report) => ({ ...report, candidateSha: BASE_SHA })],
+      ["wrong completion identity", () => undefined, (report) => ({ ...report, nativeEventId: "foreign-completion" })],
+    ];
+    for (const [name, mutate, reportMutator] of negativeCases) {
+      const fixture = await setup(mutate);
+      const before = exportFoundation(fixture.db, PROJECT_ID);
+      const result = await fixture.host.harness.callRpc("apply", {
+        projectId: PROJECT_ID,
+        operationClass: "execution_attempt_terminal_report",
+        idempotencyKey: `gh643-negative-${name.replaceAll(" ", "-")}`,
+        actorReceiptId: RECEIPT_ID,
+        expectedConfigRevision: 1,
+        expectedGovernanceEpoch: 1,
+        expectedFenceToken: fixture.fenceToken,
+        repoTargetId: TARGET_ID,
+        expectedResourceRevision: 3,
+        workItemId: WORK_ITEM_ID,
+        executionAttemptId: fixture.attempt.execution_attempt_id,
+        terminalReport: reportMutator(fixture.report),
+      });
+      expect(result, name).toMatchObject({ outcome: expect.stringMatching(/AMBIGUOUS|UNKNOWN|FOREIGN|EXTERNAL/) , verified: 0 });
+      expect(exportFoundation(fixture.db, PROJECT_ID), name).toEqual(before);
+    }
+  });
 });

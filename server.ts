@@ -1691,7 +1691,12 @@ async function completeNativeThreadEvents(sdk: BbPluginApi["sdk"], threadId: str
 }
 
 function nativeTurnId(event: LiveThreadEvent): string | null {
-  return event.scope?.kind === "turn" ? event.scope.turnId : null;
+  return event.scope?.kind === "turn" && typeof event.scope.turnId === "string" && event.scope.turnId.length > 0 ? event.scope.turnId : null;
+}
+
+function nativeEventData(event: LiveThreadEvent): Record<string, unknown> {
+  if (event.data === null || typeof event.data !== "object" || Array.isArray(event.data)) throw new Error("native event data is malformed");
+  return event.data as Record<string, unknown>;
 }
 
 function liveTerminalReader(
@@ -1711,22 +1716,42 @@ function liveTerminalReader(
   return (async () => {
     try {
       const thread = await sdk.threads.get({ threadId });
-      if (thread.projectId !== request.projectId || thread.id !== threadId || thread.environmentId === null) throw new Error("native terminal thread is foreign or has no environment");
+      if (thread.projectId !== request.projectId || thread.id !== threadId || thread.environmentId === null || thread.environmentId !== attempt.environment_id) throw new Error("native terminal thread is foreign or has no exact environment");
       const events = await completeNativeThreadEvents(sdk, threadId);
-      const completion = events.find((event) => event.id === report.nativeEventId && event.seq === report.nativeEventSeq);
-      if (!completion || completion.type !== "turn/completed" || completion.data.status !== "completed" || nativeTurnId(completion) !== report.nativeTurnId) {
+      const turnId = report.nativeTurnId;
+      const completions = events.filter((event) => event.type === "turn/completed" && nativeTurnId(event) === turnId);
+      if (completions.length !== 1) throw new Error("exact native completion is missing or ambiguous");
+      const completion = completions[0]!;
+      const completionData = nativeEventData(completion);
+      if (completion.id !== report.nativeEventId || completion.seq !== report.nativeEventSeq || completionData.status !== "completed") {
         throw new Error("exact native completion is missing or not completed");
       }
-      const turnId = report.nativeTurnId;
-      const requestEvent = events.find((event) => event.type === "client/turn/requested" && nativeTurnId(event) === turnId);
-      const requestData = requestEvent?.data as Record<string, unknown> | undefined;
-      if (!requestEvent || !requestData || typeof requestData.requestId !== "string" || typeof requestData.execution !== "object" || requestData.execution === null) throw new Error("exact native execution request is missing");
+      const providerThreadId = typeof completionData.providerThreadId === "string" && completionData.providerThreadId.length > 0 ? completionData.providerThreadId : null;
+      if (!providerThreadId) throw new Error("native completion provider thread is unavailable");
+      const accepted = events.filter((event) => event.type === "turn/input/accepted" && nativeTurnId(event) === turnId);
+      if (accepted.length !== 1) throw new Error("native completion input correlation is missing or ambiguous");
+      const acceptedEvent = accepted[0]!;
+      const acceptedData = nativeEventData(acceptedEvent);
+      const requestId = typeof acceptedData.clientRequestId === "string" && acceptedData.clientRequestId.length > 0 ? acceptedData.clientRequestId : null;
+      if (!requestId) throw new Error("native accepted input request ID is unavailable");
+      const requestEvents = events.filter((event) => event.type === "client/turn/requested" && nativeEventData(event).requestId === requestId);
+      if (requestEvents.length !== 1) throw new Error("native execution request is missing or ambiguous");
+      const requestEvent = requestEvents[0]!;
+      if (requestEvent.scope?.kind !== "thread" && requestEvent.scope?.kind !== "turn") throw new Error("native execution request scope is malformed");
+      const requestScopeTurnId = nativeTurnId(requestEvent);
+      if (requestScopeTurnId !== null && requestScopeTurnId !== turnId || requestEvent.seq >= acceptedEvent.seq) throw new Error("native execution request is foreign to the exact turn");
+      if (acceptedData.providerThreadId !== providerThreadId) throw new Error("native accepted input provider thread is foreign");
+      const requestData = nativeEventData(requestEvent);
+      if (typeof requestData.execution !== "object" || requestData.execution === null || Array.isArray(requestData.execution)) throw new Error("exact native execution request is missing");
       const execution = requestData.execution as Record<string, unknown>;
       const profileFields = ["model", "reasoningLevel", "permissionMode", "serviceTier"].map((field) => execution[field]);
       if (profileFields.some((field) => typeof field !== "string" || field.length === 0) || execution.source !== "client/turn/requested") throw new Error("native execution profile is incomplete");
-      const accepted = events.filter((event) => event.type === "turn/input/accepted" && nativeTurnId(event) === turnId && (event.data as Record<string, unknown>).clientRequestId === requestData.requestId);
-      const started = events.filter((event) => event.type === "turn/started" && nativeTurnId(event) === turnId && (event.data as Record<string, unknown>).providerThreadId === (completion.data as Record<string, unknown>).providerThreadId);
-      if (accepted.length !== 1 || started.length !== 1 || events.some((event) => event.type === "provider/modelFallback" && nativeTurnId(event) === turnId)) throw new Error("native completion correlation is missing or ambiguous");
+      const starts = events.filter((event) => event.type === "turn/started" && nativeTurnId(event) === turnId);
+      if (starts.length !== 1) throw new Error("native completion start correlation is missing or ambiguous");
+      const started = starts[0]!;
+      const startedData = nativeEventData(started);
+      if (started.seq <= acceptedEvent.seq || started.seq >= completion.seq || startedData.providerThreadId !== providerThreadId) throw new Error("native completion start correlation is foreign or unordered");
+      if (events.some((event) => event.type === "provider/modelFallback" && (nativeTurnId(event) === turnId || nativeEventData(event).providerThreadId === providerThreadId))) throw new Error("native completion correlation is ambiguous");
       const profile = {
         providerId: thread.providerId,
         model: execution.model as string,
@@ -1736,9 +1761,13 @@ function liveTerminalReader(
         visibility: thread.visibility,
       };
       const environment = await sdk.environments.get({ environmentId: thread.environmentId });
-      if (environment.projectId !== request.projectId) throw new Error("native terminal environment is foreign");
+      if (environment.id !== thread.environmentId || environment.projectId !== request.projectId || environment.projectId !== thread.projectId) throw new Error("native terminal environment is foreign");
       const status = await sdk.environments.status({ environmentId: thread.environmentId });
       if (status.outcome !== "available") throw new Error("native terminal checkout status is unavailable");
+      const checkout = status.workspace.checkout;
+      if (typeof attempt.branch_name === "string" && (checkout.kind !== "branch" || checkout.branchName !== attempt.branch_name)) throw new Error("native terminal branch is foreign");
+      const checkoutHeadSha = checkout.kind === "branch" || checkout.kind === "detached" ? checkout.headSha : null;
+      if (typeof attempt.candidate_sha === "string" && checkoutHeadSha !== attempt.candidate_sha) throw new Error("native terminal candidate is foreign");
       const candidateObservation = {
         projectId: request.projectId,
         workItemId,
@@ -1746,6 +1775,9 @@ function liveTerminalReader(
         repoTargetId: workItem.repo_target_id,
         resourceRevision: workItem.resource_revision,
         environmentId: thread.environmentId,
+        branchName: attempt.branch_name,
+        baseSha: attempt.base_sha,
+        candidateSha: attempt.candidate_sha,
         checkout: status.workspace.checkout,
         workingTree: status.workspace.workingTree,
       };
@@ -1756,15 +1788,15 @@ function liveTerminalReader(
         threadId,
         turnId,
         requestEvent: { id: requestEvent.id, seq: requestEvent.seq },
-        acceptedEvent: { id: accepted[0]!.id, seq: accepted[0]!.seq },
-        startedEvent: { id: started[0]!.id, seq: started[0]!.seq },
-        completionEvent: { id: completion.id, seq: completion.seq, providerThreadId: completion.data.providerThreadId, status: completion.data.status },
+        acceptedEvent: { id: acceptedEvent.id, seq: acceptedEvent.seq },
+        startedEvent: { id: started.id, seq: started.seq },
+        completionEvent: { id: completion.id, seq: completion.seq, providerThreadId, status: completionData.status },
       };
       const actualProfileDigest = sha256(canonicalJson(profile));
       const nativeReceiptDigest = sha256(canonicalJson(nativeReceipt));
       const candidateObservationDigest = sha256(canonicalJson(candidateObservation));
       const evidence = [
-        { kind: "native-completion", digest: sha256(canonicalJson({ id: completion.id, seq: completion.seq, threadId, turnId, status: completion.data.status })), ref: completion.id },
+        { kind: "native-completion", digest: sha256(canonicalJson({ id: completion.id, seq: completion.seq, threadId, turnId, status: completionData.status })), ref: completion.id },
         { kind: "native-profile", digest: actualProfileDigest, ref: requestEvent.id },
         { kind: "native-candidate", digest: candidateObservationDigest, ref: thread.environmentId },
       ];
