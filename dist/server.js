@@ -23292,6 +23292,8 @@ function migrateCanonicalStore(db, migrate) {
   } else if (!repairApplied) {
     if (!migrationSchemaShape(db, "schema31")) throw new Error("GH636 migration ledger is ambiguous: migration 43 is ledgered without schema 31");
     migrate(db, MIGRATIONS);
+  } else {
+    migrate(db, MIGRATIONS);
   }
   if (!has(GH636_PREVIOUS_MIGRATION_ID) || !has(GH636_REPAIR_MIGRATION_ID)) throw new Error("GH636 migration ledger is incomplete");
   assertMigratedSchema(db);
