@@ -5548,6 +5548,56 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     }
   });
 
+  it.each([
+    ["current", true],
+    ["initial-pending", false],
+  ] as const)("persists and binds one body-updating %s dispatch without leaking transition fields", async (_name, currentProjection) => {
+    const projected = await currentGithubBriefDispatch();
+    const updatedScope = "Updated current scope.";
+    const currentSnapshot = {
+      ...projected.snapshot,
+      body: `canonical: ${maintainedIssueBody({ lifecycleState: "ready", scope: "Keep canonical state local." })}`,
+      labels: ["work-ready"],
+      externalRevision: "fixture-1",
+    };
+    const transitionSnapshot = {
+      ...projected.transitionSnapshot,
+      body: `canonical: ${maintainedIssueBody({ lifecycleState: "in_progress", scope: updatedScope })}`,
+      externalRevision: "fixture-2",
+    };
+    const restore = installGithubBriefGh(currentProjection ? currentSnapshot : projected.snapshot, { transitionSnapshot });
+    try {
+      if (currentProjection) {
+        const adapter = new DeterministicGitHubIssueAdapter();
+        adapter.put(currentSnapshot);
+        expect(applyWithFixtureReceipt(projected.fixture.db, projectionRequest(projected.fixture.fenceToken, 2), adapter)).toMatchObject({ outcome: "OK" });
+      }
+      const request = transitionRequest(projected.fixture.fenceToken, "in_progress", 2, {
+        workItemBody: updatedScope,
+      });
+      const spawn = dispatchSpawn(projected.fixture.orchestratorThreadId);
+      const first = JSON.parse(await projected.fixture.host.harness.callAgentTool("dispatch_lane", { request, spawn }, {
+        projectId: PROJECT_ID,
+        threadId: projected.fixture.orchestratorThreadId,
+      }) as string);
+      expect(first).toMatchObject({ outcome: "OK" });
+      expect(projected.fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+      expect(projected.fixture.db.prepare("SELECT body, lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ body: updatedScope, lifecycle_state: "in_progress" });
+      expect(projected.fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'").get(PROJECT_ID, WORK_ITEM_ID)).toMatchObject({ state: "running", thread_id: expect.any(String) });
+      expect(projected.fixture.db.prepare("SELECT COUNT(*) AS count FROM mutation_receipts WHERE project_id = ? AND idempotency_key IN (?, ?)").get(PROJECT_ID, `${request.idempotencyKey}:maintained-body`, `${request.idempotencyKey}-finalize`)).toEqual({ count: 2 });
+
+      const second = JSON.parse(await projected.fixture.host.harness.callAgentTool("dispatch_lane", { request, spawn }, {
+        projectId: PROJECT_ID,
+        threadId: projected.fixture.orchestratorThreadId,
+      }) as string);
+      expect(second).toMatchObject({ outcome: "OK" });
+      expect(projected.fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+      expect(restore.readCallsAndCleanup().match(/--method PATCH/gu)).toHaveLength(1);
+    } finally {
+      restore.cleanup();
+    }
+  });
+
   it("refuses dispatch when the exact GitHub projection revision or digest is stale", async () => {
     for (const kind of ["digest", "revision"] as const) {
       const fixture = await fleetWatchdogFixture(0, true, 1, false);

@@ -25398,14 +25398,24 @@ async function dispatchLane(bb, db, input) {
       if (!currentWorkItem || !Number.isSafeInteger(currentWorkItem.resource_revision)) {
         return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub projection capability is unavailable for the current WorkItem" };
       }
-      const { lifecycleState: _lifecycleState, workAttempt: _workAttempt, reasonCode: _reasonCode, ...projectionBase } = request;
       const projection = await applyLiveAuthorizedMutationAsync(bb, db, {
-        ...projectionBase,
+        projectId: request.projectId,
         operationClass: "github_issue_projection",
         idempotencyKey: `${request.idempotencyKey}:maintained-body`,
+        actorReceiptId: request.actorReceiptId,
+        expectedConfigRevision: request.expectedConfigRevision,
+        expectedGovernanceEpoch: request.expectedGovernanceEpoch,
+        expectedFenceToken: request.expectedFenceToken,
+        repoTargetId: request.repoTargetId,
+        domainId: request.domainId,
+        taskClass: request.taskClass,
         expectedResourceRevision: currentWorkItem.resource_revision,
         workItemId: request.workItemId,
-        projectionKind: "github_issue"
+        projectionKind: "github_issue",
+        ...configProof.continued ? {
+          configRevision: configProof.currentConfigRevision,
+          fixtureContextDigest: configProof.proofDigest
+        } : {}
       }, false, "refuse-active", projectGithubIssueReader(db, request.projectId), githubAdapter);
       if (projection.outcome !== "OK") return projection;
       try {
@@ -25536,11 +25546,20 @@ async function dispatchEnvironmentPreflight(bb, projectId, environment, proof) {
 }
 async function finalizeDispatchIntent(bb, db, request, intent, threadId, configProof) {
   return applyLiveAuthorizedMutation(bb, db, {
-    ...request,
+    projectId: request.projectId,
+    operationClass: "work_item_transition",
+    idempotencyKey: `${request.idempotencyKey}-finalize`,
+    actorReceiptId: request.actorReceiptId,
+    expectedConfigRevision: request.expectedConfigRevision,
+    expectedGovernanceEpoch: request.expectedGovernanceEpoch,
+    expectedFenceToken: request.expectedFenceToken,
+    repoTargetId: request.repoTargetId,
+    domainId: request.domainId,
+    taskClass: request.taskClass,
+    workItemId: request.workItemId,
     lifecycleState: void 0,
     configRevision: configProof.currentConfigRevision,
     expectedResourceRevision: intent.resourceRevision,
-    idempotencyKey: `${request.idempotencyKey}-finalize`,
     fixtureContextDigest: configProof.proofDigest,
     reasonCode: "dispatch_intent_finalize",
     workAttempt: { ...request.workAttempt, threadId }
