@@ -616,6 +616,19 @@ function appendGithubIssueBrief(spawn: Record<string, unknown>, brief: GithubIss
   };
 }
 
+function appendFrozenReviewBrief(spawn: Record<string, unknown>, brief: string): Record<string, unknown> {
+  if (typeof spawn.prompt === "string") return { ...spawn, prompt: `${spawn.prompt}\n\n${brief}` };
+  if (!Array.isArray(spawn.input)) throw new Error("dispatch prompt shape is unavailable");
+  return {
+    ...spawn,
+    input: [...spawn.input, { type: "text", visibility: "agent-only", text: brief, mentions: [] }],
+  };
+}
+
+function dispatchInputDigest(spawn: Record<string, unknown>): string {
+  return sha256(canonicalJson({ input: spawn.input ?? null, prompt: spawn.prompt ?? null }));
+}
+
 function linkedGithubObservation(owner: string, repo: string, issueNumber: number, connectorHost: string): LinkedGithubObservation | null {
   const issue = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "state,stateReason,updatedAt,closedByPullRequestsReferences"], connectorHost);
   if (!issue || typeof issue !== "object" || Array.isArray(issue)) return null;
@@ -1297,8 +1310,14 @@ async function dispatchLane(
   const parsed = dispatchLaneInputSchema.safeParse(input);
   if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "dispatch", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
   const { request, spawn } = parsed.data;
-  if (!request.workAttempt || (request.lifecycleState !== "in_progress" && request.lifecycleState !== undefined)) {
-    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "lane dispatch requires a writing work attempt and an in-progress transition" };
+  const reviewDispatch = request.workAttempt?.assignmentKind === "review";
+  if (!request.workAttempt || (reviewDispatch
+    ? request.lifecycleState !== undefined
+    : request.lifecycleState !== "in_progress" && request.lifecycleState !== undefined)) {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: reviewDispatch ? "review dispatch requires a review attempt and review_pending WorkItem" : "lane dispatch requires a writing work attempt and an in-progress transition" };
+  }
+  if (reviewDispatch && request.workAttempt.candidateKind !== "local") {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "dispatch_lane only supports explicit local-candidate reviews; pull-request reviews use the governed review handoff" };
   }
   if (spawn.projectId !== request.projectId) {
     return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "spawn projectId must match request projectId" };
@@ -1341,14 +1360,34 @@ async function dispatchLane(
       expectedGovernanceEpoch: request.expectedGovernanceEpoch,
       expectedFenceToken: request.expectedFenceToken,
       requestedProfile,
+      assignmentKind: request.workAttempt.assignmentKind,
+      candidateKind: request.workAttempt.candidateKind,
     });
   } catch (error) {
     if (isRefusal(error)) return { outcome: error.data.code, subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: error.data.message };
     return { outcome: "INTERNAL_ERROR", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "dispatch config proof failed" };
   }
-  const environmentRefusal = await dispatchEnvironmentPreflight(bb, request.projectId, spawnShape.data.environment, configProof);
+  const localReview = request.workAttempt.assignmentKind === "review" && request.workAttempt.candidateKind === "local";
+  let preparedDispatchSpawn = spawnShape.data;
+  if (localReview) {
+    if (
+      configProof.reviewerRoleRequirementId !== request.workAttempt.reviewRoleRequirementId ||
+      configProof.reviewerRoleId !== request.workAttempt.reviewRoleId ||
+      configProof.reviewerRoleGeneration !== request.workAttempt.reviewRoleGeneration
+    ) return { outcome: "ROLE_GENERATION_STALE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "local review authority does not match the current independent-reviewer generation" };
+    if (request.workAttempt.reviewReturnPath?.threadId !== spawnShape.data.parentThreadId) {
+      return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "local review return path must bind the native parent thread" };
+    }
+    try {
+      preparedDispatchSpawn = appendFrozenReviewBrief(spawnShape.data as Record<string, unknown>, request.workAttempt.reviewFrozenBriefContent!) as typeof spawnShape.data;
+    } catch (error) {
+      return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: `local review brief cannot be bound to native input: ${String(error)}` };
+    }
+    request.workAttempt = { ...request.workAttempt, dispatchInputDigest: dispatchInputDigest(preparedDispatchSpawn as Record<string, unknown>) };
+  }
+  const environmentRefusal = await dispatchEnvironmentPreflight(bb, request.projectId, preparedDispatchSpawn.environment, configProof, request.workAttempt);
   if (environmentRefusal) return environmentRefusal;
-  const briefTarget = githubIssueBriefTarget(db, request.projectId, request.workItemId ?? "");
+  const briefTarget = localReview ? null : githubIssueBriefTarget(db, request.projectId, request.workItemId ?? "");
   if (briefTarget === "invalid") {
     return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub issue projection identity is malformed or ambiguous" };
   }
@@ -1379,7 +1418,7 @@ async function dispatchLane(
   }, false, "stop-active", githubAdapter?.read ?? projectGithubIssueReader(db, request.projectId), githubAdapter);
   if (intent.outcome !== "OK") return intent;
   return serializeDispatchRecovery(request, async () => {
-    let dispatchSpawn = spawnShape.data;
+    let dispatchSpawn = preparedDispatchSpawn;
     if (briefTarget) {
       const currentWorkItem = db?.prepare(
         "SELECT resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?",
@@ -1425,6 +1464,10 @@ async function dispatchLane(
       }
       dispatchSpawn = appendGithubIssueBrief(dispatchSpawn as Record<string, unknown>, latestRead.brief) as typeof dispatchSpawn;
     }
+    if (localReview) {
+      const finalEnvironmentRefusal = await dispatchEnvironmentPreflight(bb, request.projectId, dispatchSpawn.environment, configProof, request.workAttempt!);
+      if (finalEnvironmentRefusal) return finalEnvironmentRefusal;
+    }
     if (!intent.replay) {
       try {
         const spawnedThread = await spawnDispatchThread(bb, dispatchSpawn, request.idempotencyKey);
@@ -1461,9 +1504,9 @@ function preparedDispatchIntent(db: SqliteDatabase | null, request: ApplyRequest
     `SELECT reason_code
      FROM execution_attempts
      WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
-       AND assignment_kind = 'write' AND state = 'prepared' AND thread_id IS NULL
+       AND assignment_kind = ? AND state = 'prepared' AND thread_id IS NULL
      ORDER BY attempt_ordinal DESC`,
-  ).all(request.projectId, request.workItemId) as Array<{ reason_code: string | null }>;
+  ).all(request.projectId, request.workItemId, request.workAttempt?.assignmentKind ?? "write") as Array<{ reason_code: string | null }>;
   const matches = rows.filter((row) => parseWorkItemDispatchIntent(row.reason_code)?.idempotencyKey === request.idempotencyKey);
   if (matches.length > 1) return "ambiguous";
   const match = matches[0];
@@ -1535,7 +1578,51 @@ async function dispatchEnvironmentPreflight(
   projectId: string,
   environment: z.infer<typeof dispatchEnvironmentSchema>,
   proof: WorkItemDispatchConfigProof,
+  workAttempt: NonNullable<ApplyRequest["workAttempt"]>,
 ): Promise<FoundationResult | null> {
+  if (workAttempt.assignmentKind === "review" && workAttempt.candidateKind === "local") {
+    const candidateEnvironment = workAttempt.reviewCandidateEnvironment!;
+    if (environment.type !== "reuse" || environment.environmentId !== candidateEnvironment.environmentId) {
+      return { outcome: "REPO_TARGET_FOREIGN", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "local review must reuse the exact frozen candidate environment" };
+    }
+    try {
+      const [facts, project] = await Promise.all([
+        bb.sdk.environments.get({ environmentId: candidateEnvironment.environmentId }),
+        bb.sdk.projects.get({ projectId }),
+      ]);
+      if (
+        facts.id !== candidateEnvironment.environmentId || facts.projectId !== projectId || facts.hostId !== candidateEnvironment.hostId ||
+        candidateEnvironment.sourceId !== proof.sourceId || candidateEnvironment.hostId !== proof.hostId ||
+        candidateEnvironment.bbServerId !== bb.server.loopbackBaseUrl ||
+        facts.path !== candidateEnvironment.path || facts.managed !== true || facts.isWorktree !== true || facts.workspaceProvisionType !== "managed-worktree" ||
+        project.sources.filter((source) => source.id === proof.sourceId && source.projectId === projectId && source.hostId === proof.hostId && source.path === proof.path).length !== 1
+      ) return { outcome: "REPO_TARGET_FOREIGN", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "local candidate environment identity is foreign or incomplete" };
+      const base = workAttempt.reviewBaseSha!;
+      const [baseCommit, candidateCommit, status] = await Promise.all([
+        bb.sdk.environments.diff({ environmentId: candidateEnvironment.environmentId, target: "commit", sha: base }),
+        bb.sdk.environments.diff({ environmentId: candidateEnvironment.environmentId, target: "commit", sha: workAttempt.reviewCandidateSha! }),
+        bb.sdk.environments.status({ environmentId: candidateEnvironment.environmentId, mergeBaseBranch: base }),
+      ]);
+      if (baseCommit.outcome !== "available") return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "local review base commit is unavailable in the candidate repository" };
+      if (candidateCommit.outcome !== "available") return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "local review candidate commit is unavailable in the candidate repository" };
+      if (status.outcome !== "available") return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "local candidate environment is not reachable" };
+      const workspace = status.workspace;
+      const checkout = workspace?.checkout;
+      const workingTree = workspace?.workingTree as { state?: string; hasUncommittedChanges?: boolean; files?: unknown[]; insertions?: number; deletions?: number } | undefined;
+      const clean = (workingTree?.state === "clean" || workingTree?.state === "committed_unmerged") &&
+        workingTree.hasUncommittedChanges === false && Array.isArray(workingTree.files) &&
+        workingTree.files.length === 0 && workingTree.insertions === 0 && workingTree.deletions === 0;
+      const mergeBase = workspace.mergeBase;
+      if (
+        !checkout || checkout.kind !== "branch" || checkout.headSha !== workAttempt.reviewCandidateSha ||
+        checkout.branchName !== workAttempt.reviewCandidateCheckout?.branchName || !clean ||
+        !mergeBase || mergeBase.baseRef !== base || mergeBase.mergeBaseBranch !== base || mergeBase.behindCount !== 0 || mergeBase.aheadCount <= 0 || mergeBase.lineStatsComplete !== true
+      ) return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "local candidate is not the exact reachable clean frozen checkout based on the frozen base" };
+    } catch (error) {
+      return { outcome: "EXTERNAL_UNAVAILABLE", subject: projectId, expected: 1, attempted: 1, verified: 0, message: `local candidate observation is unavailable: ${String(error)}` };
+    }
+    return null;
+  }
   if (environment.type !== "host" || environment.workspace.type !== "managed-worktree" || !environment.hostId) {
     return { outcome: "REPO_TARGET_FOREIGN", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "dispatch requires one exact host managed-worktree environment" };
   }
@@ -1632,6 +1719,10 @@ async function reconcileDispatchIntent(
   }
   if (exact.length === 1) return finalizeDispatchIntent(bb, db, request, intent, exact[0]!.id, configProof);
   if (!allowRetry) return dispatchRecoveryRefusal(request.projectId, "native dispatch inventory proves no exact thread, but the prior spawn outcome is not retryable", { intent: intentResult });
+  if (request.workAttempt?.assignmentKind === "review" && request.workAttempt.candidateKind === "local") {
+    const finalEnvironmentRefusal = await dispatchEnvironmentPreflight(bb, request.projectId, spawn.environment, configProof, request.workAttempt);
+    if (finalEnvironmentRefusal) return finalEnvironmentRefusal;
+  }
   try {
     const retried = await spawnDispatchThread(bb, spawn, request.idempotencyKey);
     if (
