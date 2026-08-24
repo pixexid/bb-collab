@@ -21061,22 +21061,35 @@ function requireBoundGithubIssue(db, projectId, workItemId, target) {
   }
   return ref;
 }
-function requireBlockerCondition(db, request, blocker, githubObservation, satisfied) {
-  let conditionSatisfied;
+function blockerConditionSatisfied(db, request, blocker, githubObservation) {
   if (blocker.kind === "work_item_succeeded") {
     if (blocker.workItemId === request.workItemId) throw refusal("WORK_ITEM_STATE_INVALID", "work item cannot block on itself");
-    const dependency = asRow(db.prepare(
-      "SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?"
-    ).get(request.projectId, blocker.workItemId));
-    if (!dependency) throw refusal("WORK_ITEM_UNKNOWN", "blocking work item does not exist in the exact project");
-    if (["failed", "cancelled"].includes(dependency.lifecycle_state)) {
-      throw refusal("WORK_ITEM_STATE_INVALID", "work item cannot block on a terminal dependency that did not succeed");
+    const visited = /* @__PURE__ */ new Set([request.workItemId]);
+    let dependencyId = blocker.workItemId;
+    while (true) {
+      if (visited.has(dependencyId)) throw refusal("WORK_ITEM_STATE_INVALID", "work item blocker dependency is cyclic");
+      visited.add(dependencyId);
+      const dependency = asRow(db.prepare(
+        "SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?"
+      ).get(request.projectId, dependencyId));
+      if (!dependency) throw refusal("WORK_ITEM_UNKNOWN", "blocking work item does not exist in the exact project");
+      if (["failed", "cancelled"].includes(dependency.lifecycle_state)) {
+        throw refusal("WORK_ITEM_STATE_INVALID", "work item cannot block on a terminal dependency that did not succeed");
+      }
+      if (dependency.lifecycle_state === "succeeded") return true;
+      const next = asRow(db.prepare(
+        "SELECT waker, waker_kind FROM work_item_waits WHERE project_id = ? AND work_item_id = ?"
+      ).get(request.projectId, dependencyId));
+      if (!next || next.waker_kind !== "work_item_succeeded") return false;
+      dependencyId = next.waker;
     }
-    conditionSatisfied = dependency.lifecycle_state === "succeeded";
   } else {
     if (!githubObservation) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub blocker observation is unavailable");
-    conditionSatisfied = githubObservation.state === "closed";
+    return githubObservation.state === "closed";
   }
+}
+function requireBlockerCondition(db, request, blocker, githubObservation, satisfied) {
+  const conditionSatisfied = blockerConditionSatisfied(db, request, blocker, githubObservation);
   if (conditionSatisfied !== satisfied) {
     throw refusal("WORK_ITEM_STATE_INVALID", satisfied ? "work item blocker has not fired" : "work item blocker already fired");
   }
@@ -21123,7 +21136,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
   requireRoleActorBinding(db, request, false);
-  const nextState = request.lifecycleState;
+  let nextState = request.lifecycleState;
   let configContinuation = null;
   let dispatchIntentEvidence = null;
   if (committedDispatchIntent) {
@@ -21197,6 +21210,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
   const machineWait = wait && (wait.kind === "work_item_succeeded" || wait.kind === "github_issue_closed") ? wait : null;
   const enteringBlocked = nextState === "blocked" && workItem.lifecycle_state !== "blocked";
   const swappingBlockedWait = workItem.lifecycle_state === "blocked" && nextState === "blocked";
+  let firedReplacementSwap = false;
   if (enteringBlocked) {
     if (!machineWait || workAttempt !== void 0 || unblock !== void 0 || externalEvent !== void 0) {
       throw refusal("WORK_ITEM_STATE_INVALID", "entering blocked requires exactly one machine-evaluable blocker");
@@ -21219,7 +21233,12 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
     if (sameWorkItemBlocker(storedBlocker, replacement)) {
       throw refusal("WORK_ITEM_STATE_INVALID", "blocked wait swap requires a different replacement blocker");
     }
-    requireBlockerCondition(db, request, machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber }, githubObservation, false);
+    if (machineWait.kind === "work_item_succeeded") {
+      firedReplacementSwap = blockerConditionSatisfied(db, request, replacement, githubObservation);
+      if (firedReplacementSwap) nextState = "ready";
+    } else {
+      requireBlockerCondition(db, request, replacement, githubObservation, false);
+    }
   }
   if (wait !== void 0 && !enteringBlocked && !swappingBlockedWait) {
     if (machineWait) throw refusal("WORK_ITEM_STATE_INVALID", "machine-evaluable blocker requires an atomic transition to blocked");
@@ -21425,7 +21444,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
       if (!unblock || !sameWorkItemBlocker(storedBlocker, unblock)) {
         throw refusal("WORK_ITEM_STATE_INVALID", "blocked to ready requires the exact stored blocker");
       }
-      requireBlockerCondition(db, request, unblock, githubObservation, true);
+      if (!firedReplacementSwap) requireBlockerCondition(db, request, unblock, githubObservation, true);
     } else if (unblock !== void 0 && !swappingBlockedWait) {
       throw refusal("WORK_ITEM_STATE_INVALID", "work item unblock evidence only permits blocked to ready or an atomic blocker swap");
     }
@@ -21490,7 +21509,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
       `INSERT INTO work_item_waits (project_id, work_item_id, domain_id, waker, waker_kind, declared_at_ms, declared_by_seat, note)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(request.projectId, workItem.work_item_id, workItem.domain_id, workItemBlockerWaker(blocker), blocker.kind, now(), machineWait.declaredBySeat, machineWait.note ?? null);
-  } else if (swappingBlockedWait) {
+  } else if (swappingBlockedWait && !firedReplacementSwap) {
     const blocker = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber };
     db.prepare(
       `UPDATE work_item_waits
@@ -21580,6 +21599,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
         ...workAttempt === void 0 ? {} : { workAttempt },
         ...machineWait === null ? {} : { blocker: machineWait },
         ...unblock === void 0 ? {} : { unblock },
+        ...firedReplacementSwap ? { previousBlocker: unblock, replacementBlocker: machineWait } : {},
         ...recordedExternalEvent === null ? {} : { externalEvent: recordedExternalEvent },
         ...configContinuation === null ? {} : {
           configContinuation: {
@@ -21605,6 +21625,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
         ...reviewExecutionAttemptId === null ? {} : { reviewExecutionAttemptId },
         ...machineWait === null ? {} : { blocker: machineWait },
         ...unblock === void 0 ? {} : { unblock },
+        ...firedReplacementSwap ? { previousBlocker: unblock, replacementBlocker: machineWait } : {},
         ...recordedExternalEvent === null ? {} : { externalEvent: recordedExternalEvent },
         ...configContinuation === null ? {} : {
           configContinuation: {

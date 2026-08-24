@@ -12416,6 +12416,97 @@ else printf '%s\\n' '[]'; fi
     });
   });
 
+  it("recovers a blocked WorkItem through an already-succeeded immutable successor", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    const create = (workItemId: string, issueNumber?: number) => applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      idempotencyKey: `${workItemId}-create`,
+      workItemId,
+      workItem: {
+        workItemId,
+        title: workItemId,
+        body: workItemId,
+        ...(issueNumber === undefined ? {} : { githubIssue: { issueNumber } }),
+      },
+    }));
+    const transition = (workItemId: string, state: ApplyRequest["lifecycleState"], revision: number, overrides: Partial<ApplyRequest> = {}) =>
+      applyWithFixtureReceipt(db, transitionRequest(fenceToken, state, revision, {
+        idempotencyKey: `${workItemId}-${state}-${revision}`,
+        workItemId,
+        ...overrides,
+      }));
+    const targetId = "wi-gh-643";
+    const predecessorId = "wi-gh-637";
+    const replacementId = "wi-gh-637-r11";
+    expect(create(targetId, 643).outcome).toBe("OK");
+    expect(create(predecessorId).outcome).toBe("OK");
+    expect(create(replacementId).outcome).toBe("OK");
+    expect(transition(targetId, "ready", 1).outcome).toBe("OK");
+    expect(transition(targetId, "blocked", 2, {
+      workItemWait: { kind: "work_item_succeeded", workItemId: predecessorId, declaredBySeat: "worker-seat" },
+    }).outcome).toBe("OK");
+    expect(transition(predecessorId, "cancelled", 1).outcome).toBe("OK");
+    expect(transition(replacementId, "ready", 1).outcome).toBe("OK");
+    expect(transition(replacementId, "in_progress", 2).outcome).toBe("OK");
+    expect(transition(replacementId, "review_pending", 3).outcome).toBe("OK");
+    expect(transition(replacementId, "succeeded", 4).outcome).toBe("OK");
+
+    const swapRequest = transitionRequest(fenceToken, "blocked", 3, {
+      idempotencyKey: "gh650-fired-successor-rebind",
+      workItemId: targetId,
+      workItemWait: { kind: "work_item_succeeded", workItemId: replacementId, declaredBySeat: "worker-seat", note: "Use the live current-revision prerequisite." },
+      workItemUnblock: { kind: "work_item_succeeded", workItemId: predecessorId },
+    });
+    const swap = applyWithFixtureReceipt(db, swapRequest);
+    expect(swap).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE work_item_id = ?").get(targetId)).toEqual({ lifecycle_state: "ready", resource_revision: 4 });
+    expect(db.prepare("SELECT 1 FROM work_item_waits WHERE work_item_id = ?").get(targetId)).toBeUndefined();
+    expect(db.prepare("SELECT owner, repo, issue_number FROM external_work_refs WHERE work_item_id = ?").get(targetId)).toEqual({ owner: GITHUB_OWNER, repo: GITHUB_REPO, issue_number: 643 });
+    const event = db.prepare(
+      "SELECT aggregate_revision, event_type, actor_receipt_id, event_json FROM state_events WHERE aggregate_id = ? ORDER BY aggregate_revision DESC LIMIT 1",
+    ).get(targetId) as { aggregate_revision: number; event_type: string; actor_receipt_id: string; event_json: string };
+    expect(event).toMatchObject({ aggregate_revision: 4, event_type: "work_item_wait_swapped", actor_receipt_id: RECEIPT_ID });
+    expect(JSON.parse(event.event_json)).toMatchObject({
+      from: "blocked",
+      to: "ready",
+      previousBlocker: { kind: "work_item_succeeded", workItemId: predecessorId },
+      replacementBlocker: { kind: "work_item_succeeded", workItemId: replacementId },
+      unblock: { kind: "work_item_succeeded", workItemId: predecessorId },
+      blocker: { kind: "work_item_succeeded", workItemId: replacementId },
+    });
+    const recovered = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, swapRequest)).toMatchObject({ outcome: "OK" });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(recovered);
+  });
+
+  it("refuses a blocker cycle before mutation", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    const create = (workItemId: string) => applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      idempotencyKey: `${workItemId}-create`, workItemId,
+      workItem: { workItemId, title: workItemId, body: workItemId },
+    }));
+    const transition = (workItemId: string, state: ApplyRequest["lifecycleState"], revision: number, overrides: Partial<ApplyRequest> = {}) =>
+      applyWithFixtureReceipt(db, transitionRequest(fenceToken, state, revision, {
+        idempotencyKey: `${workItemId}-${state}-${revision}`,
+        workItemId,
+        ...overrides,
+      }));
+    expect(create("cycle-a").outcome).toBe("OK");
+    expect(create("cycle-b").outcome).toBe("OK");
+    expect(transition("cycle-a", "ready", 1).outcome).toBe("OK");
+    expect(transition("cycle-b", "ready", 1).outcome).toBe("OK");
+    expect(transition("cycle-b", "blocked", 2, {
+      workItemWait: { kind: "work_item_succeeded", workItemId: "cycle-a", declaredBySeat: "worker-seat" },
+    }).outcome).toBe("OK");
+    const before = exportFoundation(db, PROJECT_ID);
+    expect(transition("cycle-a", "blocked", 2, {
+      idempotencyKey: "cycle-a-blocked-on-b",
+      workItemWait: { kind: "work_item_succeeded", workItemId: "cycle-b", declaredBySeat: "worker-seat" },
+    })).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", message: "work item blocker dependency is cyclic", attempted: 0 });
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+  });
+
   it("requires an atomic machine-evaluable blocker and only resumes on the exact fired condition", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host);
