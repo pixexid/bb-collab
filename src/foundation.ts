@@ -1105,8 +1105,87 @@ export const MIGRATIONS: string[] = [
      continuation_of_attempt_id, created_at_ms, observed_at_ms, completed_at_ms, attempt_digest, review_pr_number,
      review_pr_head_sha, lane_capacity_observation_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
    FROM execution_attempts;
-   DROP TABLE execution_attempts;
+   ALTER TABLE decision_evidence RENAME TO execution_attempts_gh624_decision_evidence;
+   ALTER TABLE evidence_artifacts RENAME TO execution_attempts_gh624_evidence_artifacts;
+   ALTER TABLE lane_capacity_refresh_evidence RENAME TO execution_attempts_gh624_lane_capacity_refresh_evidence;
+   ALTER TABLE execution_attempts RENAME TO execution_attempts_gh624_old;
+   DROP INDEX execution_attempts_active_assignment;
+   DROP INDEX execution_attempts_active_writer_lane;
+   DROP INDEX execution_attempts_active_writer_thread;
+   DROP INDEX execution_attempts_active_work_item;
+   DROP INDEX execution_attempts_native_request;
+   DROP INDEX execution_attempts_project_state;
+   DROP TRIGGER execution_attempts_lane_capacity_observation_immutable;
+   DROP TRIGGER lane_capacity_refresh_evidence_immutable_update;
+   DROP TRIGGER lane_capacity_refresh_evidence_immutable_delete;
    ALTER TABLE execution_attempts_gh624 RENAME TO execution_attempts;
+   CREATE TABLE evidence_artifacts (
+     project_id TEXT NOT NULL,
+     evidence_id TEXT NOT NULL,
+     evidence_kind TEXT NOT NULL CHECK (evidence_kind IN
+       ('advisory_read', 'delegated_action_receipt', 'legacy_claim', 'connector', 'test', 'export', 'release', 'review_ready')),
+     source_kind TEXT NOT NULL CHECK (source_kind IN
+       ('helper', 'pro', 'legacy_claim', 'delegated_action', 'connector', 'test', 'export', 'release', 'review_ready')),
+     source_ref TEXT NOT NULL,
+     execution_attempt_id TEXT,
+     content_digest TEXT NOT NULL,
+     redacted_json TEXT NOT NULL CHECK (json_valid(redacted_json)),
+     redacted_digest TEXT NOT NULL,
+     durable_ref_json TEXT NOT NULL CHECK (json_valid(durable_ref_json)),
+     artifact_identity_digest TEXT NOT NULL,
+     created_at_ms INTEGER NOT NULL,
+     PRIMARY KEY (project_id, evidence_id),
+     FOREIGN KEY (project_id, execution_attempt_id)
+       REFERENCES execution_attempts(project_id, execution_attempt_id),
+     CHECK ((evidence_kind = 'delegated_action_receipt' AND source_kind = 'delegated_action' AND execution_attempt_id IS NOT NULL) OR
+            (evidence_kind != 'delegated_action_receipt' AND source_kind != 'delegated_action' AND execution_attempt_id IS NULL))
+   );
+   INSERT INTO evidence_artifacts (
+     project_id, evidence_id, evidence_kind, source_kind, source_ref, execution_attempt_id,
+     content_digest, redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest, created_at_ms
+   ) SELECT project_id, evidence_id, evidence_kind, source_kind, source_ref, execution_attempt_id,
+     content_digest, redacted_json, redacted_digest, durable_ref_json, artifact_identity_digest, created_at_ms
+   FROM execution_attempts_gh624_evidence_artifacts;
+   CREATE TABLE decision_evidence (
+     project_id TEXT NOT NULL,
+     decision_id TEXT NOT NULL,
+     evidence_sequence INTEGER NOT NULL CHECK (evidence_sequence > 0),
+     evidence_id TEXT NOT NULL,
+     disposition_sequence INTEGER NOT NULL CHECK (disposition_sequence > 0),
+     relation_kind TEXT NOT NULL CHECK (relation_kind IN
+       ('advisory_read', 'delegated_action_receipt', 'legacy_claim', 'supporting')),
+     relation_json TEXT NOT NULL CHECK (json_valid(relation_json)),
+     created_at_ms INTEGER NOT NULL,
+     idempotency_key TEXT NOT NULL,
+     PRIMARY KEY (project_id, decision_id, evidence_sequence),
+     FOREIGN KEY (decision_id, disposition_sequence)
+       REFERENCES decision_dispositions(decision_id, disposition_sequence),
+     FOREIGN KEY (project_id, evidence_id)
+       REFERENCES evidence_artifacts(project_id, evidence_id)
+   );
+   INSERT INTO decision_evidence (
+     project_id, decision_id, evidence_sequence, evidence_id, disposition_sequence,
+     relation_kind, relation_json, created_at_ms, idempotency_key
+   ) SELECT project_id, decision_id, evidence_sequence, evidence_id, disposition_sequence,
+     relation_kind, relation_json, created_at_ms, idempotency_key
+   FROM execution_attempts_gh624_decision_evidence;
+   CREATE TABLE lane_capacity_refresh_evidence (
+     project_id TEXT NOT NULL CHECK (length(project_id) > 0),
+     lane_capacity_observation_id TEXT NOT NULL CHECK (length(lane_capacity_observation_id) > 0),
+     execution_attempt_id TEXT NOT NULL CHECK (length(execution_attempt_id) > 0),
+     observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
+     PRIMARY KEY (project_id, lane_capacity_observation_id, execution_attempt_id),
+     FOREIGN KEY (project_id, execution_attempt_id)
+       REFERENCES execution_attempts(project_id, execution_attempt_id)
+   );
+   INSERT INTO lane_capacity_refresh_evidence (
+     project_id, lane_capacity_observation_id, execution_attempt_id, observed_at_ms
+   ) SELECT project_id, lane_capacity_observation_id, execution_attempt_id, observed_at_ms
+   FROM execution_attempts_gh624_lane_capacity_refresh_evidence;
+   DROP TABLE execution_attempts_gh624_decision_evidence;
+   DROP TABLE execution_attempts_gh624_evidence_artifacts;
+   DROP TABLE execution_attempts_gh624_lane_capacity_refresh_evidence;
+   DROP TABLE execution_attempts_gh624_old;
    CREATE UNIQUE INDEX IF NOT EXISTS execution_attempts_active_assignment
      ON execution_attempts(project_id, assignment_digest)
      WHERE origin = 'assignment' AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown');
@@ -1133,7 +1212,13 @@ export const MIGRATIONS: string[] = [
    CREATE TRIGGER execution_attempts_lane_capacity_observation_immutable
      BEFORE UPDATE OF lane_capacity_observation_id ON execution_attempts
      WHEN OLD.lane_capacity_observation_id IS NOT NULL AND NEW.lane_capacity_observation_id IS NOT OLD.lane_capacity_observation_id
-     BEGIN SELECT RAISE(ABORT, 'lane capacity observation identifier is immutable'); END;`,
+     BEGIN SELECT RAISE(ABORT, 'lane capacity observation identifier is immutable'); END;
+   CREATE TRIGGER lane_capacity_refresh_evidence_immutable_update
+     BEFORE UPDATE ON lane_capacity_refresh_evidence
+     BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;
+   CREATE TRIGGER lane_capacity_refresh_evidence_immutable_delete
+     BEFORE DELETE ON lane_capacity_refresh_evidence
+     BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;`,
 ];
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));

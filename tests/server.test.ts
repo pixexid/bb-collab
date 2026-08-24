@@ -9744,6 +9744,118 @@ else printf '%s\\n' '[]'; fi
     }
   });
 
+  it("atomically rebuilds attempts with populated production child FKs and rejects the parent-drop mutant", () => {
+    const directory = mkdtempSync(join(tmpdir(), "bb-collab-gh636-"));
+    const path = join(directory, "fixture.db");
+    const db = new Database(path);
+    databaseIsReady(db);
+    const projectId = "proj_gh636_production_shape";
+    const insert = (table: string, row: Record<string, unknown>) => {
+      const names = Object.keys(row);
+      db.prepare(`INSERT INTO ${table} (${names.join(", ")}) VALUES (${names.map((name) => `@${name}`).join(", ")})`).run(row);
+    };
+    const tableDigest = (table: string) => {
+      const columns = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(({ name }) => name)
+        .filter((name) => table !== "execution_attempts" || ![
+          "terminalization_class", "terminal_report_json", "terminal_actual_profile_digest", "interruption_reason",
+          "interruption_event_id", "interruption_event_seq", "interruption_turn_id", "interruption_evidence_digest",
+        ].includes(name));
+      const order = table === "execution_attempts"
+        ? "project_id, execution_attempt_id"
+        : table === "evidence_artifacts"
+          ? "project_id, evidence_id"
+          : "project_id, lane_capacity_observation_id, execution_attempt_id";
+      return sha256(canonicalJson(db.prepare(`SELECT ${columns.join(", ")} FROM ${table} ORDER BY ${order}`).all()));
+    };
+    const childTables = ["execution_attempts", "evidence_artifacts", "lane_capacity_refresh_evidence"];
+    try {
+      db.transaction(() => {
+        for (const statement of MIGRATIONS.slice(0, -1)) db.exec(statement);
+      })();
+      db.pragma("defer_foreign_keys = ON");
+      db.transaction(() => {
+        insert("project_config_revisions", { project_id: projectId, config_revision: 1, canonical_config_json: "{}", config_digest: sha256("{}"), created_at_ms: 1 });
+        insert("repository_targets", { project_id: projectId, repo_target_id: "target", config_revision: 1, source_id: "source", host_id: "host", path: "/fixture", remote_url: null, default_branch: "main", target_digest: "target" });
+        insert("work_items", { project_id: projectId, work_item_id: "work-item", config_revision: 1, repo_target_id: "target", title: "fixture", body: "production-shaped", lifecycle_state: "in_progress", resource_revision: 1, created_at_ms: 1, updated_at_ms: 2 });
+        insert("qualification_observations", {
+          project_id: projectId, qualification_id: "qualification", role_requirement_id: "worker-v1", config_revision: 1, repo_target_id: "target",
+          requested_profile_digest: "profile", requested_provider_id: "provider", requested_model: "model", requested_reasoning_level: "medium",
+          requested_permission_mode: "full", requested_service_tier: "default", requested_visibility: "visible", thread_id: "thread",
+          environment_id: "environment", source_id: "source", host_id: "host", provider_thread_id: "provider-thread", request_event_id: "request",
+          request_event_seq: 1, completion_event_id: "completion", completion_event_seq: 2, bb_version: "bb", plugin_sdk_version: "sdk",
+          role_requirement_digest: "requirement", qualification_context_digest: "context", fixture_context_digest: "fixture", outcome: "qualified",
+          observed_at_ms: 3, expires_at_ms: null, evidence_digest: "evidence", observation_digest: "observation", reason_code: "fixture",
+        });
+        insert("role_generations", {
+          project_id: projectId, role_id: "worker", generation: 1, role_requirement_id: "worker-v1", config_revision: 1, repo_target_id: "target",
+          status: "active", predecessor_generation: null, holder_execution_attempt_id: "holder-attempt", holder_context_digest: "context",
+          holder_requested_profile_digest: "profile", qualification_id: "qualification", eligibility_derivation_digest: "eligibility", created_at_ms: 4,
+          activated_at_ms: 5, retired_at_ms: null, standby_profile_json: null,
+        });
+        insert("assignments", {
+          project_id: projectId, assignment_id: "assignment", work_item_id: "work-item", assignment_kind: "write", lane_id: "lane",
+          role_requirement_id: "worker-v1", role_id: "worker", role_generation: 1, config_revision: 1, governance_epoch: 1, work_item_revision: 1,
+          repo_target_id: "target", branch_name: "main", base_sha: "a".repeat(40), candidate_semantics: "base", candidate_sha: null,
+          bb_server_id: "server", environment_id: "environment", source_id: "source", host_id: "host", environment_path: "/fixture",
+          environment_mode: "managed-worktree", frozen_brief_version: 1, frozen_brief_digest: "brief", requested_provider_id: "provider",
+          requested_model: "model", requested_reasoning_level: "medium", requested_permission_mode: "full", requested_service_tier: "default",
+          requested_visibility: "visible", requested_profile_digest: "profile", dispatch_kind: "spawn", attach_thread_id: null, parent_assignment_id: null,
+          depth: 0, deadline_at_ms: 10, assignment_digest: "assignment-digest", idempotency_key: "assignment-idempotency", creation_event_sequence: 1, created_at_ms: 1,
+        });
+        insert("execution_attempts", {
+          project_id: projectId, execution_attempt_id: "holder-attempt", origin: "role_holder", attempt_ordinal: 1, config_revision: 1, governance_epoch: 1,
+          repo_target_id: "target", role_id: "worker", role_generation: 1, state: "done", bb_server_id: "server", environment_id: "environment",
+          source_id: "source", host_id: "host", environment_path: "/fixture", environment_digest: "environment-digest", created_at_ms: 1, attempt_digest: "holder-digest",
+        });
+        insert("execution_attempts", {
+          project_id: projectId, execution_attempt_id: "assignment-attempt", assignment_id: "assignment", origin: "assignment", assignment_digest: "assignment-digest",
+          lane_id: "lane", assignment_kind: "write", attempt_ordinal: 1, dispatch_kind: "spawn", config_revision: 1, governance_epoch: 1,
+          work_item_id: "work-item", repo_target_id: "target", role_id: "worker", role_generation: 1, state: "running", bb_server_id: "server",
+          environment_id: "environment", source_id: "source", host_id: "host", environment_path: "/fixture", environment_digest: "environment-digest",
+          created_at_ms: 2, attempt_digest: "assignment-digest-2",
+        });
+        insert("execution_attempts", {
+          project_id: projectId, execution_attempt_id: "work-item-attempt", origin: "work_item", attempt_ordinal: 1, config_revision: 1,
+          governance_epoch: null, work_item_id: "work-item", lane_id: "lane-work-item", assignment_kind: "review", state: "interrupted",
+          created_at_ms: 3, attempt_digest: "work-item-digest",
+        });
+        insert("evidence_artifacts", {
+          project_id: projectId, evidence_id: "attempt-evidence", evidence_kind: "delegated_action_receipt", source_kind: "delegated_action",
+          source_ref: "attempt", execution_attempt_id: "assignment-attempt", content_digest: "content", redacted_json: "{}", redacted_digest: "redacted",
+          durable_ref_json: "{}", artifact_identity_digest: "identity", created_at_ms: 4,
+        });
+        insert("lane_capacity_refresh_evidence", {
+          project_id: projectId, lane_capacity_observation_id: "observation", execution_attempt_id: "work-item-attempt", observed_at_ms: 5,
+        });
+      })();
+      const before = { counts: Object.fromEntries(childTables.map((table) => [table, (db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count])), digests: Object.fromEntries(childTables.map((table) => [table, tableDigest(table)])) };
+
+      expect(() => db.transaction(() => db.exec("PRAGMA defer_foreign_keys = ON; DROP TABLE execution_attempts"))()).toThrow(/FOREIGN KEY constraint failed/iu);
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'execution_attempts'").get()).toEqual({ name: "execution_attempts" });
+      expect(Object.fromEntries(childTables.map((table) => [table, (db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count]))).toEqual(before.counts);
+
+      db.transaction(() => db.exec(MIGRATIONS.at(-1)!))();
+      expect(Object.fromEntries(childTables.map((table) => [table, (db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count]))).toEqual(before.counts);
+      expect(Object.fromEntries(childTables.map((table) => [table, tableDigest(table)]))).toEqual(before.digests);
+      expect(db.pragma("integrity_check", { simple: true })).toBe("ok");
+      expect(db.pragma("foreign_key_check")).toEqual([]);
+      expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
+      expect(db.prepare("SELECT state FROM execution_attempts WHERE execution_attempt_id = 'work-item-attempt'").get()).toEqual({ state: "interrupted" });
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'lane_capacity_refresh_evidence_immutable_%' ORDER BY name").all()).toEqual([
+        { name: "lane_capacity_refresh_evidence_immutable_delete" }, { name: "lane_capacity_refresh_evidence_immutable_update" },
+      ]);
+      db.close();
+      const reopened = new Database(path);
+      databaseIsReady(reopened);
+      expect(reopened.pragma("integrity_check", { simple: true })).toBe("ok");
+      expect(reopened.pragma("foreign_key_check")).toEqual([]);
+      reopened.close();
+    } finally {
+      if (db.open) db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("preserves every varying non-null prior execution_attempts value across the appended rebuild", () => {
     const db = new Database(":memory:");
     databaseIsReady(db);
