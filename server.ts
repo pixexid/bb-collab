@@ -1297,8 +1297,11 @@ async function dispatchLane(
   const parsed = dispatchLaneInputSchema.safeParse(input);
   if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "dispatch", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
   const { request, spawn } = parsed.data;
-  if (!request.workAttempt || (request.lifecycleState !== "in_progress" && request.lifecycleState !== undefined)) {
-    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "lane dispatch requires a writing work attempt and an in-progress transition" };
+  const reviewDispatch = request.workAttempt?.assignmentKind === "review";
+  if (!request.workAttempt || (reviewDispatch
+    ? request.lifecycleState !== undefined
+    : request.lifecycleState !== "in_progress" && request.lifecycleState !== undefined)) {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: reviewDispatch ? "review dispatch requires a review attempt and review_pending WorkItem" : "lane dispatch requires a writing work attempt and an in-progress transition" };
   }
   if (spawn.projectId !== request.projectId) {
     return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "spawn projectId must match request projectId" };
@@ -1341,14 +1344,16 @@ async function dispatchLane(
       expectedGovernanceEpoch: request.expectedGovernanceEpoch,
       expectedFenceToken: request.expectedFenceToken,
       requestedProfile,
+      assignmentKind: request.workAttempt.assignmentKind,
     });
   } catch (error) {
     if (isRefusal(error)) return { outcome: error.data.code, subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: error.data.message };
     return { outcome: "INTERNAL_ERROR", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "dispatch config proof failed" };
   }
-  const environmentRefusal = await dispatchEnvironmentPreflight(bb, request.projectId, spawnShape.data.environment, configProof);
+  const environmentRefusal = await dispatchEnvironmentPreflight(bb, request.projectId, spawnShape.data.environment, configProof, request.workAttempt);
   if (environmentRefusal) return environmentRefusal;
-  const briefTarget = githubIssueBriefTarget(db, request.projectId, request.workItemId ?? "");
+  const localReview = request.workAttempt.assignmentKind === "review" && request.workAttempt.candidateKind === "local";
+  const briefTarget = localReview ? null : githubIssueBriefTarget(db, request.projectId, request.workItemId ?? "");
   if (briefTarget === "invalid") {
     return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub issue projection identity is malformed or ambiguous" };
   }
@@ -1461,9 +1466,9 @@ function preparedDispatchIntent(db: SqliteDatabase | null, request: ApplyRequest
     `SELECT reason_code
      FROM execution_attempts
      WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
-       AND assignment_kind = 'write' AND state = 'prepared' AND thread_id IS NULL
+       AND assignment_kind = ? AND state = 'prepared' AND thread_id IS NULL
      ORDER BY attempt_ordinal DESC`,
-  ).all(request.projectId, request.workItemId) as Array<{ reason_code: string | null }>;
+  ).all(request.projectId, request.workItemId, request.workAttempt?.assignmentKind ?? "write") as Array<{ reason_code: string | null }>;
   const matches = rows.filter((row) => parseWorkItemDispatchIntent(row.reason_code)?.idempotencyKey === request.idempotencyKey);
   if (matches.length > 1) return "ambiguous";
   const match = matches[0];
@@ -1535,7 +1540,47 @@ async function dispatchEnvironmentPreflight(
   projectId: string,
   environment: z.infer<typeof dispatchEnvironmentSchema>,
   proof: WorkItemDispatchConfigProof,
+  workAttempt: NonNullable<ApplyRequest["workAttempt"]>,
 ): Promise<FoundationResult | null> {
+  if (workAttempt.assignmentKind === "review" && workAttempt.candidateKind === "local") {
+    const candidateEnvironment = workAttempt.reviewCandidateEnvironment!;
+    if (environment.type !== "reuse" || environment.environmentId !== candidateEnvironment.environmentId) {
+      return { outcome: "REPO_TARGET_FOREIGN", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "local review must reuse the exact frozen candidate environment" };
+    }
+    try {
+      const [facts, project] = await Promise.all([
+        bb.sdk.environments.get({ environmentId: candidateEnvironment.environmentId }),
+        bb.sdk.projects.get({ projectId }),
+      ]);
+      if (
+        facts.id !== candidateEnvironment.environmentId || facts.projectId !== projectId || facts.hostId !== candidateEnvironment.hostId ||
+        candidateEnvironment.bbServerId !== bb.server.loopbackBaseUrl ||
+        facts.path !== candidateEnvironment.path || facts.managed !== true || facts.isWorktree !== true || facts.workspaceProvisionType !== "managed-worktree" ||
+        project.sources.filter((source) => source.id === candidateEnvironment.sourceId && source.projectId === projectId && source.hostId === candidateEnvironment.hostId && source.path === candidateEnvironment.path).length !== 1
+      ) return { outcome: "REPO_TARGET_FOREIGN", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "local candidate environment identity is foreign or incomplete" };
+      const base = workAttempt.reviewBaseSha!;
+      const [baseCommit, status] = await Promise.all([
+        bb.sdk.environments.diff({ environmentId: candidateEnvironment.environmentId, target: "commit", sha: base }),
+        bb.sdk.environments.status({ environmentId: candidateEnvironment.environmentId, mergeBaseBranch: base }),
+      ]);
+      if (baseCommit.outcome !== "available") return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "local review base commit is unavailable in the candidate repository" };
+      if (status.outcome !== "available") return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "local candidate environment is not reachable" };
+      const workspace = status.workspace;
+      const checkout = workspace?.checkout;
+      const workingTree = workspace?.workingTree as { state?: string; hasUncommittedChanges?: boolean; files?: unknown[]; insertions?: number; deletions?: number } | undefined;
+      const clean = workingTree?.state === "clean" && workingTree.hasUncommittedChanges === false
+        || Array.isArray(workingTree?.files) && workingTree.files.length === 0 && workingTree.insertions === 0 && workingTree.deletions === 0;
+      const mergeBase = workspace.mergeBase;
+      if (
+        !checkout || checkout.kind !== "branch" || checkout.headSha !== workAttempt.reviewCandidateSha ||
+        checkout.branchName !== workAttempt.reviewCandidateCheckout?.branchName || !clean ||
+        !mergeBase || mergeBase.baseRef !== base || mergeBase.mergeBaseBranch !== base || mergeBase.behindCount !== 0 || mergeBase.hasCommittedUnmergedChanges !== false || mergeBase.lineStatsComplete !== true
+      ) return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "local candidate is not the exact reachable clean frozen checkout based on the frozen base" };
+    } catch (error) {
+      return { outcome: "EXTERNAL_UNAVAILABLE", subject: projectId, expected: 1, attempted: 1, verified: 0, message: `local candidate observation is unavailable: ${String(error)}` };
+    }
+    return null;
+  }
   if (environment.type !== "host" || environment.workspace.type !== "managed-worktree" || !environment.hostId) {
     return { outcome: "REPO_TARGET_FOREIGN", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "dispatch requires one exact host managed-worktree environment" };
   }

@@ -10,8 +10,8 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
-export const RUNTIME_CONTRACT_VERSION = 28;
-export const SCHEMA_VERSION = 33;
+export const RUNTIME_CONTRACT_VERSION = 30;
+export const SCHEMA_VERSION = 34;
 // v27 records correlated terminal evidence and first-class interrupted attempts.
 const PREVIOUS_RUNTIME_CONTRACT_VERSION = 27;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
@@ -1442,11 +1442,24 @@ const GH637_DOMAIN_MIGRATION = `
   DROP TABLE gh637_role_generations;
 `;
 MIGRATIONS.push(GH637_DOMAIN_MIGRATION);
-
 export const GH637_DOMAIN_MIGRATION_ID = MIGRATIONS.length - 1;
-
 export const GH636_PREVIOUS_MIGRATION_ID = MIGRATIONS.length - 3;
 export const GH636_REPAIR_MIGRATION_ID = MIGRATIONS.length - 2;
+
+// GH644: review candidates are explicit and immutable. PR reviews retain their
+// exact PR identity; local reviews carry the frozen checkout observation.
+const GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION = `
+  ALTER TABLE execution_attempts ADD COLUMN review_candidate_kind TEXT
+    CHECK (review_candidate_kind IS NULL OR review_candidate_kind IN ('pull-request', 'local'));
+  ALTER TABLE execution_attempts ADD COLUMN review_candidate_json TEXT
+    CHECK (review_candidate_json IS NULL OR json_valid(review_candidate_json));
+  UPDATE execution_attempts
+  SET review_candidate_kind = 'pull-request',
+      review_candidate_json = json_object('candidateKind', 'pull-request', 'headSha', review_pr_head_sha, 'prNumber', review_pr_number)
+  WHERE assignment_kind = 'review' AND review_pr_number IS NOT NULL AND review_pr_head_sha IS NOT NULL;
+`;
+MIGRATIONS.push(GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION);
+export const GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID = MIGRATIONS.length - 1;
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
 export const GH300_BACKFILL_MIGRATION_ID = MIGRATIONS.findIndex((statement) => statement.includes("CREATE TABLE execution_attempts_gh300"));
@@ -1715,6 +1728,13 @@ export const contractDigest = sha256(canonicalJson({
     maximum: MAX_WRITING_LANE_CEILING,
     lowerRequiresExplicitDecision: true,
     readOnlyAssignmentKinds: ["review", "probe"],
+  },
+  reviewCandidatePolicy: {
+    kinds: ["pull-request", "local"],
+    pullRequest: "exact positive PR number plus lowercase 40-hex head SHA",
+    local: ["base SHA exists in the candidate repository", "candidate SHA exists as the exact checkout HEAD", "managed-worktree environment", "branch checkout", "clean reachable observation", "candidate server identity", "base-ancestor merge proof", "target source identity"],
+    exclusivity: "PR identity and local identity are mutually exclusive",
+    probe: "never a review",
   },
   directorSeatPolicy: {
     roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
@@ -2113,7 +2133,7 @@ export function reconcilePreparedWorkItemDispatches(
 ): WorkItemDispatchWedge[] {
   const prepared = db.prepare(
     `SELECT execution_attempt_id, work_item_id, reason_code FROM execution_attempts
-     WHERE project_id = ? AND origin = 'work_item' AND assignment_kind = 'write'
+     WHERE project_id = ? AND origin = 'work_item' AND assignment_kind IN ('write', 'review')
        AND state = 'prepared' AND thread_id IS NULL`,
   ).all(projectId) as Array<{ execution_attempt_id: string; work_item_id: string; reason_code: string | null }>;
   const wedges: WorkItemDispatchWedge[] = [];
@@ -2220,6 +2240,30 @@ const workItemExternalEventSchema = z.object({
   issueNumber: z.number().int().positive().refine(Number.isSafeInteger),
 }).strict();
 const gitShaSchema = z.string().regex(/^[0-9a-f]{40,64}$/u);
+const pullRequestHeadShaSchema = z.string().regex(/^[0-9a-f]{40}$/u);
+const reviewCandidateKindSchema = z.enum(["pull-request", "local"]);
+const reviewCandidateEnvironmentSchema = z
+  .object({
+    bbServerId: id,
+    environmentId: id,
+    sourceId: id,
+    hostId: id,
+    path: id,
+    mode: z.literal("managed-worktree"),
+  })
+  .strict();
+const reviewCandidateCheckoutSchema = z
+  .object({
+    branchName: id,
+    headSha: gitShaSchema,
+  })
+  .strict();
+const reviewCandidateObservationSchema = z
+  .object({
+    clean: z.literal(true),
+    reachable: z.literal(true),
+  })
+  .strict();
 const executionProfileSchema = z
   .object({
     providerId: id,
@@ -2236,16 +2280,53 @@ const workAttemptSchema = z
     threadId: id.optional(),
     assignmentKind: z.enum(["write", "review", "probe"]),
     requestedProfile: executionProfileSchema.optional(),
+    candidateKind: reviewCandidateKindSchema.optional(),
     reviewPrNumber: z.number().int().positive().refine(Number.isSafeInteger, "reviewPrNumber must be a safe integer").optional(),
-    reviewPrHeadSha: gitShaSchema.optional(),
+    reviewPrHeadSha: pullRequestHeadShaSchema.optional(),
+    reviewBaseSha: gitShaSchema.optional(),
+    reviewCandidateSha: gitShaSchema.optional(),
+    reviewCandidateEnvironment: reviewCandidateEnvironmentSchema.optional(),
+    reviewCandidateCheckout: reviewCandidateCheckoutSchema.optional(),
+    reviewCandidateObservation: reviewCandidateObservationSchema.optional(),
   })
   .strict()
   .superRefine((attempt, ctx) => {
-    const linked = attempt.reviewPrNumber !== undefined || attempt.reviewPrHeadSha !== undefined;
-    if (attempt.assignmentKind === "review" && (attempt.reviewPrNumber === undefined || attempt.reviewPrHeadSha === undefined)) {
-      ctx.addIssue({ code: "custom", message: "review attempts require an exact pull request number and head SHA" });
-    } else if (attempt.assignmentKind !== "review" && linked) {
-      ctx.addIssue({ code: "custom", message: "pull request linkage is valid only for review attempts" });
+    const reviewFields = [
+      attempt.candidateKind,
+      attempt.reviewPrNumber,
+      attempt.reviewPrHeadSha,
+      attempt.reviewBaseSha,
+      attempt.reviewCandidateSha,
+      attempt.reviewCandidateEnvironment,
+      attempt.reviewCandidateCheckout,
+      attempt.reviewCandidateObservation,
+    ];
+    const linked = reviewFields.some((value) => value !== undefined);
+    if (attempt.assignmentKind !== "review") {
+      if (linked) ctx.addIssue({ code: "custom", message: "review candidate linkage is valid only for review attempts" });
+      return;
+    }
+    if (attempt.candidateKind === undefined) {
+      ctx.addIssue({ code: "custom", path: ["candidateKind"], message: "review attempts require an explicit candidate kind" });
+      return;
+    }
+    if (attempt.candidateKind === "pull-request") {
+      if (attempt.reviewPrNumber === undefined || attempt.reviewPrHeadSha === undefined) {
+        ctx.addIssue({ code: "custom", message: "pull-request reviews require an exact PR number and head SHA" });
+      }
+      if (attempt.reviewBaseSha !== undefined || attempt.reviewCandidateSha !== undefined || attempt.reviewCandidateEnvironment !== undefined || attempt.reviewCandidateCheckout !== undefined || attempt.reviewCandidateObservation !== undefined) {
+        ctx.addIssue({ code: "custom", message: "pull-request reviews cannot carry local candidate identity" });
+      }
+    } else {
+      if (attempt.reviewPrNumber !== undefined || attempt.reviewPrHeadSha !== undefined) {
+        ctx.addIssue({ code: "custom", message: "local reviews cannot carry pull-request identity" });
+      }
+      if (attempt.reviewBaseSha === undefined || attempt.reviewCandidateSha === undefined || attempt.reviewCandidateEnvironment === undefined || attempt.reviewCandidateCheckout === undefined || attempt.reviewCandidateObservation === undefined) {
+        ctx.addIssue({ code: "custom", message: "local reviews require exact base, candidate, environment, checkout, and clean/reachable observation" });
+      }
+      if (attempt.reviewCandidateSha !== undefined && attempt.reviewCandidateCheckout !== undefined && attempt.reviewCandidateSha !== attempt.reviewCandidateCheckout.headSha) {
+        ctx.addIssue({ code: "custom", path: ["reviewCandidateCheckout", "headSha"], message: "local checkout head must equal the candidate SHA" });
+      }
     }
   });
 
@@ -3666,6 +3747,7 @@ export interface WorkItemDispatchConfigRequest {
   expectedGovernanceEpoch: number | null | undefined;
   expectedFenceToken: string | null | undefined;
   requestedProfile: ExecutionProfile;
+  assignmentKind?: "write" | "review" | "probe";
 }
 
 export interface WorkItemDispatchConfigProof {
@@ -3679,6 +3761,7 @@ export interface WorkItemDispatchConfigProof {
   defaultBranch: string;
   domainId: string;
   taskClass: string;
+  assignmentKind: "write" | "review";
   continued: boolean;
   proofDigest: string;
 }
@@ -3704,9 +3787,10 @@ function dispatchTargetIdentity(row: Record<string, unknown>): Record<string, un
   };
 }
 
-function dispatchRoleRequirement(db: SqliteDatabase, projectId: string, configRevision: number, repoTargetId: string, domainId: string, taskClass: string): RoleRequirement & { domainId: string } {
+function dispatchRoleRequirement(db: SqliteDatabase, projectId: string, configRevision: number, repoTargetId: string, domainId: string, taskClass: string, assignmentKind: "write" | "review" | "probe" = "write"): RoleRequirement & { domainId: string } {
   const domain = domainForTaskClass(configuredDomains(db, projectId, configRevision), taskClass, domainId);
-  const requirements = domain.roleRequirements.filter((requirement) => requirement.roleId === "worker" && requirement.repoTargetId === repoTargetId);
+  const roleId = assignmentKind === "review" ? "independent-reviewer" : "worker";
+  const requirements = domain.roleRequirements.filter((requirement) => requirement.roleId === roleId && requirement.repoTargetId === repoTargetId);
   if (requirements.length !== 1) throw refusal("PROJECT_CONFIG_STALE", "the exact worker role requirement is missing or ambiguous across the config revision");
   return { ...requirements[0]!, domainId };
 }
@@ -3753,8 +3837,10 @@ export function proveWorkItemDispatchConfig(
   ).get(request.projectId, request.repoTargetId, workItem.config_revision));
   if (!currentTarget || !historicalTarget) throw refusal("PROJECT_CONFIG_STALE", "the exact WorkItem target is missing from a config revision");
 
-  const historicalRole = dispatchRoleRequirement(db, request.projectId, workItem.config_revision, request.repoTargetId, workItem.domain_id, workItem.task_class);
-  const currentRole = dispatchRoleRequirement(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, workItem.task_class);
+  const assignmentKind = request.assignmentKind ?? "write";
+  if (assignmentKind === "probe") throw refusal("WORK_ITEM_STATE_INVALID", "probe cannot use WorkItem lane dispatch");
+  const historicalRole = dispatchRoleRequirement(db, request.projectId, workItem.config_revision, request.repoTargetId, workItem.domain_id, workItem.task_class, assignmentKind);
+  const currentRole = dispatchRoleRequirement(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, workItem.task_class, assignmentKind);
   const requestedProfile = dispatchProfileIdentity(request.requestedProfile);
   if (!dispatchProfileMatches(request.requestedProfile, historicalRole.executedProfile) || !dispatchProfileMatches(request.requestedProfile, currentRole.executedProfile)) {
     throw refusal("PROJECT_CONFIG_STALE", "dispatch profile does not equal the exact historical and current worker requirement");
@@ -3767,6 +3853,7 @@ export function proveWorkItemDispatchConfig(
     writingLaneCeiling: writingLaneCeilingFromJson(historicalConfigJson),
     domainId: workItem.domain_id,
     taskClass: workItem.task_class,
+    assignmentKind,
     roleRequirement: historicalRole,
     target: dispatchTargetIdentity(historicalTarget),
   };
@@ -3776,6 +3863,7 @@ export function proveWorkItemDispatchConfig(
     writingLaneCeiling: writingLaneCeilingFromJson(currentConfigJson),
     domainId: workItem.domain_id,
     taskClass: workItem.task_class,
+    assignmentKind,
     roleRequirement: currentRole,
     target: dispatchTargetIdentity(currentTarget),
   };
@@ -3807,6 +3895,7 @@ export function proveWorkItemDispatchConfig(
     defaultBranch: String(currentTarget.default_branch),
     domainId: workItem.domain_id,
     taskClass: workItem.task_class,
+    assignmentKind,
     continued: workItem.config_revision !== currentConfigRevision,
     proofDigest: sha256(canonicalJson(proof)),
   };
@@ -6879,6 +6968,40 @@ interface WorkItemRow {
 
 type WorkAttempt = z.infer<typeof workAttemptSchema>;
 type WorkAttemptState = (typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES)[number] | "done" | "blocked" | "failed";
+type ReviewCandidate = {
+  candidateKind: "pull-request" | "local";
+  prNumber?: number;
+  headSha?: string;
+  baseSha?: string;
+  candidateSha?: string;
+  environment?: z.infer<typeof reviewCandidateEnvironmentSchema>;
+  checkout?: z.infer<typeof reviewCandidateCheckoutSchema>;
+  observation?: z.infer<typeof reviewCandidateObservationSchema>;
+};
+
+function reviewCandidateFromAttempt(attempt: WorkAttempt): ReviewCandidate | null {
+  if (attempt.assignmentKind !== "review" || !attempt.candidateKind) return null;
+  return attempt.candidateKind === "pull-request"
+    ? { candidateKind: "pull-request", prNumber: attempt.reviewPrNumber, headSha: attempt.reviewPrHeadSha }
+    : {
+      candidateKind: "local",
+      baseSha: attempt.reviewBaseSha,
+      candidateSha: attempt.reviewCandidateSha,
+      environment: attempt.reviewCandidateEnvironment,
+      checkout: attempt.reviewCandidateCheckout,
+      observation: attempt.reviewCandidateObservation,
+    };
+}
+
+function reviewCandidateJson(attempt: WorkAttempt): string | null {
+  const candidate = reviewCandidateFromAttempt(attempt);
+  return candidate ? canonicalJson(candidate) : null;
+}
+
+function reviewCandidateMatches(row: { review_candidate_kind?: string | null; review_candidate_json?: string | null }, attempt: WorkAttempt): boolean {
+  const candidate = reviewCandidateFromAttempt(attempt);
+  return candidate !== null && row.review_candidate_kind === candidate.candidateKind && row.review_candidate_json === canonicalJson(candidate);
+}
 const ACTIVE_WORK_ATTEMPT_STATES = WORK_ITEM_CAPACITY_ATTEMPT_STATES;
 const WORK_ITEM_THREAD_TOKEN = /thr_[A-Za-z0-9]+/gu;
 const WORK_ITEM_LANE_SENTENCE = /^(?:Lane|Writing lane) (thr_[A-Za-z0-9]+)(?:[,.!?])?(?:[ \t]+|\r?\n|$)/u;
@@ -6909,6 +7032,8 @@ function workAttemptId(input: {
   threadId: string | null;
   reviewPrNumber: number | null;
   reviewPrHeadSha: string | null;
+  reviewCandidateKind: string | null;
+  reviewCandidateJson: string | null;
 }): string {
   return sha256(canonicalJson({ origin: "work_item", ...input, domainId: input.domainId ?? "default" }));
 }
@@ -6935,6 +7060,8 @@ function insertWorkItemAttempt(
     continuationOfAttemptId: string | null;
     reviewPrNumber: number | null;
     reviewPrHeadSha: string | null;
+    reviewCandidateKind: string | null;
+    reviewCandidateJson: string | null;
   },
 ): string {
   const executionAttemptId = workAttemptId(input);
@@ -6950,6 +7077,8 @@ function insertWorkItemAttempt(
     requestedProfileDigest: input.requestedProfile ? requestedProfileDigest(input.requestedProfile) : null,
     reviewPrNumber: input.reviewPrNumber,
     reviewPrHeadSha: input.reviewPrHeadSha,
+    reviewCandidateKind: input.reviewCandidateKind,
+    reviewCandidateJson: input.reviewCandidateJson,
     attemptOrdinal: input.attemptOrdinal,
     state: input.state,
     reasonCode: input.reasonCode,
@@ -6961,13 +7090,13 @@ function insertWorkItemAttempt(
        project_id, execution_attempt_id, origin, lane_id, assignment_kind, attempt_ordinal,
        config_revision, work_item_id, repo_target_id, state, thread_id, reason_code,
        requested_provider_id, requested_model, requested_reasoning_level, requested_profile_digest,
-       review_pr_number, review_pr_head_sha, progress_json, lease_owner_thread_id, continuation_of_attempt_id, created_at_ms,
+       review_pr_number, review_pr_head_sha, review_candidate_kind, review_candidate_json, progress_json, lease_owner_thread_id, continuation_of_attempt_id, created_at_ms,
        observed_at_ms, completed_at_ms, attempt_digest
      ) VALUES (
        @projectId, @executionAttemptId, 'work_item', @laneId, @assignmentKind, @attemptOrdinal,
        @configRevision, @workItemId, @repoTargetId, @state, @threadId, @reasonCode,
        @requestedProviderId, @requestedModel, @requestedReasoningLevel, @requestedProfileDigest,
-       @reviewPrNumber, @reviewPrHeadSha,
+       @reviewPrNumber, @reviewPrHeadSha, @reviewCandidateKind, @reviewCandidateJson,
        '{}', @leaseOwnerThreadId, @continuationOfAttemptId, @createdAtMs,
        @observedAtMs, @completedAtMs, @attemptDigest
      )`,
@@ -6989,6 +7118,8 @@ function insertWorkItemAttempt(
     requestedProfileDigest: input.requestedProfile ? requestedProfileDigest(input.requestedProfile) : null,
     reviewPrNumber: input.reviewPrNumber,
     reviewPrHeadSha: input.reviewPrHeadSha,
+    reviewCandidateKind: input.reviewCandidateKind,
+    reviewCandidateJson: input.reviewCandidateJson,
     leaseOwnerThreadId: input.leaseOwnerThreadId,
     continuationOfAttemptId: input.continuationOfAttemptId,
     createdAtMs: input.createdAtMs,
@@ -7073,6 +7204,8 @@ export function backfillWorkItemAttempts(db: SqliteDatabase, migrationAppliedAtM
         continuationOfAttemptId: null,
         reviewPrNumber: null,
         reviewPrHeadSha: null,
+        reviewCandidateKind: null,
+        reviewCandidateJson: null,
       });
       db.prepare(
         "UPDATE work_items SET body = ? WHERE project_id = ? AND work_item_id = ?",
@@ -7107,10 +7240,10 @@ function activeWorkItemAttempt(
   projectId: string,
   workItemId: string,
   assignmentKind?: WorkAttempt["assignmentKind"],
-): { execution_attempt_id: string; review_pr_number: number | null; review_pr_head_sha: string | null } | undefined {
+): { execution_attempt_id: string; review_pr_number: number | null; review_pr_head_sha: string | null; review_candidate_kind: string | null; review_candidate_json: string | null } | undefined {
   const assignmentFilter = assignmentKind === undefined ? "" : " AND assignment_kind = ?";
-  return asRow<{ execution_attempt_id: string; review_pr_number: number | null; review_pr_head_sha: string | null }>(db.prepare(
-    `SELECT execution_attempt_id, review_pr_number, review_pr_head_sha FROM execution_attempts
+  return asRow<{ execution_attempt_id: string; review_pr_number: number | null; review_pr_head_sha: string | null; review_candidate_kind: string | null; review_candidate_json: string | null }>(db.prepare(
+    `SELECT execution_attempt_id, review_pr_number, review_pr_head_sha, review_candidate_kind, review_candidate_json FROM execution_attempts
      WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
        AND state IN (${ACTIVE_WORK_ATTEMPT_STATES.map(() => "?").join(", ")})${assignmentFilter}
      ORDER BY attempt_ordinal DESC LIMIT 1`,
@@ -7919,6 +8052,7 @@ function applyWorkItemTransition(
       expectedGovernanceEpoch: request.expectedGovernanceEpoch,
       expectedFenceToken: request.expectedFenceToken,
       requestedProfile: request.workAttempt!.requestedProfile!,
+      assignmentKind: request.workAttempt!.assignmentKind,
     }, configRevision);
     if (proof.proofDigest !== request.fixtureContextDigest) {
       throw refusal("PROJECT_CONFIG_STALE", "durable dispatch finalization proof does not match the prepared intent");
@@ -7942,6 +8076,7 @@ function applyWorkItemTransition(
       expectedGovernanceEpoch: request.expectedGovernanceEpoch,
       expectedFenceToken: request.expectedFenceToken,
       requestedProfile: request.workAttempt.requestedProfile,
+      assignmentKind: request.workAttempt.assignmentKind,
     });
     if (!proof.continued || proof.proofDigest !== request.fixtureContextDigest) {
       throw refusal("PROJECT_CONFIG_STALE", "config-revision continuation proof is not the exact governed revision boundary");
@@ -8097,19 +8232,17 @@ function applyWorkItemTransition(
     : undefined;
   if (redispatchingReview && (
     !workAttempt || !workAttempt.threadId || !workAttempt.requestedProfile ||
-    workAttempt.reviewPrNumber === undefined || workAttempt.reviewPrHeadSha === undefined ||
-    !priorReview || priorReview.review_pr_number !== workAttempt.reviewPrNumber ||
-    priorReview.review_pr_head_sha !== workAttempt.reviewPrHeadSha
+    !priorReview || !reviewCandidateMatches(priorReview, workAttempt)
   )) {
-    throw refusal("WORK_ITEM_STATE_INVALID", "review re-dispatch requires one active review and the same exact PR head, replacement thread, and profile");
+    throw refusal("WORK_ITEM_STATE_INVALID", "review re-dispatch requires one active review and the same exact immutable candidate and profile");
   }
   if (workAttempt !== undefined && nextState === undefined) {
     const dispatchIntent = db.prepare(
       `SELECT execution_attempt_id FROM execution_attempts
        WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
-         AND assignment_kind = 'write' AND state = 'prepared' AND thread_id IS NULL
+         AND assignment_kind = ? AND state = 'prepared' AND thread_id IS NULL
        ORDER BY attempt_ordinal DESC LIMIT 1`,
-    ).get(request.projectId, workItem.work_item_id) as { execution_attempt_id: string } | undefined;
+    ).get(request.projectId, workItem.work_item_id, workAttempt.assignmentKind) as { execution_attempt_id: string } | undefined;
     if (dispatchIntent && workAttempt.threadId) {
       const observedAtMs = now();
       db.prepare(
@@ -8158,6 +8291,59 @@ function applyWorkItemTransition(
         },
       );
     }
+    if (workAttempt.assignmentKind === "review") {
+      if (workItem.lifecycle_state !== "review_pending") {
+        throw refusal("WORK_ITEM_STATE_INVALID", "review dispatch requires a review_pending WorkItem");
+      }
+      if (activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "review")) {
+        throw refusal("WORK_ITEM_STATE_INVALID", "review dispatch already has one active review attempt");
+      }
+      const prior = latestWorkItemAttempt(db, request.projectId, workItem.work_item_id);
+      const nextRevision = workItem.resource_revision + 1;
+      const updated = db.prepare(
+        `UPDATE work_items SET resource_revision = ?, updated_at_ms = ?
+         WHERE project_id = ? AND work_item_id = ? AND resource_revision = ?`,
+      ).run(nextRevision, now(), request.projectId, workItem.work_item_id, workItem.resource_revision);
+      if (updated.changes !== 1) throw refusal("WORK_ITEM_REVISION_STALE", "work item compare-and-swap failed");
+      const executionAttemptId = insertWorkItemAttempt(db, {
+        projectId: request.projectId,
+        workItemId: workItem.work_item_id,
+        domainId: workItem.domain_id,
+        configRevision: workItem.config_revision,
+        repoTargetId: workItem.repo_target_id,
+        laneId: workAttempt.laneId,
+        threadId: null,
+        leaseOwnerThreadId: null,
+        assignmentKind: "review",
+        requestedProfile: requireWorkAttemptProfile(workAttempt),
+        attemptOrdinal: nextWorkAttemptOrdinal(db, request.projectId, workItem.work_item_id),
+        state: "prepared",
+        reasonCode: `work_item_dispatch_intent:${request.idempotencyKey}${request.reasonCode?.startsWith("dispatch_parent:") ? `:parent=${request.reasonCode.slice("dispatch_parent:".length)}` : ""}`,
+        createdAtMs: now(),
+        observedAtMs: now(),
+        completedAtMs: null,
+        continuationOfAttemptId: prior?.execution_attempt_id ?? null,
+        reviewPrNumber: workAttempt.reviewPrNumber ?? null,
+        reviewPrHeadSha: workAttempt.reviewPrHeadSha ?? null,
+        reviewCandidateKind: workAttempt.candidateKind ?? null,
+        reviewCandidateJson: reviewCandidateJson(workAttempt),
+      });
+      return commitMutation(
+        db,
+        request,
+        digest,
+        actorReceiptId,
+        {
+          aggregateType: "work_item",
+          aggregateId: workItem.work_item_id,
+          aggregateRevision: nextRevision,
+          eventType: "work_item_review_attempt_registered",
+          event: { workItemId: workItem.work_item_id, executionAttemptId, workAttempt },
+        },
+        { expected: 1, attempted: 1, verified: 1 },
+        { currentConfigRevision: configRevision, currentGovernanceEpoch: governor.governance_epoch, currentResourceRevision: nextRevision, evidence: { workItemId: workItem.work_item_id, executionAttemptId, workAttempt } },
+      );
+    }
     if (workItem.lifecycle_state !== "in_progress") {
       throw refusal("WORK_ITEM_STATE_INVALID", "replacement work attempts require an in-progress work item");
     }
@@ -8197,6 +8383,8 @@ function applyWorkItemTransition(
       continuationOfAttemptId: prior?.execution_attempt_id ?? null,
       reviewPrNumber: null,
       reviewPrHeadSha: null,
+      reviewCandidateKind: null,
+      reviewCandidateJson: null,
     });
     return commitMutation(
       db,
@@ -8349,6 +8537,8 @@ function applyWorkItemTransition(
       continuationOfAttemptId: prior?.execution_attempt_id ?? null,
       reviewPrNumber: null,
       reviewPrHeadSha: null,
+      reviewCandidateKind: null,
+      reviewCandidateJson: null,
     });
   } else if (nextState === "review_pending") {
     executionAttemptId = redispatchingReview
@@ -8375,6 +8565,8 @@ function applyWorkItemTransition(
         continuationOfAttemptId: executionAttemptId,
         reviewPrNumber: workAttempt.reviewPrNumber ?? null,
         reviewPrHeadSha: workAttempt.reviewPrHeadSha ?? null,
+        reviewCandidateKind: workAttempt.candidateKind ?? null,
+        reviewCandidateJson: reviewCandidateJson(workAttempt),
       });
     }
   } else {
@@ -10583,6 +10775,9 @@ export function migrateCanonicalStore(
   assertMigratedSchema(db);
   if (!has(GH637_DOMAIN_MIGRATION_ID)) throw new Error("GH637 migration ledger is incomplete");
   assertGh637MigratedSchema(db);
+  if (!has(GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID) || !tableColumns(db, "execution_attempts").includes("review_candidate_kind") || !tableColumns(db, "execution_attempts").includes("review_candidate_json")) {
+    throw new Error("GH644 migration ledger is incomplete");
+  }
 }
 
 export function databaseIsReady(db: SqliteDatabase): void {
