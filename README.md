@@ -254,7 +254,7 @@ The first release is complete only when it can provide:
 4. Project governorship with one compare-and-swap epoch/fence and one
    versioned mutation resolver.
 5. A canonical WorkItem lifecycle and GitHub Issues as the first projection.
-6. Role generations, manual succession and the minimum qualification and
+6. Role generations, first-generation creation, manual succession and the minimum qualification and
    eligibility evidence needed for the director, project-orchestrator, worker
    and independent-reviewer roles; only director generation 1 may use the
    exact receipt-gated unmanaged qualification-and-creation exception.
@@ -314,7 +314,7 @@ conformance, governorship and resolver seams exist.
 | [Sidebar provider logos](docs/sidebar-provider-logos.md) | Provider-branding implementation boundary. |
 | [Canonical WorkItem registration](docs/workitem-registration.md) | Authorized registration procedure. |
 | [Project registration and bootstrap](docs/project-bootstrap.md) | Strict second-tenant bootstrap seam and seat-topology evidence. |
-| [Role succession runbook](docs/succession-runbook.md) | Current project-agnostic succession method. |
+| [Role generation runbook](docs/succession-runbook.md) | Current project-agnostic first-generation creation and succession method. |
 | [Thread archive sweep](docs/thread-archive-sweep.md) | Current fail-closed archive capability. |
 | [Archived documentation](docs/incidents/README.md) | Issue-linked historical records. |
 
