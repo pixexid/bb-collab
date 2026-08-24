@@ -2474,6 +2474,68 @@ describe("bb-collab plugin boundary", () => {
     }
   });
 
+  it("fails closed when any startable issue has zero, multiple, or out-of-domain bindings", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-domain-queue-coverage-"));
+    const gh = join(bin, "gh");
+    const phase = join(bin, "phase");
+    writeFileSync(phase, "zero");
+    writeFileSync(gh, `#!/bin/sh
+mode=$(cat '${phase}')
+if [ "$mode" = zero ]; then printf '%s\\n' '[[{"number":301,"labels":[{"name":"queue:startable"}]},{"number":302,"labels":[{"name":"queue:startable"}]},{"number":303,"labels":[{"name":"queue:startable"}]}]]';
+elif [ "$mode" = multiple ]; then printf '%s\\n' '[[{"number":304,"labels":[{"name":"queue:startable"}]}]]';
+else printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue:startable"}]}]]'; fi
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const host = await loadedHost();
+      const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: domainRoleConfig() });
+      const createReady = (workItemId: string, domainId: string, taskClass: string) => {
+        expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+          idempotencyKey: `${workItemId}-create`, taskClass, domainId,
+          workItem: { workItemId, title: workItemId, body: workItemId, taskClass, domainId },
+        })).outcome).toBe("OK");
+        expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1, {
+          idempotencyKey: `${workItemId}-ready`, workItemId,
+        })).outcome).toBe("OK");
+      };
+      createReady("coverage-editorial", "editorial", "editorial");
+      createReady("coverage-code", "code", "code");
+      bindFixtureGithubIssue(db, 301, "coverage-editorial");
+      bindFixtureGithubIssue(db, 302, "coverage-code");
+
+      const zero = await startableQueueStateAsync(db, PROJECT_ID, ["example/project"]);
+      expect(zero).toMatchObject({ count: 3, domains: {
+        editorial: { count: 1, known: false, reason: "startable-queue-bindings:0" },
+        code: { count: 1, known: false, reason: "startable-queue-bindings:0" },
+      }});
+      expect(Object.values(zero!.domains).some((state) => state.known)).toBe(false);
+
+      createReady("coverage-multiple-a", "code", "code");
+      createReady("coverage-multiple-b", "code", "code");
+      db.exec("DROP INDEX external_work_refs_issue_identity");
+      bindFixtureGithubIssue(db, 304, "coverage-multiple-a");
+      bindFixtureGithubIssue(db, 304, "coverage-multiple-b");
+      writeFileSync(phase, "multiple");
+      const multiple = await startableQueueStateAsync(db, PROJECT_ID, ["example/project"]);
+      expect(Object.values(multiple!.domains).every((state) => !state.known)).toBe(true);
+      expect(Object.values(multiple!.domains).every((state) => state.reason === "startable-queue-bindings:2")).toBe(true);
+
+      createReady("coverage-out-of-domain", "code", "code");
+      db.prepare("UPDATE work_items SET domain_id = 'rogue', task_class = 'rogue' WHERE project_id = ? AND work_item_id = ?").run(PROJECT_ID, "coverage-out-of-domain");
+      bindFixtureGithubIssue(db, 305, "coverage-out-of-domain");
+      writeFileSync(phase, "rogue");
+      const rogue = await startableQueueStateAsync(db, PROJECT_ID, ["example/project"]);
+      expect(Object.values(rogue!.domains).every((state) => !state.known)).toBe(true);
+      expect(Object.values(rogue!.domains).every((state) => state.reason === "startable-queue-domain-unknown:rogue")).toBe(true);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("loads one CLI/RPC seam and refuses production apply before any write", async () => {
     const host = await loadedHost();
     const db = host.bb.storage.database();
@@ -4227,7 +4289,7 @@ fi
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-role-queue-complete-"));
     const gh = join(bin, "gh");
     const inventory = join(bin, "inventory.json");
-    const issues = Array.from({ length: 1001 }, (_, index) => ({ number: index + 1, labels: [{ name: "queue:startable" }] }));
+    const issues = [{ number: 1, labels: [{ name: "queue:startable" }] }, ...Array.from({ length: 1000 }, (_, index) => ({ number: index + 2, labels: [{ name: "queue:blocked" }] }))];
     writeFileSync(inventory, JSON.stringify(Array.from({ length: 11 }, (_, index) => issues.slice(index * 100, (index + 1) * 100))));
     writeFileSync(gh, `#!/bin/sh
 exec /bin/cat '${inventory}'

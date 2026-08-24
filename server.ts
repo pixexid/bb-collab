@@ -295,6 +295,12 @@ export async function startableQueueStateAsync(db: SqliteDatabase | null, projec
   let waitingExternalCount = 0;
   const heads: string[] = [];
   const domainStates: Record<string, StartableQueueDomainState> = {};
+  const markDomainCoverageUnknown = (reason: string) => {
+    for (const state of Object.values(domainStates)) {
+      state.known = false;
+      state.reason = reason;
+    }
+  };
   try {
     const configHead = db?.prepare("SELECT config_revision FROM project_config_heads WHERE project_id = ?").get(projectId) as { config_revision: number } | undefined;
     if (!db || !configHead) return null;
@@ -338,11 +344,13 @@ export async function startableQueueStateAsync(db: SqliteDatabase | null, projec
             AND refs.provider = 'github' AND refs.owner = ? AND refs.repo = ? AND refs.issue_number = ?`,
       ).all(projectId, owner, repo, issue.number) as Array<{ domain_id: string | null }>;
       if (matches.length !== 1) {
+        markDomainCoverageUnknown(`startable-queue-bindings:${matches.length}`);
         continue;
       }
       const domainId = matches[0]!.domain_id ?? "default";
       const state = domainStates[domainId];
       if (!state) {
+        markDomainCoverageUnknown(`startable-queue-domain-unknown:${domainId}`);
         continue;
       }
       if (!state.known) continue;

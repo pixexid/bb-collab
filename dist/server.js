@@ -24495,6 +24495,12 @@ async function startableQueueStateAsync(db, projectId, repositories) {
   let waitingExternalCount = 0;
   const heads = [];
   const domainStates = {};
+  const markDomainCoverageUnknown = (reason) => {
+    for (const state of Object.values(domainStates)) {
+      state.known = false;
+      state.reason = reason;
+    }
+  };
   try {
     const configHead = db?.prepare("SELECT config_revision FROM project_config_heads WHERE project_id = ?").get(projectId);
     if (!db || !configHead) return null;
@@ -24532,11 +24538,13 @@ async function startableQueueStateAsync(db, projectId, repositories) {
             AND refs.provider = 'github' AND refs.owner = ? AND refs.repo = ? AND refs.issue_number = ?`
       ).all(projectId, owner, repo, issue2.number);
       if (matches.length !== 1) {
+        markDomainCoverageUnknown(`startable-queue-bindings:${matches.length}`);
         continue;
       }
       const domainId = matches[0].domain_id ?? "default";
       const state = domainStates[domainId];
       if (!state) {
+        markDomainCoverageUnknown(`startable-queue-domain-unknown:${domainId}`);
         continue;
       }
       if (!state.known) continue;
