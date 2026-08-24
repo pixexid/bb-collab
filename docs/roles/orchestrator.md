@@ -24,7 +24,7 @@ For Tier-A, dispatch read-only and accept only through the [canonical gate](../o
 
 ## Live state
 
-Live state is never this page. The canonical store is the bb-collab plugin database: use the `role_generation_heads` current-role query to resolve the current director, orchestrator, and worker records. The predecessor handoff is `handoff.md` in the predecessor seat’s thread storage: resolve the predecessor thread id from the same current-role query, then read `handoff.md` under that thread’s storage directory (`~/.bb/thread-storage/<threadId>/`). Read that file, not a checked-in copy. Before retiring, a seat writes its own `handoff.md` into its own thread storage so its successor can follow this same path. Current seat IDs are the values returned by that query—query them when needed and never write them into documentation.
+Live state is never this page. Query the plugin database’s `role_generation_heads` joined to `role_generations` for current director, orchestrator, and worker records. Resolve the predecessor handoff from the returned thread’s thread storage; never write current seat IDs into documentation.
 
 ## First actions
 
@@ -34,4 +34,4 @@ Live state is never this page. The canonical store is the bb-collab plugin datab
 
 ## Silence is a defect signal
 
-Follow the canonical [silence/watch rule](../rules.md#silence-is-a-defect-signal), upward and downward.
+Use the canonical [waiting-subscription rule](../rules.md#waiting-is-a-subscription).

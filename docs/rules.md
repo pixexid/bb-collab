@@ -28,7 +28,7 @@ A filtered run that matched nothing exits zero and prints a passing summary: tak
 
 ## Delegation return path
 
-> Every delegation names its return path: `do X, report DONE | BLOCKED | WAITING <what, and what event wakes me> to me`. The return path makes silence attributable; the [silence/watch rule](#silence-is-a-defect-signal) makes it detectable.
+> Every delegation names its return path: `do X, report DONE | BLOCKED | WAITING <what, and what event wakes me> to me`. The return path makes silence attributable; the [silence rule](#silence-is-a-defect-signal) makes it detectable.
 
 A WAITING claim without a live waker is a stall from day one. The declarer names the waking event and confirms it exists before ending the turn — if the next step is yours, or the event already fired, take it. The orchestrator confirms the named waker exists at check time before accepting the wait, because WAITING is self-declared by the party who benefits from not being chased. A WAITING on the same thing past ~24 hours surfaces to the orchestrator as "wait went stale: chase the external or re-plan." Resolve the named waker live — never maintain a list of valid wakers.
 
@@ -38,7 +38,7 @@ A WAITING claim without a live waker is a stall from day one. The declarer names
 
 ## Silence is a defect signal
 
-> A blocking question and its watch are one act: run `bb thread wait <their-thread> --status idle --timeout <bounded>`, always bounded, then check your own inbound for the answer. Idle plus no answer means never sent or delivered: re-ask once, bundled. Still nothing after the second watch: escalate with `director unresponsive` — never loop a third time. One wait, one inbox check, at most one re-ask: no polling, no timers. The same pattern applies downward to every lane blocking on you.
+> A blocking question ends with its named return path and the seat ending its turn. If the named wake is missing, report that missing path as a defect and apply the [waiting-subscription rule](#waiting-is-a-subscription); do not wait, re-ask, or second-watch to await a result. Its bounded director/orchestrator forensic read is the only exception and never applies downward to workers or reviewers.
 
 ## Quiet with startable work is a defect state
 
@@ -57,6 +57,18 @@ Labels are queue truth: an unlabelled issue is not in the queue, so labelling is
 ## Completion is native; the verdict is ours
 
 > bb natively emits `child-completed`, `child-failed`, `child-interrupted`, and `child-outcome-batch`; `threads.childSummary` reads the same ground. Never build completion notification — wire the native signal. bb tells you a child finished; it does not tell you whether the child succeeded. The notification is native; the verdict is ours, and it is what the `DONE | BLOCKED | WAITING` return path carries.
+
+## Waiting is a subscription
+
+> Waiting is a subscription, not a loop. Every seat — director, project-orchestrator, worker, and reviewer — ends its turn when it needs another thread's outcome; the completion or report wakes it through the native push path. `bb thread wait` or status polling is permitted only as one bounded, named, same-turn verification read by a director or orchestrator for one ruling or recovery forensic incident. It is never a loop, never a worker's way to await a result, and never a substitute for a return path. A seat that catches itself needing a poll reports the missing return path as the defect.
+
+IDLE-WITH-REASON is legitimate: a WAITING seat parks, costs nothing, and stays reachable. BUSY-POLLING is the defect: it burns tokens and occupies the thread so queued messages cannot land, degrading the messaging fabric. The exception is per-incident and named; its same-turn report names the ruling or recovery it serves. A repeated wait by any seat is the same P2 process finding as a worker loop.
+
+Enforcement is tiered: workers receive this rule in their brief and Tier-A transcript review finding; orchestrator patterns are visible in source reconciliation and subject to director oversight; director patterns are subject to operator oversight. Any seat may report a polling pattern upward. A Tier-A review brief must state that a wait/poll loop in the transcript is a P2 process finding.
+
+Stopping a thread with a non-empty queue can trigger delivery or start of a queued payload; stop is not queue cancellation. When queued payloads must not run, inventory and clear that exact queue, verify it is empty, then stop. If a stop races and a queued turn starts, stop the unintended turn, clear the remainder, and record the native event order rather than claiming the first stop cancelled delivery. This does not authorize routine stops or weaken natural completion.
+
+Seat brief injection: Waiting is a subscription, not a loop. All seats end turns; one bounded named same-turn director/orchestrator forensic read per incident. IDLE-WITH-REASON is legitimate; BUSY-POLLING is P2 process finding; Tier-A review briefs state it. Stop is not queue cancellation: clear and verify the exact queue before stopping when payload must not run.
 
 ## A message is delivered when it lands, consumed when the reply addresses it
 

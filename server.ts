@@ -2026,6 +2026,14 @@ function roleBriefRole(roleId: string): z.infer<typeof roleBriefRoleSchema> {
   return roleId === "director" ? "director" : roleId === "project-orchestrator" ? "orchestrator" : "worker";
 }
 
+function canonicalSeatBriefInjection(rules: string): string {
+  const marker = "Seat brief injection: ";
+  const start = rules.indexOf(marker);
+  const end = start < 0 ? -1 : rules.indexOf("\n", start + marker.length);
+  if (start < 0 || end < 0) throw new Error("role brief bundle is missing the canonical messaging doctrine");
+  return rules.slice(start, end);
+}
+
 async function composeRoleBrief(
   bb: BbPluginApi,
   db: SqliteDatabase | null,
@@ -2045,6 +2053,8 @@ async function composeRoleBrief(
     bundle.ponytail.trimEnd(),
     "",
     bundle.roles[input.role].trimEnd(),
+    "",
+    canonicalSeatBriefInjection(bundle.rules),
     "",
     "## Read in order",
     `docs/roles/${input.role}.md, docs/operations-model.md, docs/ponytail.md, docs/rules.md, docs/threat-model.md.`,
