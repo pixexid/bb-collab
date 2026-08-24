@@ -149,6 +149,7 @@ export interface CurrentRoleBinding {
   generation: number;
   executionAttemptId: string;
   threadId: string;
+  generationEventType: string | null;
 }
 
 export type CurrentRoleBindingUnknownReason = "canonical-store-unavailable" | "canonical-store-unreadable" | "project-unknown";
@@ -485,13 +486,21 @@ export function readCurrentRoleBindings(db: SqliteDatabase | null, projectId: st
       status: "known",
       bindings: readRoleHolderStates(db)
         .filter((holder) => holder.project_id === projectId)
-        .map((holder) => ({
-          roleId: holder.role_id,
-          domainId: holder.domain_id ?? "default",
-          generation: holder.role_generation,
-          executionAttemptId: holder.execution_attempt_id,
-          threadId: holder.thread_id,
-        })),
+        .map((holder) => {
+          const event = db.prepare(
+            `SELECT event_type FROM state_events
+             WHERE project_id = ? AND aggregate_type = 'role_generation' AND aggregate_id = ? AND aggregate_revision = ?
+             ORDER BY event_sequence DESC LIMIT 1`,
+          ).get(projectId, holder.role_id, holder.role_generation) as { event_type: string } | undefined;
+          return {
+            roleId: holder.role_id,
+            domainId: holder.domain_id ?? "default",
+            generation: holder.role_generation,
+            executionAttemptId: holder.execution_attempt_id,
+            threadId: holder.thread_id,
+            generationEventType: event?.event_type ?? null,
+          };
+        }),
     };
   } catch {
     return { status: "unknown", reason: "canonical-store-unreadable" };

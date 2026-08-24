@@ -10,7 +10,7 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
-export const RUNTIME_CONTRACT_VERSION = 29;
+export const RUNTIME_CONTRACT_VERSION = 30;
 export const SCHEMA_VERSION = 34;
 // v27 records correlated terminal evidence and first-class interrupted attempts.
 const PREVIOUS_RUNTIME_CONTRACT_VERSION = 27;
@@ -19,6 +19,14 @@ export const MAX_WRITING_LANE_CEILING = 3;
 // Schema v32 repairs the append-only v31 migration ledger without changing runtime state.
 const PREVIOUS_SCHEMA_VERSION = 32;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
+export const ROLE_GENERATION_EVENT_TYPES = ["role_generation_created", "role_generation_succeeded"] as const;
+export type RoleGenerationEventType = (typeof ROLE_GENERATION_EVENT_TYPES)[number];
+
+export function roleGenerationEventType(generation: number, predecessorGeneration: number | null): RoleGenerationEventType {
+  if (generation === 1 && predecessorGeneration === null) return "role_generation_created";
+  if (generation > 1 && predecessorGeneration !== null) return "role_generation_succeeded";
+  throw new Error("role generation has no valid creation or succession semantics");
+}
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatPrimaryProfile = {
   providerId: "claude-code",
@@ -3433,6 +3441,7 @@ export interface FoundationResult {
   mutationReceipt?: MutationReceipt;
   actorReceiptId?: string;
   eventSequence?: number;
+  eventType?: string;
   evidence?: unknown;
   export?: ExportPayload;
 }
@@ -6801,7 +6810,7 @@ function materializeRoleHolderAttempt(
   );
 }
 
-function applyRoleGenerationSuccession(
+function applyRoleGenerationMutation(
   db: SqliteDatabase,
   request: ApplyRequest,
   digest: string,
@@ -6812,7 +6821,7 @@ function applyRoleGenerationSuccession(
   const actorReceiptId = requireActor(db, request);
   requireRoleActorBinding(db, request, false);
   if (!request.roleId || !request.qualificationId || !request.profileDigest || !request.fixtureContextDigest) {
-    throw refusal("INVALID_INPUT", "role succession requires role, qualification, profile, and fixture context identities");
+    throw refusal("INVALID_INPUT", "role generation requires role, qualification, profile, and fixture context identities");
   }
   const resolved = requireRoleRequirement(db, request, configRevision);
   requireRoleTargetContext(db, request, resolved, context);
@@ -6821,11 +6830,11 @@ function applyRoleGenerationSuccession(
   }
   const standbyProfile = request.standbyProfile;
   if (resolved.requirement.standbyProfile && (!standbyProfile || !roleRequirementProfileMatches(resolved.requirement, standbyProfile))) {
-    throw refusal("ROLE_STANDBY_INVALID", "director-seat succession requires another allowed profile from its configured pair");
+    throw refusal("ROLE_STANDBY_INVALID", "director-seat role generation requires another allowed profile from its configured pair");
   }
   if (request.roleId === "director") {
     if (!standbyProfile || standbyProfile.providerId === context.profile.providerId) {
-      throw refusal("ROLE_STANDBY_INVALID", "director succession requires a named standby from another provider");
+      throw refusal("ROLE_STANDBY_INVALID", "director role generation requires a named standby from another provider");
     }
   } else if (standbyProfile) {
     throw refusal("ROLE_STANDBY_INVALID", "standby is reserved for the director seat");
@@ -6912,6 +6921,12 @@ function applyRoleGenerationSuccession(
     if (!predecessor || !["active", "draining"].includes(predecessor.status)) throw refusal("ROLE_NOT_ACTIVE", "predecessor is not current and active or draining");
     nextGeneration = request.expectedGeneration + 1;
   }
+  let eventType: RoleGenerationEventType;
+  try {
+    eventType = roleGenerationEventType(nextGeneration, request.predecessorGeneration ?? null);
+  } catch {
+    throw refusal("ROLE_PREDECESSOR_MISMATCH", "role generation is neither first-generation creation nor succession");
+  }
   const createdAtMs = now();
   const persistedPredecessorGeneration = request.predecessorGeneration ?? null;
   materializeRoleHolderAttempt(
@@ -6977,7 +6992,7 @@ function applyRoleGenerationSuccession(
       aggregateType: "role_generation",
       aggregateId: request.roleId,
       aggregateRevision: nextGeneration,
-      eventType: "role_generation_succeeded",
+      eventType,
       event: {
         roleId: request.roleId,
         domainId: resolved.domainId,
@@ -6993,6 +7008,7 @@ function applyRoleGenerationSuccession(
       currentGovernanceEpoch: governor.governance_epoch,
       currentResourceRevision: nextGeneration,
       expectedResourceRevision: request.expectedGeneration ?? undefined,
+      eventType,
       evidence: {
         roleId: request.roleId,
         generation: nextGeneration,
@@ -7025,7 +7041,7 @@ function applyRoleMutation(
       if (replayInTransaction) return replayInTransaction;
       return request.operationClass === "qualification_observation_record"
         ? applyQualificationObservation(db, request, digest, context)
-        : applyRoleGenerationSuccession(db, request, digest, context);
+        : applyRoleGenerationMutation(db, request, digest, context);
     });
   } catch (error) {
     if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
@@ -10623,6 +10639,12 @@ export async function doctor(
               role_generations.status, role_generations.qualification_id,
               role_generations.holder_execution_attempt_id,
               role_generations.standby_profile_json,
+              (SELECT event_type FROM state_events
+               WHERE state_events.project_id = role_generation_heads.project_id
+                 AND state_events.aggregate_type = 'role_generation'
+                 AND state_events.aggregate_id = role_generation_heads.role_id
+                 AND state_events.aggregate_revision = role_generation_heads.current_generation
+               ORDER BY state_events.event_sequence DESC LIMIT 1) AS generation_event_type,
               execution_attempts.state AS holder_attempt_state,
               execution_attempts.native_receipt_digest AS holder_native_receipt_digest,
               execution_attempts.thread_id AS holder_thread_id
@@ -10638,6 +10660,12 @@ export async function doctor(
               role_generations.status, role_generations.qualification_id,
               role_generations.holder_execution_attempt_id,
               role_generations.standby_profile_json,
+              (SELECT event_type FROM state_events
+               WHERE state_events.project_id = role_generation_heads.project_id
+                 AND state_events.aggregate_type = 'role_generation'
+                 AND state_events.aggregate_id = role_generation_heads.role_id
+                 AND state_events.aggregate_revision = role_generation_heads.current_generation
+               ORDER BY state_events.event_sequence DESC LIMIT 1) AS generation_event_type,
               execution_attempts.state AS holder_attempt_state,
               execution_attempts.native_receipt_digest AS holder_native_receipt_digest,
               execution_attempts.thread_id AS holder_thread_id

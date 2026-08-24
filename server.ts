@@ -844,6 +844,7 @@ export const foundationResultSchema = z
     expected: z.number().int().nonnegative(),
     attempted: z.number().int().nonnegative(),
     verified: z.number().int().nonnegative(),
+    eventType: z.string().optional(),
     message: z.string().optional(),
     currentConfigRevision: z.number().int().positive().optional(),
     expectedConfigRevision: z.number().int().nonnegative().optional(),
@@ -2124,7 +2125,7 @@ async function applyLiveAuthorizedMutation(
     evidenceReader = resolved;
   }
   const result = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader, evidenceReader);
-  await deliverSucceededSeatBrief(bb, db, input, result);
+  await deliverSucceededRoleGenerationBrief(bb, db, input, result);
   return result;
 }
 
@@ -2157,7 +2158,7 @@ async function applyLiveAuthorizedMutationAsync(
     evidenceReader = resolved;
   }
   const result = await applyAuthorizedMutationAsync(db, input, githubAdapter, reader, null, null, githubIssueReader, evidenceReader);
-  await deliverSucceededSeatBrief(bb, db, input, result);
+  await deliverSucceededRoleGenerationBrief(bb, db, input, result);
   return result;
 }
 
@@ -2263,13 +2264,19 @@ async function sendRoleBrief(
   projectId: string,
   threadId: string,
   role: z.infer<typeof roleBriefRoleSchema>,
+  generationEventType?: string,
 ): Promise<void> {
   const brief = await composeRoleBrief(bb, db, { projectId, role });
+  const ceremony = generationEventType === "role_generation_created"
+    ? "first-generation creation"
+    : generationEventType === "role_generation_succeeded"
+      ? "succession"
+      : null;
   // created is observe-only and can race the first turn; queue instead of waiting for idle.
   await sendWhenThreadReady(bb, {
     threadId,
     mode: "queue-if-active",
-    input: [{ type: "text", visibility: "agent-only", text: brief.prompt, mentions: [] }],
+    input: [{ type: "text", visibility: "agent-only", text: ceremony ? `Canonical role-generation event: ${ceremony}.\n\n${brief.prompt}` : brief.prompt, mentions: [] }],
   }, projectId);
 }
 
@@ -2302,7 +2309,7 @@ async function sendWhenThreadIdle(bb: BbPluginApi, request: Parameters<BbPluginA
   await enqueueAutomatedTell(bb, request, true, projectId);
 }
 
-async function deliverSucceededSeatBrief(
+async function deliverSucceededRoleGenerationBrief(
   bb: BbPluginApi,
   db: SqliteDatabase | null,
   input: unknown,
@@ -2311,7 +2318,7 @@ async function deliverSucceededSeatBrief(
   const request = applyRequestSchema.safeParse(input);
   if (!request.success || result.outcome !== "OK" || request.data.operationClass !== "role_generation_succession" || !request.data.roleContext || !request.data.roleId) return;
   try {
-    await sendRoleBrief(bb, db, request.data.projectId, request.data.roleContext.threadId, roleBriefRole(request.data.roleId));
+    await sendRoleBrief(bb, db, request.data.projectId, request.data.roleContext.threadId, roleBriefRole(request.data.roleId), result.eventType);
   } catch (error) {
     bb.log.error(`role brief seating failed for thread=${request.data.roleContext.threadId}: ${String(error)}`);
   }
@@ -5572,7 +5579,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
 
   // Lifecycle callbacks observe a completed creation; they cannot intercept a
   // spawn. An unseated thread receives its worker brief here at seating;
-  // successful canonical succession separately delivers the exact seat brief.
+  // Every successful canonical role-generation event separately delivers the exact seat brief.
   bb.events.on("thread.created", async ({ thread }) => {
     try {
       await sendRoleBrief(bb, db, thread.projectId, thread.id, roleForThread(db, thread.projectId, thread.id));
@@ -5726,7 +5733,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       },
       {
         name: "stall-guard",
-        summary: "Run one succession-safe stall-guard cycle (host-supervised seam)",
+        summary: "Run one role-generation-safe stall-guard cycle (host-supervised seam)",
         usage: "bb collab stall-guard --cycle --project PROJECT_ID",
       },
       {

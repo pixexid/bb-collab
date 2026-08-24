@@ -95,7 +95,7 @@ The canonical exits are [`WORK_ITEM_TRANSITIONS`](../src/foundation.ts):
 
 A same-state `review_pending → review_pending` re-dispatch is also allowed. It supersedes the active review and registers a replacement, but the replacement must include a lane, thread, requested profile, PR number, and PR head SHA, with an active prior review carrying the same PR number and head SHA. These rules are enforced by [`applyWorkItemTransition`](../src/foundation.ts).
 
-`workItemReconciliationIssues` reports `review_attempt_count` only when a `review_pending` item has more than one active review attempt; zero is accepted. Any reconciliation issue blocks the next project-orchestrator succession ([`workItemReconciliationIssues`](../src/foundation.ts), [`applyWorkItemTransition`](../src/foundation.ts)).
+`workItemReconciliationIssues` reports `review_attempt_count` only when a `review_pending` item has more than one active review attempt; zero is accepted. Any reconciliation issue blocks the next project-orchestrator succession, while an unseated project-orchestrator uses first-generation creation ([`workItemReconciliationIssues`](../src/foundation.ts), [`applyWorkItemTransition`](../src/foundation.ts)).
 
 ## Escalation
 

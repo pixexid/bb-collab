@@ -42,7 +42,7 @@ disposition, with the ten ratified derived mutation classes, including
 immutable project configuration and its mapped targets, including
 `roleRequirements` provisioning,
 `work_item_create`, `work_item_transition`, `qualification_observation_record`, and
-`role_generation_succession`. The
+`role_generation_succession` first-generation creation or succession seam. The
 `approverAttestation` RPC validates that active registry row, exact Decision
 and disposition, caller plugin, and request binding, then atomically issues a
 fresh interim receipt plus verified plugin actor with no pending UI interaction.
@@ -80,14 +80,14 @@ managed-worktree/source/environment checks. Historical contract v15 added only t
 current-generation qualification exemption for generation 2, holder
 `thr_gsb7m77ciz`, environment `env_3znzsxb7ce`, and source `src_x8veidmpik`.
 The current head and holder execution attempt remained required; foreign, stale,
-wrong-profile, future-generation, succession, and writing requests refused
+wrong-profile, future-generation, first-generation creation, succession, and writing requests refused
 before any write. The grandfathered unmanaged epoch-2 service could not establish
 generation-3 occupancy without a later receipt-gated succession. Contract v17
 supersedes those historical v13-v15 rules: only director generation 1 uses the
 exact holder/environment/source qualification-and-creation exemption, only director generations carry the
 named different-provider standby, and project-orchestrator generations omit it.
 Historical contract v16 additionally rejected a native thread designated as a witness by
-its title or title fallback before qualification or succession could materialize a
+its title or title fallback before qualification or first-generation creation or succession could materialize a
 holder attempt; it preserved the existing role/head, environment/source, and
 executed-profile checks. Stale v16 consumers refuse, current v17 consumers reread,
 and schema/migrations remain unchanged by this role-policy
@@ -112,7 +112,7 @@ derives separate target genesis and operational plugin actors and writes
 `bootstrap_derivation_receipts` in the same transaction as the target config,
 repository targets, governorship, state event, and mutation receipt. The
 genesis receipt is single-use and `requireActor` rejects it for governor,
-config, Decision, qualification, succession, and every other later mutation;
+config, Decision, qualification, first-generation creation, succession, and every other later mutation;
 only the distinct operational receipt owns the target governorship. Stale
 source fences/epochs, frozen or missing source governorship, non-plugin or
 invalid source actors, unrelated classes, wrong source/target/scope/options,
@@ -160,11 +160,11 @@ The goals are:
 | Harness-era identity | A provider, model, harness name or display name is treated as a role or actor | Typed RoleGeneration and actor references; ROLE_NOT_ACTIVE, ROLE_GENERATION_STALE or ROLE_HOLDER_MISMATCH. |
 | Wrong project | A checkout, current directory or thread selects a neighboring project | Stable project_id and config revision; PROJECT_UNKNOWN or PROJECT_CONFIG_STALE. |
 | Wrong repository | First/app/current checkout or slug fallback targets another repository | Stable repo_target_id under project/config; REPO_TARGET_REQUIRED, REPO_TARGET_AMBIGUOUS, REPO_TARGET_FOREIGN or REPO_TARGET_STALE. |
-| Domain confusion | A task, role, wait, attempt, or diagnostic is routed through the wrong configured domain | Immutable configured domain inventory, globally unique task classes and role requirement IDs, exact WorkItem domain/task binding, and domain-qualified role heads, standing, succession, waits, liveness, capacity evidence, Doctor and export; DOMAIN_REQUIRED, DOMAIN_AMBIGUOUS, DOMAIN_FOREIGN or DOMAIN_CONFIG_STALE. |
+| Domain confusion | A task, role, wait, attempt, or diagnostic is routed through the wrong configured domain | Immutable configured domain inventory, globally unique task classes and role requirement IDs, exact WorkItem domain/task binding, and domain-qualified role heads, standing, first-generation creation, succession, waits, liveness, capacity evidence, Doctor and export; DOMAIN_REQUIRED, DOMAIN_AMBIGUOUS, DOMAIN_FOREIGN or DOMAIN_CONFIG_STALE. |
 | Split authority | GitHub label, BB Task, Markdown row or project file activates work | Canonical WorkItem and resolver; PROJECTION_DRIFT is visible and projections rebuild from canonical state. |
 | Stale governorship | Old source/target process writes after a fence transition | Compare-and-swap epoch/token; GOVERNOR_EPOCH_STALE or PROJECT_FROZEN. |
 | Missing governorship | A resolver or adapter proceeds when the canonical store is unavailable | Fail closed with GOVERNOR_UNAVAILABLE or CANONICAL_STORE_UNAVAILABLE. |
-| Role succession race | Retired or non-head generation accepts a decision | Current RoleHead, active state, holder receipt and monotonic generation checks; ROLE_GENERATION_STALE. |
+| Role-generation transition race | Retired or non-head generation accepts a first-generation creation or succession decision | Current RoleHead, active state, holder receipt and monotonic generation checks; ROLE_GENERATION_STALE. |
 | Unqualified actor | Expired, contradictory or absent qualification satisfies a role or review gate | Immutable observations and derived eligibility; ROLE_UNQUALIFIED or CAPABILITY_UNKNOWN. |
 | Duplicate writer | Two active writers share a project lane | One-writer-per-lane policy at dispatch; no runtime ceiling enforcement remains after the assignment-subsystem severance. |
 | Requested/executed confusion | Requested profile is reported as actual execution | Separate Assignment and ExecutionAttempt; EXECUTION_PROFILE_UNKNOWN or EXECUTION_PROFILE_MISMATCH. |

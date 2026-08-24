@@ -1,9 +1,12 @@
-# Role succession runbook
+# Role generation creation and succession runbook
 
 This is the operational runbook for the director/project-orchestrator seats of
 any project governed by this plugin. Canonical authority remains the
 actor-receipt-gated `role_generation_succession` resolver and its
-`RoleGeneration` row. This document is guidance, not a second role store.
+`RoleGeneration` row. The operation class remains backward-compatible: null
+expected and predecessor generations record **first-generation creation**;
+exact non-null predecessor generations record **succession**. This document
+is guidance, not a second role store.
 
 This runbook is project-agnostic by construction. It names no project, thread,
 environment, source, or digest. Read those from the canonical store at the
@@ -11,7 +14,8 @@ current config revision, never from documentation.
 
 ## Authorization
 
-Succession is authorized by the operator's typed word (ADR 0007). The
+First-generation creation and succession are authorized by the operator's
+typed word (ADR 0007). The
 authority ceremony was deleted by operator ruling with no replacement: there
 is no mint surface and there never will be one.
 
@@ -25,9 +29,10 @@ mint one.
 ## Seat pairing and epoch naming
 
 One epoch pairs one director generation with one orchestrator generation. The
-incoming director runs the orchestrator's succession apply. The mixed-epoch
-interval between the two applies is a bounded transition state closed by the
-paired apply, never a resting state.
+incoming director runs the orchestrator's first-generation creation or
+succession apply as appropriate. The mixed-epoch interval between the two
+applies is a bounded transition state closed by the paired apply, never a
+resting state.
 
 Three sequences may coincidentally agree and must never be derived from one
 another: the human-facing epoch in a seat's name, the canonical generation in
@@ -57,7 +62,8 @@ evidence or rewriting historical generations.
 
 ## Triggers
 
-Start succession for any of these conditions:
+For an unseated role, record first-generation creation. Start succession for
+any of these conditions:
 
 - context weight becomes costly (roughly 15–20 substantive turns or a
   disproportionate wake cost);
@@ -88,10 +94,14 @@ Start succession for any of these conditions:
 5. Obtain a bounded comprehension acknowledgement (10 lines or fewer) naming
    the role, epoch, fleet state, next decision, and any contradiction found.
 6. Submit the exact actor-receipt-gated `role_generation_succession` request.
+   Null expected and predecessor generations must emit the canonical
+   `role_generation_created` event; an exact non-null predecessor must emit
+   `role_generation_succeeded`. The request wire remains the same for both
+   meanings, and existing event history is never rewritten.
    Name the configured standby only for `director-seat`; omit it for every
    other role. The atomic `RoleGeneration` write is the authority transfer.
-7. Consumers read the current `RoleGeneration`; do not manually retarget
-   watcher or escalation state.
+7. Consumers read the current `RoleGeneration` and its canonical event type;
+   do not manually retarget watcher or escalation state.
 8. Revoke the predecessor by record. A live predecessor may receive one
    retirement notice; a dead or quota-dead thread may reject tells, so do not
    wait for acknowledgement. Stale generations refuse further authority.

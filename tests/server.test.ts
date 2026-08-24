@@ -9743,7 +9743,7 @@ else printf '%s\\n' '[]'; fi
 
   it("appends authority-root schema and bumps the runtime contract", () => {
     expect(SCHEMA_VERSION).toBe(34);
-    expect(RUNTIME_CONTRACT_VERSION).toBe(29);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(30);
     expect(MIGRATIONS).toHaveLength(47);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
@@ -9770,7 +9770,7 @@ else printf '%s\\n' '[]'; fi
       oldSchemaVersion: 32,
       newSchemaVersion: 34,
       oldContractVersion: 27,
-      newContractVersion: 29,
+      newContractVersion: 30,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -9780,20 +9780,20 @@ else printf '%s\\n' '[]'; fi
       oldSchemaVersion: 32,
       newSchemaVersion: 34,
       oldContractVersion: 27,
-      newContractVersion: 29,
+      newContractVersion: 30,
       action: "refused",
       expected: 4,
       attempted: 4,
       verified: 0,
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ action: "refused", verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(34, 29))).toMatchObject({ action: "reread", verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(34, 30))).toMatchObject({ action: "reread", verified: 4 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 32,
       newSchemaVersion: 34,
       oldContractVersion: 27,
-      newContractVersion: 29,
+      newContractVersion: 30,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -10062,7 +10062,7 @@ else printf '%s\\n' '[]'; fi
   });
 
   it("assembles the production v22 cached-consumer rollout receipt with stale-v21 refusal semantics", async () => {
-    expect(RUNTIME_CONTRACT_VERSION).toBe(29);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(30);
     expect(SCHEMA_VERSION).toBe(34);
     expect(MIGRATIONS).toHaveLength(47);
     expect(contractDigest).not.toBe("d4e51b0b1fd68957120cea5febb7762d6c3b9eddab76f67916e556830b062b83");
@@ -10081,7 +10081,7 @@ else printf '%s\\n' '[]'; fi
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 34, observedContractVersion: 29 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 34, observedContractVersion: 30 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -10707,7 +10707,7 @@ else printf '%s\\n' '[]'; fi
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
       observedSchemaVersion: 34,
-      observedContractVersion: 29,
+      observedContractVersion: 30,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -10789,7 +10789,7 @@ else printf '%s\\n' '[]'; fi
       evidence: {
         cachedConsumers: {
           oldContractVersion: 27,
-          newContractVersion: 29,
+          newContractVersion: 30,
           action: "unknown",
           expected: 4,
           attempted: 0,
@@ -10937,7 +10937,7 @@ else printf '%s\\n' '[]'; fi
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 34, schemaDigest, contractVersion: 29, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 34, schemaDigest, contractVersion: 30, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -13682,7 +13682,7 @@ else printf '%s\\n' '[]'; fi
     const qualified = applyWithFixtureReceipt(db, qualificationRequest(fenceToken), null, facts);
     expect(qualified).toMatchObject({ outcome: "OK", expected: 1, attempted: 1, verified: 1 });
     const activated = applyWithFixtureReceipt(db, successionRequest(fenceToken), null, facts);
-    expect(activated).toMatchObject({ outcome: "OK", currentResourceRevision: 1 });
+    expect(activated).toMatchObject({ outcome: "OK", currentResourceRevision: 1, eventType: "role_generation_created" });
     expect(db.prepare("SELECT role_id, generation, status, predecessor_generation FROM role_generations").get()).toEqual({
       role_id: "project-orchestrator",
       generation: 1,
@@ -13695,6 +13695,7 @@ else printf '%s\\n' '[]'; fi
     });
     expect(db.prepare("SELECT COUNT(*) AS count FROM qualification_observations").get()).toEqual({ count: 1 });
     expect(db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE aggregate_type IN ('qualification_observation', 'role_generation')").get()).toEqual({ count: 2 });
+    expect(db.prepare("SELECT event_type FROM state_events WHERE aggregate_type = 'role_generation'").get()).toEqual({ event_type: "role_generation_created" });
     const firstExport = exportFoundation(db, PROJECT_ID);
     expect(exportFoundation(db, PROJECT_ID)).toEqual(firstExport);
     expect((firstExport.export?.manifest.tableCounts ?? {})).toMatchObject({
@@ -13703,6 +13704,7 @@ else printf '%s\\n' '[]'; fi
       role_generations: 1,
       role_generation_heads: 1,
     });
+    expect(firstExport.export?.recordsNdjson).toContain('"event_type":"role_generation_created"');
     const rawFacts = roleReader((value) => {
       value.thread.visibility = "hidden";
       value.events[3]!.data.status = "failed";
@@ -13714,7 +13716,7 @@ else printf '%s\\n' '[]'; fi
       outcome: "OK",
       evidence: {
         qualificationObservationCount: 1,
-        roleGenerationHeads: [{ role_id: "project-orchestrator", current_generation: 1, status: "active" }],
+        roleGenerationHeads: [{ role_id: "project-orchestrator", current_generation: 1, status: "active", generation_event_type: "role_generation_created" }],
         eligibility: [{ roleRequirementId: "orchestrator-v1", effectiveStatus: "eligible" }],
         cachedConsumers: { action: "unknown", expected: 4, attempted: 0, verified: 0 },
       },
@@ -13775,7 +13777,7 @@ else printf '%s\\n' '[]'; fi
     const listed = await host.harness.runCli(["role-list", "--project", PROJECT_ID]);
     expect(listed.exitCode).toBe(0);
     expect(JSON.parse(listed.stdout).evidence).toEqual([
-      { roleId: "project-orchestrator", domainId: "default", generation: 2, executionAttemptId, threadId: successorContext.threadId },
+      { roleId: "project-orchestrator", domainId: "default", generation: 2, executionAttemptId, threadId: successorContext.threadId, generationEventType: "role_generation_succeeded" },
     ]);
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeList);
     expect(host.harness.inspection.sdk.callsTo("threads.list")).toEqual([]);
@@ -14043,7 +14045,8 @@ else printf '%s\\n' '[]'; fi
     const succession = successionRequest(fenceToken, { idempotencyKey: "live-succession" });
     const cli = await host.harness.runCli(["apply", "--project", PROJECT_ID, "--request", JSON.stringify(succession)]);
     expect(cli.exitCode).toBe(0);
-    expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "OK" });
+    expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "OK", eventType: "role_generation_created" });
+    expect(host.harness.inspection.sdk.callsTo("threads.send").map(([input]) => (input as { input: Array<{ text: string }> }).input[0]?.text)).toContainEqual(expect.stringContaining("Canonical role-generation event: first-generation creation."));
     expect(host.harness.inspection.sdk.callsTo("threads.get").length).toBeGreaterThanOrEqual(2);
     expect(host.harness.inspection.sdk.callsTo("threads.events.list").length).toBeGreaterThanOrEqual(2);
     expect(host.harness.inspection.sdk.callsTo("environments.get").length).toBeGreaterThanOrEqual(2);
@@ -14788,10 +14791,10 @@ else printf '%s\\n' '[]'; fi
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 29, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 29, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 29, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(34, 29))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 29, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 30, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 30, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 30, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(34, 30))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 30, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 
