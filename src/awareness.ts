@@ -487,14 +487,17 @@ export function readCurrentRoleBindings(db: SqliteDatabase | null, projectId: st
       bindings: readRoleHolderStates(db)
         .filter((holder) => holder.project_id === projectId)
         .map((holder) => {
+          const domainId = holder.domain_id ?? "default";
           const event = db.prepare(
             `SELECT event_type FROM state_events
              WHERE project_id = ? AND aggregate_type = 'role_generation' AND aggregate_id = ? AND aggregate_revision = ?
+               AND (json_extract(event_json, '$.domainId') = ?
+                 OR (? = 'default' AND json_extract(event_json, '$.domainId') IS NULL))
              ORDER BY event_sequence DESC LIMIT 1`,
-          ).get(projectId, holder.role_id, holder.role_generation) as { event_type: string } | undefined;
+          ).get(projectId, holder.role_id, holder.role_generation, domainId, domainId) as { event_type: string } | undefined;
           return {
             roleId: holder.role_id,
-            domainId: holder.domain_id ?? "default",
+            domainId,
             generation: holder.role_generation,
             executionAttemptId: holder.execution_attempt_id,
             threadId: holder.thread_id,

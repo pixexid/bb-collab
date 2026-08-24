@@ -14082,13 +14082,24 @@ function readCurrentRoleBindings(db, projectId) {
     }
     return {
       status: "known",
-      bindings: readRoleHolderStates(db).filter((holder) => holder.project_id === projectId).map((holder) => ({
-        roleId: holder.role_id,
-        domainId: holder.domain_id ?? "default",
-        generation: holder.role_generation,
-        executionAttemptId: holder.execution_attempt_id,
-        threadId: holder.thread_id
-      }))
+      bindings: readRoleHolderStates(db).filter((holder) => holder.project_id === projectId).map((holder) => {
+        const domainId = holder.domain_id ?? "default";
+        const event = db.prepare(
+          `SELECT event_type FROM state_events
+             WHERE project_id = ? AND aggregate_type = 'role_generation' AND aggregate_id = ? AND aggregate_revision = ?
+               AND (json_extract(event_json, '$.domainId') = ?
+                 OR (? = 'default' AND json_extract(event_json, '$.domainId') IS NULL))
+             ORDER BY event_sequence DESC LIMIT 1`
+        ).get(projectId, holder.role_id, holder.role_generation, domainId, domainId);
+        return {
+          roleId: holder.role_id,
+          domainId,
+          generation: holder.role_generation,
+          executionAttemptId: holder.execution_attempt_id,
+          threadId: holder.thread_id,
+          generationEventType: event?.event_type ?? null
+        };
+      })
     };
   } catch {
     return { status: "unknown", reason: "canonical-store-unreadable" };
@@ -14772,13 +14783,18 @@ function assertGithubIssueBriefBinding(brief, expected) {
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var RUNTIME_CONTRACT_VERSION = 29;
+var RUNTIME_CONTRACT_VERSION = 30;
 var SCHEMA_VERSION = 34;
 var PREVIOUS_RUNTIME_CONTRACT_VERSION = 27;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
 var PREVIOUS_SCHEMA_VERSION = 32;
 var ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"];
+function roleGenerationEventType(generation, predecessorGeneration) {
+  if (generation === 1 && predecessorGeneration === null) return "role_generation_created";
+  if (generation > 1 && predecessorGeneration !== null) return "role_generation_succeeded";
+  throw new Error("role generation has no valid creation or succession semantics");
+}
 var DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat";
 var directorSeatPrimaryProfile = {
   providerId: "claude-code",
@@ -20280,13 +20296,13 @@ function materializeRoleHolderAttempt(db, request, context, resolved, governance
     context.holderExecutionAttemptId
   );
 }
-function applyRoleGenerationSuccession(db, request, digest2, context) {
+function applyRoleGenerationMutation(db, request, digest2, context) {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
   requireRoleActorBinding(db, request, false);
   if (!request.roleId || !request.qualificationId || !request.profileDigest || !request.fixtureContextDigest) {
-    throw refusal("INVALID_INPUT", "role succession requires role, qualification, profile, and fixture context identities");
+    throw refusal("INVALID_INPUT", "role generation requires role, qualification, profile, and fixture context identities");
   }
   const resolved = requireRoleRequirement(db, request, configRevision);
   requireRoleTargetContext(db, request, resolved, context);
@@ -20295,11 +20311,11 @@ function applyRoleGenerationSuccession(db, request, digest2, context) {
   }
   const standbyProfile = request.standbyProfile;
   if (resolved.requirement.standbyProfile && (!standbyProfile || !roleRequirementProfileMatches(resolved.requirement, standbyProfile))) {
-    throw refusal("ROLE_STANDBY_INVALID", "director-seat succession requires another allowed profile from its configured pair");
+    throw refusal("ROLE_STANDBY_INVALID", "director-seat role generation requires another allowed profile from its configured pair");
   }
   if (request.roleId === "director") {
     if (!standbyProfile || standbyProfile.providerId === context.profile.providerId) {
-      throw refusal("ROLE_STANDBY_INVALID", "director succession requires a named standby from another provider");
+      throw refusal("ROLE_STANDBY_INVALID", "director role generation requires a named standby from another provider");
     }
   } else if (standbyProfile) {
     throw refusal("ROLE_STANDBY_INVALID", "standby is reserved for the director seat");
@@ -20371,6 +20387,12 @@ function applyRoleGenerationSuccession(db, request, digest2, context) {
     if (!predecessor || !["active", "draining"].includes(predecessor.status)) throw refusal("ROLE_NOT_ACTIVE", "predecessor is not current and active or draining");
     nextGeneration = request.expectedGeneration + 1;
   }
+  let eventType;
+  try {
+    eventType = roleGenerationEventType(nextGeneration, request.predecessorGeneration ?? null);
+  } catch {
+    throw refusal("ROLE_PREDECESSOR_MISMATCH", "role generation is neither first-generation creation nor succession");
+  }
   const createdAtMs = now();
   const persistedPredecessorGeneration = request.predecessorGeneration ?? null;
   materializeRoleHolderAttempt(
@@ -20436,7 +20458,7 @@ function applyRoleGenerationSuccession(db, request, digest2, context) {
       aggregateType: "role_generation",
       aggregateId: request.roleId,
       aggregateRevision: nextGeneration,
-      eventType: "role_generation_succeeded",
+      eventType,
       event: {
         roleId: request.roleId,
         domainId: resolved.domainId,
@@ -20452,6 +20474,7 @@ function applyRoleGenerationSuccession(db, request, digest2, context) {
       currentGovernanceEpoch: governor.governance_epoch,
       currentResourceRevision: nextGeneration,
       expectedResourceRevision: request.expectedGeneration ?? void 0,
+      eventType,
       evidence: {
         roleId: request.roleId,
         generation: nextGeneration,
@@ -20476,7 +20499,7 @@ function applyRoleMutation(db, request, digest2, reader) {
     return transaction(db, () => {
       const replayInTransaction = checkIdempotency(db, request, digest2);
       if (replayInTransaction) return replayInTransaction;
-      return request.operationClass === "qualification_observation_record" ? applyQualificationObservation(db, request, digest2, context) : applyRoleGenerationSuccession(db, request, digest2, context);
+      return request.operationClass === "qualification_observation_record" ? applyQualificationObservation(db, request, digest2, context) : applyRoleGenerationMutation(db, request, digest2, context);
     });
   } catch (error48) {
     if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
@@ -23257,6 +23280,14 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
               role_generations.status, role_generations.qualification_id,
               role_generations.holder_execution_attempt_id,
               role_generations.standby_profile_json,
+              (SELECT event_type FROM state_events
+               WHERE state_events.project_id = role_generation_heads.project_id
+                 AND state_events.aggregate_type = 'role_generation'
+                 AND state_events.aggregate_id = role_generation_heads.role_id
+                 AND state_events.aggregate_revision = role_generation_heads.current_generation
+                 AND (json_extract(state_events.event_json, '$.domainId') = role_generation_heads.domain_id
+                   OR (role_generation_heads.domain_id = 'default' AND json_extract(state_events.event_json, '$.domainId') IS NULL))
+               ORDER BY state_events.event_sequence DESC LIMIT 1) AS generation_event_type,
               execution_attempts.state AS holder_attempt_state,
               execution_attempts.native_receipt_digest AS holder_native_receipt_digest,
               execution_attempts.thread_id AS holder_thread_id
@@ -23271,6 +23302,14 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
               role_generations.status, role_generations.qualification_id,
               role_generations.holder_execution_attempt_id,
               role_generations.standby_profile_json,
+              (SELECT event_type FROM state_events
+               WHERE state_events.project_id = role_generation_heads.project_id
+                 AND state_events.aggregate_type = 'role_generation'
+                 AND state_events.aggregate_id = role_generation_heads.role_id
+                 AND state_events.aggregate_revision = role_generation_heads.current_generation
+                 AND (json_extract(state_events.event_json, '$.domainId') = 'default'
+                   OR json_extract(state_events.event_json, '$.domainId') IS NULL)
+               ORDER BY state_events.event_sequence DESC LIMIT 1) AS generation_event_type,
               execution_attempts.state AS holder_attempt_state,
               execution_attempts.native_receipt_digest AS holder_native_receipt_digest,
               execution_attempts.thread_id AS holder_thread_id
@@ -25224,6 +25263,7 @@ var foundationResultSchema = external_exports.object({
   expected: external_exports.number().int().nonnegative(),
   attempted: external_exports.number().int().nonnegative(),
   verified: external_exports.number().int().nonnegative(),
+  eventType: external_exports.string().optional(),
   message: external_exports.string().optional(),
   currentConfigRevision: external_exports.number().int().positive().optional(),
   expectedConfigRevision: external_exports.number().int().nonnegative().optional(),
@@ -26326,7 +26366,7 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
     evidenceReader = resolved;
   }
   const result2 = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader, evidenceReader);
-  await deliverSucceededSeatBrief(bb, db, input, result2);
+  await deliverSucceededRoleGenerationBrief(bb, db, input, result2);
   return result2;
 }
 async function applyLiveAuthorizedMutationAsync(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = readGithubIssueForBackfill, githubAdapter = null) {
@@ -26350,7 +26390,7 @@ async function applyLiveAuthorizedMutationAsync(bb, db, input, allowCachedConsum
     evidenceReader = resolved;
   }
   const result2 = await applyAuthorizedMutationAsync(db, input, githubAdapter, reader, null, null, githubIssueReader, evidenceReader);
-  await deliverSucceededSeatBrief(bb, db, input, result2);
+  await deliverSucceededRoleGenerationBrief(bb, db, input, result2);
   return result2;
 }
 async function liveWorkItemWaker(bb, db, projectId, waker) {
@@ -26426,12 +26466,15 @@ async function composeRoleBrief(bb, db, input) {
   ].join("\n");
   return { role: input.role, roleContent: bundle.roles[input.role], ponytail: bundle.ponytail, rules: bundle.rules, project: { id: project.id, name: project.name, sourceIds: project.sources.map((source) => source.id) }, pointers, prompt };
 }
-async function sendRoleBrief(bb, db, projectId, threadId, role) {
+async function sendRoleBrief(bb, db, projectId, threadId, role, generationEventType) {
   const brief = await composeRoleBrief(bb, db, { projectId, role });
+  const ceremony = generationEventType === "role_generation_created" ? "first-generation creation" : generationEventType === "role_generation_succeeded" ? "succession" : null;
   await sendWhenThreadReady(bb, {
     threadId,
     mode: "queue-if-active",
-    input: [{ type: "text", visibility: "agent-only", text: brief.prompt, mentions: [] }]
+    input: [{ type: "text", visibility: "agent-only", text: ceremony ? `Canonical role-generation event: ${ceremony}.
+
+${brief.prompt}` : brief.prompt, mentions: [] }]
   }, projectId);
 }
 async function enqueueAutomatedTell(bb, request, waitForIdle, projectId) {
@@ -26454,11 +26497,11 @@ async function sendWhenThreadReady(bb, request, projectId) {
 async function sendWhenThreadIdle(bb, request, projectId) {
   await enqueueAutomatedTell(bb, request, true, projectId);
 }
-async function deliverSucceededSeatBrief(bb, db, input, result2) {
+async function deliverSucceededRoleGenerationBrief(bb, db, input, result2) {
   const request = applyRequestSchema.safeParse(input);
   if (!request.success || result2.outcome !== "OK" || request.data.operationClass !== "role_generation_succession" || !request.data.roleContext || !request.data.roleId) return;
   try {
-    await sendRoleBrief(bb, db, request.data.projectId, request.data.roleContext.threadId, roleBriefRole(request.data.roleId));
+    await sendRoleBrief(bb, db, request.data.projectId, request.data.roleContext.threadId, roleBriefRole(request.data.roleId), result2.eventType);
   } catch (error48) {
     bb.log.error(`role brief seating failed for thread=${request.data.roleContext.threadId}: ${String(error48)}`);
   }
@@ -29546,7 +29589,7 @@ ${thread.titleFallback ?? ""}`);
       },
       {
         name: "stall-guard",
-        summary: "Run one succession-safe stall-guard cycle (host-supervised seam)",
+        summary: "Run one role-generation-safe stall-guard cycle (host-supervised seam)",
         usage: "bb collab stall-guard --cycle --project PROJECT_ID"
       },
       {

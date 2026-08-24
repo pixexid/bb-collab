@@ -10644,6 +10644,8 @@ export async function doctor(
                  AND state_events.aggregate_type = 'role_generation'
                  AND state_events.aggregate_id = role_generation_heads.role_id
                  AND state_events.aggregate_revision = role_generation_heads.current_generation
+                 AND (json_extract(state_events.event_json, '$.domainId') = role_generation_heads.domain_id
+                   OR (role_generation_heads.domain_id = 'default' AND json_extract(state_events.event_json, '$.domainId') IS NULL))
                ORDER BY state_events.event_sequence DESC LIMIT 1) AS generation_event_type,
               execution_attempts.state AS holder_attempt_state,
               execution_attempts.native_receipt_digest AS holder_native_receipt_digest,
@@ -10665,6 +10667,8 @@ export async function doctor(
                  AND state_events.aggregate_type = 'role_generation'
                  AND state_events.aggregate_id = role_generation_heads.role_id
                  AND state_events.aggregate_revision = role_generation_heads.current_generation
+                 AND (json_extract(state_events.event_json, '$.domainId') = 'default'
+                   OR json_extract(state_events.event_json, '$.domainId') IS NULL)
                ORDER BY state_events.event_sequence DESC LIMIT 1) AS generation_event_type,
               execution_attempts.state AS holder_attempt_state,
               execution_attempts.native_receipt_digest AS holder_native_receipt_digest,

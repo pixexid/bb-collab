@@ -2439,6 +2439,67 @@ describe("bb-collab plugin boundary", () => {
     ]);
   });
 
+  it("keeps historical default and new domain generation events distinct", async () => {
+    const config = roleConfig();
+    const requirements = config.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>;
+    delete config.extensions.bbCollab.roleRequirements;
+    config.extensions.bbCollab.domains = [
+      { domainId: "default", taskClasses: ["default"], roleRequirements: requirements },
+      { domainId: "editorial", taskClasses: ["editorial"], roleRequirements: requirements.map((requirement) => ({ ...requirement, roleRequirementId: `${requirement.roleRequirementId}-editorial` })) },
+    ];
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config });
+    const seat = (domainId: "default" | "editorial", suffix: string) => {
+      const roleRequirementId = domainId === "default" ? "orchestrator-v1" : "orchestrator-v1-editorial";
+      const roleContext = {
+        threadId: `thread-${suffix}`,
+        requestEventId: `request-${suffix}`,
+        requestEventSeq: 1,
+        completionEventId: `completion-${suffix}`,
+        completionEventSeq: 4,
+      };
+      const facts = roleReader((value) => {
+        value.thread.id = roleContext.threadId;
+        value.thread.environmentId = `environment-${suffix}`;
+        value.environment.id = `environment-${suffix}`;
+        value.events[0]!.id = roleContext.requestEventId;
+        value.events[3]!.id = roleContext.completionEventId;
+      });
+      expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+        idempotencyKey: `${suffix}-qualification`, domainId, roleRequirementId, qualificationId: `${suffix}-qualification`, roleContext,
+      }), null, facts).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+        idempotencyKey: `${suffix}-creation`, domainId, roleRequirementId, qualificationId: `${suffix}-qualification`, roleContext,
+      }), null, facts).outcome).toBe("OK");
+    };
+
+    seat("default", "default-one");
+    seat("editorial", "editorial-one");
+    // Historical default-domain events predate domainId in event_json.
+    db.prepare(
+      `UPDATE state_events SET event_type = 'role_generation_succeeded', event_json = json_remove(event_json, '$.domainId')
+       WHERE project_id = ? AND aggregate_type = 'role_generation' AND aggregate_id = 'project-orchestrator'
+         AND aggregate_revision = 1 AND json_extract(event_json, '$.domainId') = 'default'`,
+    ).run(PROJECT_ID);
+
+    const listed = await host.harness.runCli(["role-list", "--project", PROJECT_ID]);
+    expect(listed.exitCode).toBe(0);
+    expect(JSON.parse(listed.stdout).evidence.map(({ domainId, generationEventType }: { domainId: string; generationEventType: string }) => ({ domainId, generationEventType }))).toEqual([
+      { domainId: "default", generationEventType: "role_generation_succeeded" },
+      { domainId: "editorial", generationEventType: "role_generation_created" },
+    ]);
+    const doctorResult = await host.harness.callRpc("doctor", { projectId: PROJECT_ID });
+    expect(doctorResult).toMatchObject({
+      outcome: "OK",
+      evidence: {
+        roleGenerationHeads: expect.arrayContaining([
+          expect.objectContaining({ domain_id: "default", generation_event_type: "role_generation_succeeded" }),
+          expect.objectContaining({ domain_id: "editorial", generation_event_type: "role_generation_created" }),
+        ]),
+      },
+    });
+  });
+
   it("reports complete per-domain queue heads while retaining one project-wide count", async () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-domain-queue-"));
     const gh = join(bin, "gh");
