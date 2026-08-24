@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { parseApplyRequest } from "../src/foundation.js";
+import { parseApplyRequest, sha256 } from "../src/foundation.js";
 
 const SHA_A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const profile = { providerId: "codex", model: "reviewer", reasoningLevel: "medium", permissionMode: "full", serviceTier: "default", visibility: "visible" as const };
+const frozenBrief = "Review the exact local candidate.";
 const base = {
   projectId: "project",
   operationClass: "work_item_transition" as const,
@@ -24,6 +25,13 @@ const localAttempt = {
   reviewCandidateEnvironment: { bbServerId: "server", environmentId: "environment", sourceId: "source", hostId: "host", path: "/repo", mode: "managed-worktree" as const },
   reviewCandidateCheckout: { branchName: "bb/candidate", headSha: SHA_B },
   reviewCandidateObservation: { clean: true as const, reachable: true as const },
+  reviewRoleRequirementId: "reviewer-v1",
+  reviewRoleId: "independent-reviewer" as const,
+  reviewRoleGeneration: 2,
+  reviewFrozenBriefVersion: 1 as const,
+  reviewFrozenBriefContent: frozenBrief,
+  reviewFrozenBriefDigest: sha256(frozenBrief),
+  reviewReturnPath: { threadId: "thread-parent", statuses: ["DONE", "BLOCKED", "WAITING"] as ["DONE", "BLOCKED", "WAITING"] },
 };
 
 describe("explicit local review candidates", () => {

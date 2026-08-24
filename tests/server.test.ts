@@ -27,6 +27,7 @@ import {
   GH636_REPAIR_MIGRATION_ID,
   GH637_DOMAIN_MIGRATION_ID,
   GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID,
+  GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION_ID,
   ROLE_CONTEXT_EVENT_PAGE_SIZE,
   MIGRATION_STATES,
   MIGRATION_STEPS,
@@ -2979,7 +2980,7 @@ else printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue:startable"}]}]]'; 
     const legacyGenesis = "legacy-v28-genesis";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -6)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -7)) db.exec(statement);
       })();
       seedVerifiedFixtureReceipt(db, {
         projectId: legacyProject,
@@ -2994,6 +2995,7 @@ else printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue:startable"}]}]]'; 
       }));
       expect(bootstrapped).toMatchObject({ outcome: "OK" });
       const legacyFence = (bootstrapped.evidence as { fenceToken: string }).fenceToken;
+      db.exec(MIGRATIONS.at(-7)!);
       db.exec(MIGRATIONS.at(-6)!);
       db.exec(MIGRATIONS.at(-5)!);
       db.exec(MIGRATIONS.at(-4)!);
@@ -5409,6 +5411,8 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
 
   it("dispatches a local review only with exact native base, candidate, server, and ancestry proof", async () => {
     const fixture = await assignmentFixture({ withoutGithubIssues: true });
+    activateReviewer(fixture.db, fixture.fenceToken);
+    const frozenBrief = "Review the exact local candidate and return one qualified verdict.";
     const candidateEnvironment = {
       bbServerId: fixture.host.bb.server.loopbackBaseUrl,
       environmentId: ROLE_ENVIRONMENT_ID,
@@ -5428,6 +5432,13 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       reviewCandidateEnvironment: candidateEnvironment,
       reviewCandidateCheckout: { branchName: "bb/local-review", headSha: CANDIDATE_SHA },
       reviewCandidateObservation: { clean: true as const, reachable: true as const },
+      reviewRoleRequirementId: "reviewer-v1",
+      reviewRoleId: "independent-reviewer" as const,
+      reviewRoleGeneration: 2,
+      reviewFrozenBriefVersion: 1 as const,
+      reviewFrozenBriefContent: frozenBrief,
+      reviewFrozenBriefDigest: sha256(frozenBrief),
+      reviewReturnPath: { threadId: ROLE_THREAD_ID, statuses: ["DONE", "BLOCKED", "WAITING"] as ["DONE", "BLOCKED", "WAITING"] },
     };
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, {
@@ -5450,22 +5461,57 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     }, { projectId: PROJECT_ID, threadId: ROLE_THREAD_ID }) as string);
     expect(result).toMatchObject({ outcome: "OK" });
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    expect(fixture.db.prepare(
+      `SELECT review_role_requirement_id, review_role_id, review_role_generation,
+              review_frozen_brief_version, review_frozen_brief_content, review_frozen_brief_digest,
+              review_return_path_json, dispatch_input_digest, requested_profile_digest, repo_target_id
+         FROM execution_attempts WHERE project_id = ? AND work_item_id = ? ORDER BY attempt_ordinal DESC LIMIT 1`,
+    ).get(PROJECT_ID, WORK_ITEM_ID)).toEqual({
+      review_role_requirement_id: "reviewer-v1",
+      review_role_id: "independent-reviewer",
+      review_role_generation: 2,
+      review_frozen_brief_version: 1,
+      review_frozen_brief_content: frozenBrief,
+      review_frozen_brief_digest: sha256(frozenBrief),
+      review_return_path_json: canonicalJson({ threadId: ROLE_THREAD_ID, statuses: ["DONE", "BLOCKED", "WAITING"] }),
+      dispatch_input_digest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      requested_profile_digest: ROLE_PROFILE_DIGEST,
+      repo_target_id: TARGET_ID,
+    });
+    const attemptEvent = fixture.db.prepare(
+      "SELECT event_json FROM state_events WHERE project_id = ? AND event_type = 'work_item_attempt_armed' ORDER BY event_sequence DESC LIMIT 1",
+    ).get(PROJECT_ID) as { event_json: string };
+    expect(attemptEvent.event_json).toContain(frozenBrief);
+    expect(attemptEvent.event_json).toContain(sha256(frozenBrief));
+    expect(exportFoundation(fixture.db, PROJECT_ID).export?.recordsNdjson).toContain(`"review_frozen_brief_digest":"${sha256(frozenBrief)}"`);
   });
 
   it.each([
     ["wrong base", (attempt: Record<string, unknown>) => ({ ...attempt, reviewBaseSha: H1_CANDIDATE_SHA })],
     ["unreachable base", (_attempt: Record<string, unknown>, fixture: Awaited<ReturnType<typeof assignmentFixture>>) => { fixture.host.harness.sdk.stub("environments.diff", (async () => ({ outcome: "unavailable" })) as never); return _attempt; }],
-    ["unreachable candidate", (_attempt: Record<string, unknown>, fixture: Awaited<ReturnType<typeof assignmentFixture>>) => { fixture.host.harness.sdk.stub("environments.status", (async () => ({ outcome: "unavailable" })) as never); return _attempt; }],
+    ["unreachable candidate", (_attempt: Record<string, unknown>, fixture: Awaited<ReturnType<typeof assignmentFixture>>) => {
+      let diffCalls = 0;
+      fixture.host.harness.sdk.stub("environments.diff", (async () => { diffCalls += 1; return diffCalls === 1 ? { outcome: "available" } : { outcome: "unavailable" }; }) as never);
+      return _attempt;
+    }],
     ["foreign bb server", (attempt: Record<string, unknown>) => ({ ...attempt, reviewCandidateEnvironment: { ...(attempt.reviewCandidateEnvironment as Record<string, unknown>), bbServerId: "foreign-server" } })],
     ["ancestry drift", (_attempt: Record<string, unknown>, _fixture: Awaited<ReturnType<typeof assignmentFixture>>, status: Record<string, unknown>) => ({ ..._attempt, _status: { ...status, workspace: { ...(status.workspace as Record<string, unknown>), mergeBase: { ...(status.workspace as Record<string, unknown>).mergeBase as Record<string, unknown>, behindCount: 1 } } } })],
     ["target drift", (_attempt: Record<string, unknown>, fixture: Awaited<ReturnType<typeof assignmentFixture>>) => { fixture.host.harness.sdk.stub("projects.get", (async () => ({ ...projectFacts(), sources: [{ ...projectFacts().sources[0]!, path: "/workspace/foreign" }] })) as never); return _attempt; }],
+    ["reviewer generation drift", (attempt: Record<string, unknown>) => ({ ...attempt, reviewRoleGeneration: 1 })],
+    ["frozen brief digest drift", (attempt: Record<string, unknown>) => ({ ...attempt, reviewFrozenBriefDigest: "c".repeat(64) })],
+    ["return path drift", (attempt: Record<string, unknown>) => ({ ...attempt, reviewReturnPath: { threadId: "thread-foreign", statuses: ["DONE", "BLOCKED", "WAITING"] } })],
   ] as const)("refuses local review %s before intent or spawn", async (_name, mutate) => {
     const fixture = await assignmentFixture({ withoutGithubIssues: true });
+    activateReviewer(fixture.db, fixture.fenceToken);
+    const frozenBrief = "Review the exact local candidate and return one qualified verdict.";
     const candidateEnvironment = { bbServerId: fixture.host.bb.server.loopbackBaseUrl, environmentId: ROLE_ENVIRONMENT_ID, sourceId: "source-main", hostId: "host-main", path: "/workspace/project", mode: "managed-worktree" as const };
     const baseAttempt: Record<string, unknown> = {
       laneId: "lane-local-review", threadId: "thread-local-review", assignmentKind: "review", requestedProfile: ROLE_PROFILE, candidateKind: "local",
       reviewBaseSha: BASE_SHA, reviewCandidateSha: CANDIDATE_SHA, reviewCandidateEnvironment: candidateEnvironment,
       reviewCandidateCheckout: { branchName: "bb/local-review", headSha: CANDIDATE_SHA }, reviewCandidateObservation: { clean: true, reachable: true },
+      reviewRoleRequirementId: "reviewer-v1", reviewRoleId: "independent-reviewer", reviewRoleGeneration: 2,
+      reviewFrozenBriefVersion: 1, reviewFrozenBriefContent: frozenBrief, reviewFrozenBriefDigest: sha256(frozenBrief),
+      reviewReturnPath: { threadId: ROLE_THREAD_ID, statuses: ["DONE", "BLOCKED", "WAITING"] },
     };
     const status = {
       outcome: "available",
@@ -5485,13 +5531,58 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, { idempotencyKey: `local-review-pending-${_name}`, workAttempt: undefined })).outcome).toBe("OK");
     if (mutated._status) fixture.host.harness.sdk.stub("environments.status", (async () => mutatedStatus) as never);
     const before = exportFoundation(fixture.db, PROJECT_ID);
-    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
-      request: transitionRequest(fixture.fenceToken, undefined, 4, { idempotencyKey: `local-review-dispatch-${_name}`, workAttempt: reviewAttempt as never }),
-      spawn: dispatchSpawn(ROLE_THREAD_ID, { environment: { type: "reuse", environmentId: ROLE_ENVIRONMENT_ID } }),
-    }, { projectId: PROJECT_ID, threadId: ROLE_THREAD_ID }) as string);
+    let result: { outcome: string };
+    try {
+      result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: transitionRequest(fixture.fenceToken, undefined, 4, { idempotencyKey: `local-review-dispatch-${_name}`, workAttempt: reviewAttempt as never }),
+        spawn: dispatchSpawn(ROLE_THREAD_ID, { environment: { type: "reuse", environmentId: ROLE_ENVIRONMENT_ID } }),
+      }, { projectId: PROJECT_ID, threadId: ROLE_THREAD_ID }) as string) as { outcome: string };
+    } catch {
+      result = { outcome: "INVALID_INPUT" };
+    }
     expect(result.outcome).not.toBe("OK");
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
     expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("does not spawn when the exact local candidate moves after preflight", async () => {
+    const fixture = await assignmentFixture({ withoutGithubIssues: true });
+    activateReviewer(fixture.db, fixture.fenceToken);
+    const frozenBrief = "Review the exact local candidate and return one qualified verdict.";
+    const candidateEnvironment = { bbServerId: fixture.host.bb.server.loopbackBaseUrl, environmentId: ROLE_ENVIRONMENT_ID, sourceId: "source-main", hostId: "host-main", path: "/workspace/project", mode: "managed-worktree" as const };
+    const reviewAttempt = {
+      laneId: "lane-local-review", threadId: "thread-local-review", assignmentKind: "review" as const, requestedProfile: ROLE_PROFILE, candidateKind: "local" as const,
+      reviewBaseSha: BASE_SHA, reviewCandidateSha: CANDIDATE_SHA, reviewCandidateEnvironment: candidateEnvironment,
+      reviewCandidateCheckout: { branchName: "bb/local-review", headSha: CANDIDATE_SHA }, reviewCandidateObservation: { clean: true as const, reachable: true as const },
+      reviewRoleRequirementId: "reviewer-v1", reviewRoleId: "independent-reviewer" as const, reviewRoleGeneration: 2,
+      reviewFrozenBriefVersion: 1 as const, reviewFrozenBriefContent: frozenBrief, reviewFrozenBriefDigest: sha256(frozenBrief),
+      reviewReturnPath: { threadId: ROLE_THREAD_ID, statuses: ["DONE", "BLOCKED", "WAITING"] as ["DONE", "BLOCKED", "WAITING"] },
+    };
+    const validStatus = {
+      outcome: "available",
+      workspace: {
+        checkout: { kind: "branch", branchName: "bb/local-review", headSha: CANDIDATE_SHA },
+        mergeBase: { aheadCount: 1, baseRef: BASE_SHA, behindCount: 0, commits: [], deletions: 0, files: [], hasCommittedUnmergedChanges: true, insertions: 0, lineStatsComplete: true, mergeBaseBranch: BASE_SHA },
+        workingTree: { deletions: 0, files: [], hasUncommittedChanges: false, insertions: 0, lineStatsComplete: true, state: "committed_unmerged" },
+      },
+    };
+    let statusCalls = 0;
+    fixture.host.harness.sdk.stub("environments.diff", (async () => ({ outcome: "available" })) as never);
+    fixture.host.harness.sdk.stub("environments.status", (async () => {
+      statusCalls += 1;
+      return statusCalls === 1 ? validStatus : { ...validStatus, workspace: { ...validStatus.workspace, checkout: { ...validStatus.workspace.checkout, headSha: H1_CANDIDATE_SHA } } };
+    }) as never);
+    fixture.host.harness.sdk.stub("threads.spawn", (async () => { throw new Error("spawn must not be reached"); }) as never);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, { idempotencyKey: "late-move-review-pending", workAttempt: undefined })).outcome).toBe("OK");
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, undefined, 4, { idempotencyKey: "late-move-review-dispatch", workAttempt: reviewAttempt }),
+      spawn: dispatchSpawn(ROLE_THREAD_ID, { environment: { type: "reuse", environmentId: ROLE_ENVIRONMENT_ID } }),
+    }, { projectId: PROJECT_ID, threadId: ROLE_THREAD_ID }) as string);
+    expect(result.outcome).toBe("EXTERNAL_RESPONSE_INVALID");
+    expect(statusCalls).toBe(2);
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? ORDER BY attempt_ordinal DESC LIMIT 1").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ state: "prepared", thread_id: null });
   });
 
   it("refuses a changed dispatch target before the durable intent or native spawn", async () => {
@@ -9591,19 +9682,19 @@ else printf '%s\\n' '[]'; fi
     const db = new Database(":memory:");
     databaseIsReady(db);
     try {
-    for (const statement of MIGRATIONS.slice(0, -19)) db.exec(statement);
+    for (const statement of MIGRATIONS.slice(0, -20)) db.exec(statement);
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, '{}', ?, 1)").run(PROJECT_ID, sha256("{}"));
       db.prepare("INSERT INTO project_config_heads (project_id, config_revision, updated_at_ms) VALUES (?, 1, 1)").run(PROJECT_ID);
       db.prepare(`INSERT INTO operator_messages (project_id, recipient, sender_thread_id, severity, message_text, created_at_ms, reply_text, reply_delivery_error) VALUES (?, 'operator', 'fixture-thread', 'routine', 'failed delivery', 10, 'reply retained', 'delivery failed')`).run(PROJECT_ID);
-      db.exec(MIGRATIONS.at(-8)!);
+      db.exec(MIGRATIONS.at(-9)!);
       expect(db.prepare("SELECT reply_text, reply_delivery_error, replied_at_ms, archived_at_ms FROM operator_messages").get()).toEqual({ reply_text: "reply retained", reply_delivery_error: "delivery failed", replied_at_ms: null, archived_at_ms: null });
     } finally { db.close(); }
   });
 
   it("appends authority-root schema and bumps the runtime contract", () => {
-    expect(SCHEMA_VERSION).toBe(34);
-    expect(RUNTIME_CONTRACT_VERSION).toBe(29);
-    expect(MIGRATIONS).toHaveLength(47);
+    expect(SCHEMA_VERSION).toBe(35);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(30);
+    expect(MIGRATIONS).toHaveLength(48);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
     expect(sha256(MIGRATIONS.slice(0, GH636_PREVIOUS_MIGRATION_ID + 1).join("\n"))).toBe("b8beac282f4b36cf0dca454f3be9ffc11bae6a3d2c66388c9e43210928e4a5c8");
@@ -9627,9 +9718,9 @@ else printf '%s\\n' '[]'; fi
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 32,
-      newSchemaVersion: 34,
+      newSchemaVersion: 35,
       oldContractVersion: 27,
-      newContractVersion: 29,
+      newContractVersion: 30,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -9637,22 +9728,22 @@ else printf '%s\\n' '[]'; fi
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(20, 22))).toMatchObject({
       oldSchemaVersion: 32,
-      newSchemaVersion: 34,
+      newSchemaVersion: 35,
       oldContractVersion: 27,
-      newContractVersion: 29,
+      newContractVersion: 30,
       action: "refused",
       expected: 4,
       attempted: 4,
       verified: 0,
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ action: "refused", verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(34, 29))).toMatchObject({ action: "reread", verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 30))).toMatchObject({ action: "reread", verified: 4 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 32,
-      newSchemaVersion: 34,
+      newSchemaVersion: 35,
       oldContractVersion: 27,
-      newContractVersion: 29,
+      newContractVersion: 30,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -9696,7 +9787,7 @@ else printf '%s\\n' '[]'; fi
     databaseIsReady(db);
     const projectId = "proj_gh200_migration";
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -12)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -13)) db.exec(statement); })();
       for (const configRevision of [5, 6]) {
         db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, ?, '{}', ?, ?)")
           .run(projectId, configRevision, sha256("{}"), configRevision);
@@ -9733,7 +9824,7 @@ else printf '%s\\n' '[]'; fi
          WHERE work_items.project_id = ? ORDER BY work_items.work_item_id`,
       ).all(projectId);
       const before = snapshot();
-      db.transaction(() => db.exec(MIGRATIONS.at(-13)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-14)!))();
       expect(snapshot()).toEqual(before);
       expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
       expect(db.prepare("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
@@ -9750,15 +9841,15 @@ else printf '%s\\n' '[]'; fi
     const projectId = "proj_gh295_migration";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -17)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -18)) db.exec(statement);
       })();
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, '{}', ?, 1)").run(projectId, sha256("{}"));
       db.prepare("INSERT INTO repository_targets (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest) VALUES (?, 'target-main', 1, 'source', 'host', '/migration', NULL, 'main', 'target-digest')").run(projectId);
       db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, 'historical', 1, 'target-main', 'Historical', 'preserve me', 'in_progress', 3, 10, 20)").run(projectId);
       const beforeRows = db.prepare("SELECT * FROM work_items WHERE project_id = ?").all(projectId);
-      const priorStatementDigests = MIGRATIONS.slice(0, -17).map(sha256);
-      db.transaction(() => db.exec(MIGRATIONS.at(-18)!))();
-      expect(MIGRATIONS.slice(0, -17).map(sha256)).toEqual(priorStatementDigests);
+      const priorStatementDigests = MIGRATIONS.slice(0, -18).map(sha256);
+      db.transaction(() => db.exec(MIGRATIONS.at(-19)!))();
+      expect(MIGRATIONS.slice(0, -18).map(sha256)).toEqual(priorStatementDigests);
       expect(db.prepare("SELECT * FROM work_items WHERE project_id = ?").all(projectId)).toEqual(beforeRows);
       expect(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'work_items'").get()).toMatchObject({ sql: expect.stringContaining("review_pending") });
       db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, 'reviewable', 1, 'target-main', 'Reviewable', 'new state', 'review_pending', 1, 30, 30)").run(projectId);
@@ -9774,7 +9865,7 @@ else printf '%s\\n' '[]'; fi
     databaseIsReady(db);
     const projectId = "proj_review_linkage_migration";
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -15)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -16)) db.exec(statement); })();
       const configJson = "{}";
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, ?, ?, 1)").run(projectId, configJson, sha256(configJson));
       db.prepare("INSERT INTO project_config_heads (project_id, config_revision, updated_at_ms) VALUES (?, 1, 1)").run(projectId);
@@ -9789,7 +9880,7 @@ else printf '%s\\n' '[]'; fi
       const before = db.prepare(`SELECT ${existingColumns.join(", ")} FROM execution_attempts`).all();
       const rowCount = (db.prepare("SELECT COUNT(*) AS count FROM execution_attempts").get() as { count: number }).count;
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-15)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-16)!))();
 
       expect((db.prepare("SELECT COUNT(*) AS count FROM execution_attempts").get() as { count: number }).count).toBe(rowCount);
       expect(db.prepare(`SELECT ${existingColumns.join(", ")} FROM execution_attempts`).all()).toEqual(before);
@@ -9805,7 +9896,7 @@ else printf '%s\\n' '[]'; fi
     const db = new Database(":memory:");
     databaseIsReady(db);
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -14)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -15)) db.exec(statement); })();
       db.pragma("foreign_keys = OFF");
       db.prepare("INSERT INTO project_config_revisions VALUES ('project', 1, '{}', 'config-digest', 1)").run();
       db.prepare("INSERT INTO repository_targets VALUES ('project', 'target', 1, 'source', 'host', '/target', NULL, 'main', 'target-digest')").run();
@@ -9837,11 +9928,11 @@ else printf '%s\\n' '[]'; fi
         eligibility: db.prepare("SELECT profile_digest, derivation_digest FROM eligibility_projections").get(),
         generation: db.prepare("SELECT holder_executed_profile_digest, holder_context_digest, eligibility_derivation_digest FROM role_generations").get(),
       };
-      const priorStatementDigests = MIGRATIONS.slice(0, -13).map(sha256);
+      const priorStatementDigests = MIGRATIONS.slice(0, -14).map(sha256);
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-14)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-15)!))();
 
-      expect(MIGRATIONS.slice(0, -13).map(sha256)).toEqual(priorStatementDigests);
+      expect(MIGRATIONS.slice(0, -14).map(sha256)).toEqual(priorStatementDigests);
       expect(db.prepare("SELECT requested_provider_id, requested_model, requested_reasoning_level, requested_permission_mode, requested_service_tier, requested_visibility, requested_profile_digest, attempt_digest FROM execution_attempts").get()).toEqual(Object.fromEntries(Object.entries(before.attempt as Record<string, unknown>).map(([name, value]) => [name.replace(/^actual_/u, "requested_"), value])));
       expect(db.prepare("SELECT requested_profile_digest, requested_provider_id, requested_model, requested_reasoning_level, requested_permission_mode, requested_service_tier, requested_visibility, evidence_digest, observation_digest FROM qualification_observations").get()).toEqual({
         requested_profile_digest: "legacy-profile-digest", requested_provider_id: "provider", requested_model: "model",
@@ -9885,7 +9976,7 @@ else printf '%s\\n' '[]'; fi
     databaseIsReady(db);
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -16)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -17)) db.exec(statement);
       })();
       const legacyResult = JSON.stringify({
         projectId: "proj_backfill_legacy",
@@ -9906,7 +9997,7 @@ else printf '%s\\n' '[]'; fi
         "SELECT project_id, epoch_created_at_ms, state, result_json, created_at_ms, updated_at_ms FROM work_item_github_backfills",
       ).get();
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-16)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-17)!))();
 
       expect((db.prepare("PRAGMA table_info(work_item_github_backfills)").all() as Array<{ name: string }>).map((column) => column.name)).toEqual([
         "project_id", "epoch_created_at_ms", "state", "result_json", "created_at_ms", "updated_at_ms", "config_revision", "attempt_reason",
@@ -9921,9 +10012,9 @@ else printf '%s\\n' '[]'; fi
   });
 
   it("assembles the production v22 cached-consumer rollout receipt with stale-v21 refusal semantics", async () => {
-    expect(RUNTIME_CONTRACT_VERSION).toBe(29);
-    expect(SCHEMA_VERSION).toBe(34);
-    expect(MIGRATIONS).toHaveLength(47);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(30);
+    expect(SCHEMA_VERSION).toBe(35);
+    expect(MIGRATIONS).toHaveLength(48);
     expect(contractDigest).not.toBe("d4e51b0b1fd68957120cea5febb7762d6c3b9eddab76f67916e556830b062b83");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
@@ -9940,7 +10031,7 @@ else printf '%s\\n' '[]'; fi
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 34, observedContractVersion: 29 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 35, observedContractVersion: 30 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -10170,7 +10261,8 @@ else printf '%s\\n' '[]'; fi
         .filter((name) => table !== "execution_attempts" || ![
           "terminalization_class", "terminal_report_json", "terminal_actual_profile_digest", "interruption_reason",
           "interruption_event_id", "interruption_event_seq", "interruption_turn_id", "interruption_evidence_digest",
-          "review_candidate_kind", "review_candidate_json",
+          "review_candidate_kind", "review_candidate_json", "review_role_requirement_id", "review_role_id", "review_role_generation",
+          "review_frozen_brief_version", "review_frozen_brief_content", "review_frozen_brief_digest", "review_return_path_json", "dispatch_input_digest",
         ].includes(name));
       const order = table === "execution_attempts"
         ? "project_id, execution_attempt_id"
@@ -10186,7 +10278,7 @@ else printf '%s\\n' '[]'; fi
     const dispositionDigest = () => sha256(canonicalJson(db.prepare("SELECT decision_id, disposition_sequence, disposition, actor_receipt_id FROM decision_dispositions ORDER BY decision_id, disposition_sequence").all()));
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -4)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -5)) db.exec(statement);
       })();
       db.pragma("defer_foreign_keys = ON");
       db.transaction(() => {
@@ -10323,7 +10415,7 @@ else printf '%s\\n' '[]'; fi
     const projectId = "proj_gh300_rebuild";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -19)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -20)) db.exec(statement);
       })();
       db.pragma("foreign_keys = OFF");
       const insert = (table: string, row: Record<string, unknown>) => {
@@ -10381,7 +10473,7 @@ else printf '%s\\n' '[]'; fi
       const before = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
       expect(Object.values(before).every((value) => value !== null)).toBe(true);
       expect(new Set(Object.values(before).map((value) => String(value))).size).toBeGreaterThan(20);
-      db.transaction(() => db.exec(MIGRATIONS.at(-19)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-20)!))();
       const after = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
       expect(Object.fromEntries(columns.map((column) => [column, after[column]]))).toEqual(Object.fromEntries(columns.map((column) => [column, before[column]])));
       expect(after.progress_json).toBe("{}");
@@ -10419,9 +10511,9 @@ else printf '%s\\n' '[]'; fi
     try {
       const executed: number[] = [];
       migrateCanonicalStore(succeeded, (database, statements) => sdkMigrate(database, statements, executed));
-      expect(executed).toEqual([GH636_REPAIR_MIGRATION_ID, GH637_DOMAIN_MIGRATION_ID, GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID]);
+      expect(executed).toEqual([GH636_REPAIR_MIGRATION_ID, GH637_DOMAIN_MIGRATION_ID, GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID, GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION_ID]);
       expect(succeeded.prepare("SELECT id FROM _bb_migrations ORDER BY id").all()).toEqual(
-        Array.from({ length: GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID + 1 }, (_, id) => ({ id })),
+        Array.from({ length: GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION_ID + 1 }, (_, id) => ({ id })),
       );
       expect(succeeded.pragma("integrity_check", { simple: true })).toBe("ok");
       expect(succeeded.pragma("foreign_key_check")).toEqual([]);
@@ -10494,13 +10586,13 @@ else printf '%s\\n' '[]'; fi
 
       const executed: number[] = [];
       migrateCanonicalStore(db, (database, statements) => migrateWithLedger(database, statements, executed));
-      expect(executed).toEqual([GH637_DOMAIN_MIGRATION_ID, GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID]);
+      expect(executed).toEqual([GH637_DOMAIN_MIGRATION_ID, GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID, GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION_ID]);
       expect(db.prepare("SELECT project_id, config_revision, domain_id FROM orchestration_domains").all()).toEqual([
         { project_id: projectId, config_revision: 1, domain_id: "default" },
       ]);
       expect(db.prepare("SELECT domain_id, task_class FROM work_items").get()).toEqual({ domain_id: "default", task_class: "default" });
       expect(db.prepare("SELECT id FROM _bb_migrations ORDER BY id").all()).toEqual(
-        Array.from({ length: GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID + 1 }, (_, id) => ({ id })),
+        Array.from({ length: GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION_ID + 1 }, (_, id) => ({ id })),
       );
       expect(db.pragma("integrity_check", { simple: true })).toBe("ok");
       expect(db.pragma("foreign_key_check")).toEqual([]);
@@ -10564,8 +10656,8 @@ else printf '%s\\n' '[]'; fi
     const before = exportFoundation(db, PROJECT_ID);
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
-      observedSchemaVersion: 34,
-      observedContractVersion: 29,
+      observedSchemaVersion: 35,
+      observedContractVersion: 30,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -10647,7 +10739,7 @@ else printf '%s\\n' '[]'; fi
       evidence: {
         cachedConsumers: {
           oldContractVersion: 27,
-          newContractVersion: 29,
+          newContractVersion: 30,
           action: "unknown",
           expected: 4,
           attempted: 0,
@@ -10795,7 +10887,7 @@ else printf '%s\\n' '[]'; fi
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 34, schemaDigest, contractVersion: 29, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 35, schemaDigest, contractVersion: 30, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -12025,8 +12117,8 @@ else printf '%s\\n' '[]'; fi
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 32, newSchemaVersion: 34, action: "unknown", expected: 4, attempted: 0, verified: 0 },
-        schema: { version: 34 },
+        cachedConsumers: { oldSchemaVersion: 32, newSchemaVersion: 35, action: "unknown", expected: 4, attempted: 0, verified: 0 },
+        schema: { version: 35 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -14626,7 +14718,7 @@ else printf '%s\\n' '[]'; fi
     db.exec("DROP TABLE execution_attempts; DROP TABLE assignments");
     db.pragma("foreign_keys = ON");
     db.exec(MIGRATIONS.find((statement) => statement.includes("CREATE TABLE IF NOT EXISTS assignments"))!);
-    for (const statement of MIGRATIONS.at(-14)!.split(";").filter((statement) => statement.includes("ALTER TABLE execution_attempts"))) db.exec(statement);
+    for (const statement of MIGRATIONS.at(-15)!.split(";").filter((statement) => statement.includes("ALTER TABLE execution_attempts"))) db.exec(statement);
     expect(db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(exportFoundation(db, PROJECT_ID));
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
@@ -14646,10 +14738,10 @@ else printf '%s\\n' '[]'; fi
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 29, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 29, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 29, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(34, 29))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 34, oldContractVersion: 27, newContractVersion: 29, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 30, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 30, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 30, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 30))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 30, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 

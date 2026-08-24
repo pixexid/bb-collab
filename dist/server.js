@@ -14772,8 +14772,8 @@ function assertGithubIssueBriefBinding(brief, expected) {
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var RUNTIME_CONTRACT_VERSION = 29;
-var SCHEMA_VERSION = 34;
+var RUNTIME_CONTRACT_VERSION = 30;
+var SCHEMA_VERSION = 35;
 var PREVIOUS_RUNTIME_CONTRACT_VERSION = 27;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
@@ -16211,6 +16211,23 @@ var GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION = `
 `;
 MIGRATIONS.push(GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION);
 var GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID = MIGRATIONS.length - 1;
+var GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION = `
+  ALTER TABLE execution_attempts ADD COLUMN review_role_requirement_id TEXT;
+  ALTER TABLE execution_attempts ADD COLUMN review_role_id TEXT;
+  ALTER TABLE execution_attempts ADD COLUMN review_role_generation INTEGER
+    CHECK (review_role_generation IS NULL OR review_role_generation > 0);
+  ALTER TABLE execution_attempts ADD COLUMN review_frozen_brief_version INTEGER
+    CHECK (review_frozen_brief_version IS NULL OR review_frozen_brief_version = 1);
+  ALTER TABLE execution_attempts ADD COLUMN review_frozen_brief_content TEXT;
+  ALTER TABLE execution_attempts ADD COLUMN review_frozen_brief_digest TEXT
+    CHECK (review_frozen_brief_digest IS NULL OR review_frozen_brief_digest GLOB '[0-9a-f]*');
+  ALTER TABLE execution_attempts ADD COLUMN review_return_path_json TEXT
+    CHECK (review_return_path_json IS NULL OR json_valid(review_return_path_json));
+  ALTER TABLE execution_attempts ADD COLUMN dispatch_input_digest TEXT
+    CHECK (dispatch_input_digest IS NULL OR dispatch_input_digest GLOB '[0-9a-f]*');
+`;
+MIGRATIONS.push(GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION);
+var GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION_ID = MIGRATIONS.length - 1;
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
 var GH300_BACKFILL_MIGRATION_ID = MIGRATIONS.findIndex((statement) => statement.includes("CREATE TABLE execution_attempts_gh300"));
 var CACHED_CONSUMERS = [
@@ -16426,7 +16443,9 @@ var contractDigest = sha256(canonicalJson({
     pullRequest: "exact positive PR number plus lowercase 40-hex head SHA",
     local: ["base SHA exists in the candidate repository", "candidate SHA exists as the exact checkout HEAD", "managed-worktree environment", "branch checkout", "clean reachable observation", "candidate server identity", "base-ancestor merge proof", "target source identity"],
     exclusivity: "PR identity and local identity are mutually exclusive",
-    probe: "never a review"
+    probe: "never a review",
+    authority: "local reviews persist exact reviewer requirement/generation, frozen brief/return path, and native input digest",
+    finalObservation: "local candidate is rechecked immediately before every native spawn or retry"
   },
   directorSeatPolicy: {
     roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
@@ -16834,6 +16853,10 @@ var reviewCandidateObservationSchema = external_exports.object({
   clean: external_exports.literal(true),
   reachable: external_exports.literal(true)
 }).strict();
+var reviewReturnPathSchema = external_exports.object({
+  threadId: id,
+  statuses: external_exports.tuple([external_exports.literal("DONE"), external_exports.literal("BLOCKED"), external_exports.literal("WAITING")])
+}).strict();
 var executionProfileSchema = external_exports.object({
   providerId: id,
   model: id,
@@ -16854,7 +16877,15 @@ var workAttemptSchema = external_exports.object({
   reviewCandidateSha: gitShaSchema.optional(),
   reviewCandidateEnvironment: reviewCandidateEnvironmentSchema.optional(),
   reviewCandidateCheckout: reviewCandidateCheckoutSchema.optional(),
-  reviewCandidateObservation: reviewCandidateObservationSchema.optional()
+  reviewCandidateObservation: reviewCandidateObservationSchema.optional(),
+  reviewRoleRequirementId: id.optional(),
+  reviewRoleId: external_exports.literal("independent-reviewer").optional(),
+  reviewRoleGeneration: external_exports.number().int().positive().optional(),
+  reviewFrozenBriefVersion: external_exports.literal(1).optional(),
+  reviewFrozenBriefContent: external_exports.string().max(256 * 1024).optional(),
+  reviewFrozenBriefDigest: digestSchema.optional(),
+  reviewReturnPath: reviewReturnPathSchema.optional(),
+  dispatchInputDigest: digestSchema.optional()
 }).strict().superRefine((attempt, ctx) => {
   const reviewFields = [
     attempt.candidateKind,
@@ -16864,7 +16895,15 @@ var workAttemptSchema = external_exports.object({
     attempt.reviewCandidateSha,
     attempt.reviewCandidateEnvironment,
     attempt.reviewCandidateCheckout,
-    attempt.reviewCandidateObservation
+    attempt.reviewCandidateObservation,
+    attempt.reviewRoleRequirementId,
+    attempt.reviewRoleId,
+    attempt.reviewRoleGeneration,
+    attempt.reviewFrozenBriefVersion,
+    attempt.reviewFrozenBriefContent,
+    attempt.reviewFrozenBriefDigest,
+    attempt.reviewReturnPath,
+    attempt.dispatchInputDigest
   ];
   const linked = reviewFields.some((value) => value !== void 0);
   if (attempt.assignmentKind !== "review") {
@@ -16879,7 +16918,7 @@ var workAttemptSchema = external_exports.object({
     if (attempt.reviewPrNumber === void 0 || attempt.reviewPrHeadSha === void 0) {
       ctx.addIssue({ code: "custom", message: "pull-request reviews require an exact PR number and head SHA" });
     }
-    if (attempt.reviewBaseSha !== void 0 || attempt.reviewCandidateSha !== void 0 || attempt.reviewCandidateEnvironment !== void 0 || attempt.reviewCandidateCheckout !== void 0 || attempt.reviewCandidateObservation !== void 0) {
+    if (attempt.reviewBaseSha !== void 0 || attempt.reviewCandidateSha !== void 0 || attempt.reviewCandidateEnvironment !== void 0 || attempt.reviewCandidateCheckout !== void 0 || attempt.reviewCandidateObservation !== void 0 || attempt.reviewRoleRequirementId !== void 0 || attempt.reviewRoleId !== void 0 || attempt.reviewRoleGeneration !== void 0 || attempt.reviewFrozenBriefVersion !== void 0 || attempt.reviewFrozenBriefContent !== void 0 || attempt.reviewFrozenBriefDigest !== void 0 || attempt.reviewReturnPath !== void 0 || attempt.dispatchInputDigest !== void 0) {
       ctx.addIssue({ code: "custom", message: "pull-request reviews cannot carry local candidate identity" });
     }
   } else {
@@ -16891,6 +16930,15 @@ var workAttemptSchema = external_exports.object({
     }
     if (attempt.reviewCandidateSha !== void 0 && attempt.reviewCandidateCheckout !== void 0 && attempt.reviewCandidateSha !== attempt.reviewCandidateCheckout.headSha) {
       ctx.addIssue({ code: "custom", path: ["reviewCandidateCheckout", "headSha"], message: "local checkout head must equal the candidate SHA" });
+    }
+    if (attempt.reviewRoleRequirementId === void 0 || attempt.reviewRoleId === void 0 || attempt.reviewRoleGeneration === void 0) {
+      ctx.addIssue({ code: "custom", message: "local reviews require the exact reviewer requirement and generation" });
+    }
+    if (attempt.reviewFrozenBriefVersion === void 0 || attempt.reviewFrozenBriefContent === void 0 || attempt.reviewFrozenBriefDigest === void 0 || attempt.reviewReturnPath === void 0) {
+      ctx.addIssue({ code: "custom", message: "local reviews require a frozen brief and explicit return path" });
+    }
+    if (attempt.reviewFrozenBriefContent !== void 0 && attempt.reviewFrozenBriefDigest !== void 0 && sha256(attempt.reviewFrozenBriefContent) !== attempt.reviewFrozenBriefDigest) {
+      ctx.addIssue({ code: "custom", path: ["reviewFrozenBriefDigest"], message: "frozen brief digest must equal the brief content" });
     }
   }
 });
@@ -17718,6 +17766,21 @@ function dispatchRoleRequirement(db, projectId, configRevision, repoTargetId, do
   if (requirements.length !== 1) throw refusal("PROJECT_CONFIG_STALE", "the exact worker role requirement is missing or ambiguous across the config revision");
   return { ...requirements[0], domainId };
 }
+function dispatchReviewerAuthority(db, projectId, configRevision, repoTargetId, domainId, requirement) {
+  const head = asRow(db.prepare(
+    "SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = 'independent-reviewer' AND domain_id = ?"
+  ).get(projectId, domainId));
+  if (!head) throw refusal("ROLE_HEAD_UNAVAILABLE", "local review requires a current independent-reviewer generation");
+  const rows = db.prepare(
+    `SELECT role_id, generation
+       FROM role_generations
+      WHERE project_id = ? AND role_id = 'independent-reviewer' AND domain_id = ?
+        AND generation = ? AND role_requirement_id = ? AND config_revision = ?
+        AND repo_target_id = ? AND status = 'active'`
+  ).all(projectId, domainId, head.current_generation, requirement.roleRequirementId, configRevision, repoTargetId);
+  if (rows.length !== 1 || rows[0].role_id !== "independent-reviewer") throw refusal("ROLE_NOT_ACTIVE", "local review requires one exact active independent-reviewer generation");
+  return { roleRequirementId: requirement.roleRequirementId, roleId: "independent-reviewer", roleGeneration: rows[0].generation };
+}
 function proveWorkItemDispatchConfig(db, request, committedConfigRevision) {
   const head = currentConfig(db, request.projectId);
   if (!head) throw refusal("PROJECT_CONFIG_REQUIRED", "project has no stored config revision");
@@ -17758,6 +17821,7 @@ function proveWorkItemDispatchConfig(db, request, committedConfigRevision) {
   if (assignmentKind === "probe") throw refusal("WORK_ITEM_STATE_INVALID", "probe cannot use WorkItem lane dispatch");
   const historicalRole = dispatchRoleRequirement(db, request.projectId, workItem.config_revision, request.repoTargetId, workItem.domain_id, workItem.task_class, assignmentKind);
   const currentRole = dispatchRoleRequirement(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, workItem.task_class, assignmentKind);
+  const reviewerAuthority = assignmentKind === "review" && request.candidateKind === "local" ? dispatchReviewerAuthority(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, currentRole) : void 0;
   const requestedProfile = dispatchProfileIdentity(request.requestedProfile);
   if (!dispatchProfileMatches(request.requestedProfile, historicalRole.executedProfile) || !dispatchProfileMatches(request.requestedProfile, currentRole.executedProfile)) {
     throw refusal("PROJECT_CONFIG_STALE", "dispatch profile does not equal the exact historical and current worker requirement");
@@ -17772,7 +17836,8 @@ function proveWorkItemDispatchConfig(db, request, committedConfigRevision) {
     taskClass: workItem.task_class,
     assignmentKind,
     roleRequirement: historicalRole,
-    target: dispatchTargetIdentity(historicalTarget)
+    target: dispatchTargetIdentity(historicalTarget),
+    ...reviewerAuthority === void 0 ? {} : { reviewerAuthority }
   };
   const currentDispatchConfig = {
     permissionMode: JSON.parse(currentConfigJson).permissionMode,
@@ -17782,7 +17847,8 @@ function proveWorkItemDispatchConfig(db, request, committedConfigRevision) {
     taskClass: workItem.task_class,
     assignmentKind,
     roleRequirement: currentRole,
-    target: dispatchTargetIdentity(currentTarget)
+    target: dispatchTargetIdentity(currentTarget),
+    ...reviewerAuthority === void 0 ? {} : { reviewerAuthority }
   };
   if (canonicalJson(historicalDispatchConfig) !== canonicalJson(currentDispatchConfig)) {
     throw refusal("PROJECT_CONFIG_STALE", "dispatch-relevant config authority is not equivalent across revisions", {
@@ -17813,6 +17879,11 @@ function proveWorkItemDispatchConfig(db, request, committedConfigRevision) {
     domainId: workItem.domain_id,
     taskClass: workItem.task_class,
     assignmentKind,
+    ...reviewerAuthority === void 0 ? {} : {
+      reviewerRoleRequirementId: reviewerAuthority.roleRequirementId,
+      reviewerRoleId: reviewerAuthority.roleId,
+      reviewerRoleGeneration: reviewerAuthority.roleGeneration
+    },
     continued: workItem.config_revision !== currentConfigRevision,
     proofDigest: sha256(canonicalJson(proof))
   };
@@ -20436,6 +20507,10 @@ function reviewCandidateMatches(row, attempt) {
   const candidate = reviewCandidateFromAttempt(attempt);
   return candidate !== null && row.review_candidate_kind === candidate.candidateKind && row.review_candidate_json === canonicalJson(candidate);
 }
+function reviewAuthorityMatches(row, attempt) {
+  if (attempt.assignmentKind !== "review" || attempt.candidateKind !== "local") return true;
+  return row.review_role_requirement_id === attempt.reviewRoleRequirementId && row.review_role_id === attempt.reviewRoleId && row.review_role_generation === attempt.reviewRoleGeneration && row.review_frozen_brief_version === attempt.reviewFrozenBriefVersion && row.review_frozen_brief_content === attempt.reviewFrozenBriefContent && row.review_frozen_brief_digest === attempt.reviewFrozenBriefDigest && row.review_return_path_json === canonicalJson(attempt.reviewReturnPath);
+}
 var ACTIVE_WORK_ATTEMPT_STATES = WORK_ITEM_CAPACITY_ATTEMPT_STATES;
 var WORK_ITEM_THREAD_TOKEN = /thr_[A-Za-z0-9]+/gu;
 var WORK_ITEM_LANE_SENTENCE = /^(?:Lane|Writing lane) (thr_[A-Za-z0-9]+)(?:[,.!?])?(?:[ \t]+|\r?\n|$)/u;
@@ -20447,7 +20522,18 @@ function parseBackfillLane(body) {
   return { token: leading[1], strippedBody: body.slice(leading[0].length) };
 }
 function workAttemptId(input) {
-  return sha256(canonicalJson({ origin: "work_item", ...input, domainId: input.domainId ?? "default" }));
+  return sha256(canonicalJson({
+    origin: "work_item",
+    ...input,
+    domainId: input.domainId ?? "default",
+    reviewRoleRequirementId: input.reviewRoleRequirementId ?? null,
+    reviewRoleId: input.reviewRoleId ?? null,
+    reviewRoleGeneration: input.reviewRoleGeneration ?? null,
+    reviewFrozenBriefVersion: input.reviewFrozenBriefVersion ?? null,
+    reviewFrozenBriefContent: input.reviewFrozenBriefContent ?? null,
+    reviewFrozenBriefDigest: input.reviewFrozenBriefDigest ?? null,
+    reviewReturnPathJson: input.reviewReturnPathJson ?? null
+  }));
 }
 function insertWorkItemAttempt(db, input) {
   const executionAttemptId = workAttemptId(input);
@@ -20465,6 +20551,14 @@ function insertWorkItemAttempt(db, input) {
     reviewPrHeadSha: input.reviewPrHeadSha,
     reviewCandidateKind: input.reviewCandidateKind,
     reviewCandidateJson: input.reviewCandidateJson,
+    reviewRoleRequirementId: input.reviewRoleRequirementId ?? null,
+    reviewRoleId: input.reviewRoleId ?? null,
+    reviewRoleGeneration: input.reviewRoleGeneration ?? null,
+    reviewFrozenBriefVersion: input.reviewFrozenBriefVersion ?? null,
+    reviewFrozenBriefContent: input.reviewFrozenBriefContent ?? null,
+    reviewFrozenBriefDigest: input.reviewFrozenBriefDigest ?? null,
+    reviewReturnPathJson: input.reviewReturnPathJson ?? null,
+    dispatchInputDigest: input.dispatchInputDigest ?? null,
     attemptOrdinal: input.attemptOrdinal,
     state: input.state,
     reasonCode: input.reasonCode,
@@ -20476,13 +20570,18 @@ function insertWorkItemAttempt(db, input) {
        project_id, execution_attempt_id, origin, lane_id, assignment_kind, attempt_ordinal,
        config_revision, work_item_id, repo_target_id, state, thread_id, reason_code,
        requested_provider_id, requested_model, requested_reasoning_level, requested_profile_digest,
-       review_pr_number, review_pr_head_sha, review_candidate_kind, review_candidate_json, progress_json, lease_owner_thread_id, continuation_of_attempt_id, created_at_ms,
+       review_pr_number, review_pr_head_sha, review_candidate_kind, review_candidate_json,
+       review_role_requirement_id, review_role_id, review_role_generation, review_frozen_brief_version,
+       review_frozen_brief_content, review_frozen_brief_digest, review_return_path_json, dispatch_input_digest,
+       progress_json, lease_owner_thread_id, continuation_of_attempt_id, created_at_ms,
        observed_at_ms, completed_at_ms, attempt_digest
      ) VALUES (
        @projectId, @executionAttemptId, 'work_item', @laneId, @assignmentKind, @attemptOrdinal,
        @configRevision, @workItemId, @repoTargetId, @state, @threadId, @reasonCode,
        @requestedProviderId, @requestedModel, @requestedReasoningLevel, @requestedProfileDigest,
        @reviewPrNumber, @reviewPrHeadSha, @reviewCandidateKind, @reviewCandidateJson,
+       @reviewRoleRequirementId, @reviewRoleId, @reviewRoleGeneration, @reviewFrozenBriefVersion,
+       @reviewFrozenBriefContent, @reviewFrozenBriefDigest, @reviewReturnPathJson, @dispatchInputDigest,
        '{}', @leaseOwnerThreadId, @continuationOfAttemptId, @createdAtMs,
        @observedAtMs, @completedAtMs, @attemptDigest
      )`
@@ -20506,6 +20605,14 @@ function insertWorkItemAttempt(db, input) {
     reviewPrHeadSha: input.reviewPrHeadSha,
     reviewCandidateKind: input.reviewCandidateKind,
     reviewCandidateJson: input.reviewCandidateJson,
+    reviewRoleRequirementId: input.reviewRoleRequirementId ?? null,
+    reviewRoleId: input.reviewRoleId ?? null,
+    reviewRoleGeneration: input.reviewRoleGeneration ?? null,
+    reviewFrozenBriefVersion: input.reviewFrozenBriefVersion ?? null,
+    reviewFrozenBriefContent: input.reviewFrozenBriefContent ?? null,
+    reviewFrozenBriefDigest: input.reviewFrozenBriefDigest ?? null,
+    reviewReturnPathJson: input.reviewReturnPathJson ?? null,
+    dispatchInputDigest: input.dispatchInputDigest ?? null,
     leaseOwnerThreadId: input.leaseOwnerThreadId,
     continuationOfAttemptId: input.continuationOfAttemptId,
     createdAtMs: input.createdAtMs,
@@ -20611,7 +20718,9 @@ function nextWorkAttemptOrdinal(db, projectId, workItemId) {
 function activeWorkItemAttempt(db, projectId, workItemId, assignmentKind) {
   const assignmentFilter = assignmentKind === void 0 ? "" : " AND assignment_kind = ?";
   return asRow(db.prepare(
-    `SELECT execution_attempt_id, review_pr_number, review_pr_head_sha, review_candidate_kind, review_candidate_json FROM execution_attempts
+    `SELECT execution_attempt_id, review_pr_number, review_pr_head_sha, review_candidate_kind, review_candidate_json,
+            review_role_requirement_id, review_role_id, review_role_generation, review_frozen_brief_version,
+            review_frozen_brief_content, review_frozen_brief_digest, review_return_path_json FROM execution_attempts
      WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
        AND state IN (${ACTIVE_WORK_ATTEMPT_STATES.map(() => "?").join(", ")})${assignmentFilter}
      ORDER BY attempt_ordinal DESC LIMIT 1`
@@ -21260,7 +21369,8 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
       expectedGovernanceEpoch: request.expectedGovernanceEpoch,
       expectedFenceToken: request.expectedFenceToken,
       requestedProfile: request.workAttempt.requestedProfile,
-      assignmentKind: request.workAttempt.assignmentKind
+      assignmentKind: request.workAttempt.assignmentKind,
+      candidateKind: request.workAttempt.candidateKind
     }, configRevision);
     if (proof.proofDigest !== request.fixtureContextDigest) {
       throw refusal("PROJECT_CONFIG_STALE", "durable dispatch finalization proof does not match the prepared intent");
@@ -21284,7 +21394,8 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
       expectedGovernanceEpoch: request.expectedGovernanceEpoch,
       expectedFenceToken: request.expectedFenceToken,
       requestedProfile: request.workAttempt.requestedProfile,
-      assignmentKind: request.workAttempt.assignmentKind
+      assignmentKind: request.workAttempt.assignmentKind,
+      candidateKind: request.workAttempt.candidateKind
     });
     if (!proof.continued || proof.proofDigest !== request.fixtureContextDigest) {
       throw refusal("PROJECT_CONFIG_STALE", "config-revision continuation proof is not the exact governed revision boundary");
@@ -21419,10 +21530,13 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
   }
   const redispatchingReview = workItem.lifecycle_state === "review_pending" && nextState === "review_pending";
   const priorReview = redispatchingReview ? activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "review") : void 0;
-  if (redispatchingReview && (!workAttempt || !workAttempt.threadId || !workAttempt.requestedProfile || !priorReview || !reviewCandidateMatches(priorReview, workAttempt))) {
+  if (redispatchingReview && (!workAttempt || !workAttempt.threadId || !workAttempt.requestedProfile || !priorReview || !reviewCandidateMatches(priorReview, workAttempt) || !reviewAuthorityMatches(priorReview, workAttempt))) {
     throw refusal("WORK_ITEM_STATE_INVALID", "review re-dispatch requires one active review and the same exact immutable candidate and profile");
   }
   if (workAttempt !== void 0 && nextState === void 0) {
+    if (workAttempt.assignmentKind === "review" && workAttempt.candidateKind === "local" && !workAttempt.dispatchInputDigest) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "local review dispatch requires the exact native input digest");
+    }
     const dispatchIntent = db.prepare(
       `SELECT execution_attempt_id FROM execution_attempts
        WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
@@ -21433,9 +21547,9 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
       const observedAtMs = now();
       db.prepare(
         `UPDATE execution_attempts
-         SET state = 'running', thread_id = ?, lease_owner_thread_id = ?, reason_code = 'work_item_dispatch', observed_at_ms = ?
+         SET state = 'running', thread_id = ?, lease_owner_thread_id = ?, reason_code = 'work_item_dispatch', observed_at_ms = ?, dispatch_input_digest = COALESCE(?, dispatch_input_digest)
          WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND thread_id IS NULL`
-      ).run(workAttempt.threadId, workAttempt.threadId, observedAtMs, request.projectId, dispatchIntent.execution_attempt_id);
+      ).run(workAttempt.threadId, workAttempt.threadId, observedAtMs, workAttempt.dispatchInputDigest ?? null, request.projectId, dispatchIntent.execution_attempt_id);
       return commitMutation(
         db,
         request,
@@ -21512,7 +21626,15 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
         reviewPrNumber: workAttempt.reviewPrNumber ?? null,
         reviewPrHeadSha: workAttempt.reviewPrHeadSha ?? null,
         reviewCandidateKind: workAttempt.candidateKind ?? null,
-        reviewCandidateJson: reviewCandidateJson(workAttempt)
+        reviewCandidateJson: reviewCandidateJson(workAttempt),
+        reviewRoleRequirementId: workAttempt.reviewRoleRequirementId ?? null,
+        reviewRoleId: workAttempt.reviewRoleId ?? null,
+        reviewRoleGeneration: workAttempt.reviewRoleGeneration ?? null,
+        reviewFrozenBriefVersion: workAttempt.reviewFrozenBriefVersion ?? null,
+        reviewFrozenBriefContent: workAttempt.reviewFrozenBriefContent ?? null,
+        reviewFrozenBriefDigest: workAttempt.reviewFrozenBriefDigest ?? null,
+        reviewReturnPathJson: workAttempt.reviewReturnPath ? canonicalJson(workAttempt.reviewReturnPath) : null,
+        dispatchInputDigest: workAttempt.dispatchInputDigest ?? null
       });
       return commitMutation(
         db,
@@ -21740,7 +21862,15 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
         reviewPrNumber: workAttempt.reviewPrNumber ?? null,
         reviewPrHeadSha: workAttempt.reviewPrHeadSha ?? null,
         reviewCandidateKind: workAttempt.candidateKind ?? null,
-        reviewCandidateJson: reviewCandidateJson(workAttempt)
+        reviewCandidateJson: reviewCandidateJson(workAttempt),
+        reviewRoleRequirementId: workAttempt.reviewRoleRequirementId ?? null,
+        reviewRoleId: workAttempt.reviewRoleId ?? null,
+        reviewRoleGeneration: workAttempt.reviewRoleGeneration ?? null,
+        reviewFrozenBriefVersion: workAttempt.reviewFrozenBriefVersion ?? null,
+        reviewFrozenBriefContent: workAttempt.reviewFrozenBriefContent ?? null,
+        reviewFrozenBriefDigest: workAttempt.reviewFrozenBriefDigest ?? null,
+        reviewReturnPathJson: workAttempt.reviewReturnPath ? canonicalJson(workAttempt.reviewReturnPath) : null,
+        dispatchInputDigest: workAttempt.dispatchInputDigest ?? null
       });
     }
   } else {
@@ -23496,6 +23626,9 @@ function migrateCanonicalStore(db, migrate) {
   if (!has(GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID) || !tableColumns(db, "execution_attempts").includes("review_candidate_kind") || !tableColumns(db, "execution_attempts").includes("review_candidate_json")) {
     throw new Error("GH644 migration ledger is incomplete");
   }
+  if (!has(GH644_LOCAL_REVIEW_AUTHORITY_MIGRATION_ID) || !["review_role_requirement_id", "review_role_id", "review_role_generation", "review_frozen_brief_version", "review_frozen_brief_content", "review_frozen_brief_digest", "review_return_path_json", "dispatch_input_digest"].every((column) => tableColumns(db, "execution_attempts").includes(column))) {
+    throw new Error("GH644 authority migration ledger is incomplete");
+  }
 }
 function databaseIsReady(db) {
   db.pragma("foreign_keys = ON");
@@ -24931,6 +25064,19 @@ ${brief.content}` };
     input: [...spawn.input, { type: "text", visibility: "agent-only", text: brief.content, mentions: [] }]
   };
 }
+function appendFrozenReviewBrief(spawn, brief) {
+  if (typeof spawn.prompt === "string") return { ...spawn, prompt: `${spawn.prompt}
+
+${brief}` };
+  if (!Array.isArray(spawn.input)) throw new Error("dispatch prompt shape is unavailable");
+  return {
+    ...spawn,
+    input: [...spawn.input, { type: "text", visibility: "agent-only", text: brief, mentions: [] }]
+  };
+}
+function dispatchInputDigest(spawn) {
+  return sha256(canonicalJson({ input: spawn.input ?? null, prompt: spawn.prompt ?? null }));
+}
 function readGithubIssueForBackfill(owner, repo, issueNumber, connectorHost) {
   if (connectorHost === void 0) throw new Error("GitHub connector host is unavailable");
   const value = githubJson(["issue", "view", String(issueNumber), "--repo", `${owner}/${repo}`, "--json", "number,title,body,state,stateReason,labels,updatedAt,url"], connectorHost);
@@ -25553,15 +25699,29 @@ async function dispatchLane(bb, db, input) {
       expectedGovernanceEpoch: request.expectedGovernanceEpoch,
       expectedFenceToken: request.expectedFenceToken,
       requestedProfile,
-      assignmentKind: request.workAttempt.assignmentKind
+      assignmentKind: request.workAttempt.assignmentKind,
+      candidateKind: request.workAttempt.candidateKind
     });
   } catch (error48) {
     if (isRefusal(error48)) return { outcome: error48.data.code, subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: error48.data.message };
     return { outcome: "INTERNAL_ERROR", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "dispatch config proof failed" };
   }
-  const environmentRefusal = await dispatchEnvironmentPreflight(bb, request.projectId, spawnShape.data.environment, configProof, request.workAttempt);
-  if (environmentRefusal) return environmentRefusal;
   const localReview = request.workAttempt.assignmentKind === "review" && request.workAttempt.candidateKind === "local";
+  let preparedDispatchSpawn = spawnShape.data;
+  if (localReview) {
+    if (configProof.reviewerRoleRequirementId !== request.workAttempt.reviewRoleRequirementId || configProof.reviewerRoleId !== request.workAttempt.reviewRoleId || configProof.reviewerRoleGeneration !== request.workAttempt.reviewRoleGeneration) return { outcome: "ROLE_GENERATION_STALE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "local review authority does not match the current independent-reviewer generation" };
+    if (request.workAttempt.reviewReturnPath?.threadId !== spawnShape.data.parentThreadId) {
+      return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "local review return path must bind the native parent thread" };
+    }
+    try {
+      preparedDispatchSpawn = appendFrozenReviewBrief(spawnShape.data, request.workAttempt.reviewFrozenBriefContent);
+    } catch (error48) {
+      return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: `local review brief cannot be bound to native input: ${String(error48)}` };
+    }
+    request.workAttempt = { ...request.workAttempt, dispatchInputDigest: dispatchInputDigest(preparedDispatchSpawn) };
+  }
+  const environmentRefusal = await dispatchEnvironmentPreflight(bb, request.projectId, preparedDispatchSpawn.environment, configProof, request.workAttempt);
+  if (environmentRefusal) return environmentRefusal;
   const briefTarget = localReview ? null : githubIssueBriefTarget(db, request.projectId, request.workItemId ?? "");
   if (briefTarget === "invalid") {
     return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub issue projection identity is malformed or ambiguous" };
@@ -25590,7 +25750,7 @@ async function dispatchLane(bb, db, input) {
   }, false, "stop-active", githubAdapter?.read ?? projectGithubIssueReader(db, request.projectId), githubAdapter);
   if (intent.outcome !== "OK") return intent;
   return serializeDispatchRecovery(request, async () => {
-    let dispatchSpawn = spawnShape.data;
+    let dispatchSpawn = preparedDispatchSpawn;
     if (briefTarget) {
       const currentWorkItem = db?.prepare(
         "SELECT resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?"
@@ -25635,6 +25795,10 @@ async function dispatchLane(bb, db, input) {
         return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub issue body or comment tail moved before dispatch" };
       }
       dispatchSpawn = appendGithubIssueBrief(dispatchSpawn, latestRead.brief);
+    }
+    if (localReview) {
+      const finalEnvironmentRefusal = await dispatchEnvironmentPreflight(bb, request.projectId, dispatchSpawn.environment, configProof, request.workAttempt);
+      if (finalEnvironmentRefusal) return finalEnvironmentRefusal;
     }
     if (!intent.replay) {
       try {
@@ -25726,18 +25890,20 @@ async function dispatchEnvironmentPreflight(bb, projectId, environment, proof, w
       ]);
       if (facts.id !== candidateEnvironment.environmentId || facts.projectId !== projectId || facts.hostId !== candidateEnvironment.hostId || candidateEnvironment.bbServerId !== bb.server.loopbackBaseUrl || facts.path !== candidateEnvironment.path || facts.managed !== true || facts.isWorktree !== true || facts.workspaceProvisionType !== "managed-worktree" || project.sources.filter((source) => source.id === candidateEnvironment.sourceId && source.projectId === projectId && source.hostId === candidateEnvironment.hostId && source.path === candidateEnvironment.path).length !== 1) return { outcome: "REPO_TARGET_FOREIGN", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "local candidate environment identity is foreign or incomplete" };
       const base = workAttempt.reviewBaseSha;
-      const [baseCommit, status] = await Promise.all([
+      const [baseCommit, candidateCommit, status] = await Promise.all([
         bb.sdk.environments.diff({ environmentId: candidateEnvironment.environmentId, target: "commit", sha: base }),
+        bb.sdk.environments.diff({ environmentId: candidateEnvironment.environmentId, target: "commit", sha: workAttempt.reviewCandidateSha }),
         bb.sdk.environments.status({ environmentId: candidateEnvironment.environmentId, mergeBaseBranch: base })
       ]);
       if (baseCommit.outcome !== "available") return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "local review base commit is unavailable in the candidate repository" };
+      if (candidateCommit.outcome !== "available") return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "local review candidate commit is unavailable in the candidate repository" };
       if (status.outcome !== "available") return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "local candidate environment is not reachable" };
       const workspace = status.workspace;
       const checkout = workspace?.checkout;
       const workingTree = workspace?.workingTree;
       const clean = (workingTree?.state === "clean" || workingTree?.state === "committed_unmerged") && workingTree.hasUncommittedChanges === false && Array.isArray(workingTree.files) && workingTree.files.length === 0 && workingTree.insertions === 0 && workingTree.deletions === 0;
       const mergeBase = workspace.mergeBase;
-      if (!checkout || checkout.kind !== "branch" || checkout.headSha !== workAttempt.reviewCandidateSha || checkout.branchName !== workAttempt.reviewCandidateCheckout?.branchName || !clean || !mergeBase || mergeBase.baseRef !== base || mergeBase.mergeBaseBranch !== base || mergeBase.behindCount !== 0 || mergeBase.lineStatsComplete !== true) return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "local candidate is not the exact reachable clean frozen checkout based on the frozen base" };
+      if (!checkout || checkout.kind !== "branch" || checkout.headSha !== workAttempt.reviewCandidateSha || checkout.branchName !== workAttempt.reviewCandidateCheckout?.branchName || !clean || !mergeBase || mergeBase.baseRef !== base || mergeBase.mergeBaseBranch !== base || mergeBase.behindCount !== 0 || mergeBase.aheadCount <= 0 || mergeBase.lineStatsComplete !== true) return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "local candidate is not the exact reachable clean frozen checkout based on the frozen base" };
     } catch (error48) {
       return { outcome: "EXTERNAL_UNAVAILABLE", subject: projectId, expected: 1, attempted: 1, verified: 0, message: `local candidate observation is unavailable: ${String(error48)}` };
     }
@@ -25819,6 +25985,10 @@ async function reconcileDispatchIntent(bb, db, request, spawn, intentResult, all
   }
   if (exact.length === 1) return finalizeDispatchIntent(bb, db, request, intent, exact[0].id, configProof);
   if (!allowRetry) return dispatchRecoveryRefusal(request.projectId, "native dispatch inventory proves no exact thread, but the prior spawn outcome is not retryable", { intent: intentResult });
+  if (request.workAttempt?.assignmentKind === "review" && request.workAttempt.candidateKind === "local") {
+    const finalEnvironmentRefusal = await dispatchEnvironmentPreflight(bb, request.projectId, spawn.environment, configProof, request.workAttempt);
+    if (finalEnvironmentRefusal) return finalEnvironmentRefusal;
+  }
   try {
     const retried = await spawnDispatchThread(bb, spawn, request.idempotencyKey);
     if (retried.projectId !== request.projectId || retried.parentThreadId !== intent.parentThreadId || retried.title !== `${expectedTitle} ${marker}`) {

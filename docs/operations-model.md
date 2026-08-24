@@ -79,7 +79,11 @@ commits, the project target's managed-worktree environment and branch
 checkout, the candidate server identity, an exact base-ancestor merge proof,
 and an explicit clean/reachable observation. The two identities are mutually
 exclusive; a local review never creates or updates a GitHub projection and is
-never a `probe`.
+never a `probe`. The canonical attempt also persists the exact active
+independent-reviewer requirement and generation, frozen brief content/digest,
+explicit `DONE`/`BLOCKED`/`WAITING` return path, and native input digest. The
+candidate is re-observed immediately before every native spawn or retry; any
+movement retires the spawn opportunity while preserving the prepared intent.
 
 Enter it from `in_progress` only while an active writing attempt exists; that attempt is closed as `done`. Omitting a work attempt is legal for the orchestrator-verifies-the-fixed-head shape. If supplied, the attempt must be `review` with a lane, requested profile, and one explicit candidate kind; its initial thread ID is optional. These requirements and the registration are enforced by [`workAttemptSchema` and `applyWorkItemTransition`](../src/foundation.ts).
 
