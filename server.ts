@@ -23,6 +23,7 @@ import {
   backfillWorkItemGithubIssues,
   backfillWorkItemAttempts,
   MIGRATIONS,
+  migrateCanonicalStore,
   ROLE_CONTEXT_EVENT_PAGE_SIZE,
   PLUGIN_ID,
   PLUGIN_SDK_VERSION,
@@ -2939,7 +2940,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   try {
     db = bb.storage.database();
     databaseIsReady(db);
-    bb.storage.migrate(db, MIGRATIONS);
+    migrateCanonicalStore(db, (database, statements) => bb.storage.migrate(database, statements));
     try {
       backfillWorkItemAttempts(db);
     } catch (error) {
