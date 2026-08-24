@@ -8,7 +8,7 @@ import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import plugin, { cliSchemaError, deployedDistFailureDetail, fleetWatchdogBlockerFiredKey, fleetWatchdogCompositeKey, fleetWatchdogEpisodeKey, fleetWatchdogIssueReopenedKey, fleetWatchdogMergeCloseKey, fleetWatchdogReopenKey, fleetWatchdogRoleLivenessKey, fleetWatchdogScope, IDLE_FLEET_ATTEMPT_STALE_MS, ROLE_QUEUE_CACHE_MS, ROLE_QUEUE_DECISION_BOUND_MS, ROLE_QUEUE_IDLE_THRESHOLD_MS, ROLE_QUEUE_MAX_REPOSITORIES, ROLE_QUEUE_OBSERVATION_MS, ROLE_QUEUE_REFRESH_TIMEOUT_MS, rpcContract, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
+import plugin, { cliSchemaError, deployedDistFailureDetail, fleetWatchdogBlockerFiredKey, fleetWatchdogCompositeKey, fleetWatchdogEpisodeKey, fleetWatchdogIssueReopenedKey, fleetWatchdogMergeCloseKey, fleetWatchdogReopenKey, fleetWatchdogRoleLivenessKey, fleetWatchdogScope, IDLE_FLEET_ATTEMPT_STALE_MS, ROLE_QUEUE_CACHE_MS, ROLE_QUEUE_DECISION_BOUND_MS, ROLE_QUEUE_IDLE_THRESHOLD_MS, ROLE_QUEUE_MAX_REPOSITORIES, ROLE_QUEUE_OBSERVATION_MS, ROLE_QUEUE_REFRESH_TIMEOUT_MS, rpcContract, startableQueueStateAsync, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
 import { canonicalWorktreePath } from "../src/worktree-cleanup.js";
 import {
   CACHED_CONSUMERS,
@@ -25,6 +25,7 @@ import {
   MIGRATIONS,
   GH636_PREVIOUS_MIGRATION_ID,
   GH636_REPAIR_MIGRATION_ID,
+  GH637_DOMAIN_MIGRATION_ID,
   ROLE_CONTEXT_EVENT_PAGE_SIZE,
   MIGRATION_STATES,
   MIGRATION_STEPS,
@@ -234,6 +235,17 @@ function roleConfig(connector: "required" | "optional" | "prohibited" = "optiona
   config.extensions.bbCollab.reviewPolicy = {
     connectors: [{ repoTargetId: TARGET_ID, connectorId: "connector-review", policy: connector }],
   };
+  return config;
+}
+
+function domainRoleConfig() {
+  const config = roleConfig();
+  const requirements = config.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>;
+  delete config.extensions.bbCollab.roleRequirements;
+  config.extensions.bbCollab.domains = [
+    { domainId: "editorial", taskClasses: ["editorial"], roleRequirements: requirements.map((requirement) => ({ ...requirement, roleRequirementId: `${requirement.roleRequirementId}-editorial` })) },
+    { domainId: "code", taskClasses: ["code"], roleRequirements: requirements.map((requirement) => ({ ...requirement, roleRequirementId: `${requirement.roleRequirementId}-code` })) },
+  ];
   return config;
 }
 
@@ -1145,6 +1157,15 @@ function cloneProject(db: Database.Database, sourceProjectId: string, targetProj
   };
   clone("project_config_revisions");
   clone("project_config_heads");
+  clone("orchestration_domains", "", (row) => {
+    row.domain_digest = sha256(canonicalJson({
+      projectId: targetProjectId,
+      configRevision: row.config_revision,
+      domainId: row.domain_id,
+      taskClasses: JSON.parse(String(row.task_classes_json)),
+      roleRequirements: JSON.parse(String(row.role_requirements_json)),
+    }));
+  });
   clone("repository_targets");
   clone("work_items");
   clone("qualification_observations");
@@ -2337,6 +2358,184 @@ function connectorEvidence(state: "available" | "absent" | "degraded" | "unknown
 }
 
 describe("bb-collab plugin boundary", () => {
+  it("binds WorkItems to configured domains and refuses missing, foreign, and stale domain FIT", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: domainRoleConfig() });
+    const missing = applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      idempotencyKey: "domain-missing-task-class",
+      workItem: { workItemId: "domain-missing", title: "Missing class", body: "refuse" },
+    }));
+    expect(missing).toMatchObject({ outcome: "DOMAIN_REQUIRED", attempted: 0, verified: 0 });
+
+    const created = applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      idempotencyKey: "domain-code-create",
+      workItem: { workItemId: "domain-code", title: "Code work", body: "route", taskClass: "code", domainId: "code" },
+      taskClass: "code",
+      domainId: "code",
+    }));
+    expect(created).toMatchObject({ outcome: "OK" });
+    expect(db.prepare("SELECT domain_id, task_class FROM work_items WHERE work_item_id = ?").get("domain-code")).toEqual({ domain_id: "code", task_class: "code" });
+
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      idempotencyKey: "domain-wrong-route",
+      workItem: { workItemId: "domain-wrong", title: "Wrong route", body: "refuse", taskClass: "code" },
+      taskClass: "code",
+      domainId: "editorial",
+    })).outcome).toBe("DOMAIN_FOREIGN");
+
+    db.prepare("UPDATE orchestration_domains SET role_requirements_json = ? WHERE project_id = ? AND config_revision = 1 AND domain_id = 'code'").run("[]", PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      idempotencyKey: "domain-stale-inventory",
+      workItem: { workItemId: "domain-stale", title: "Stale route", body: "refuse", taskClass: "code" },
+      taskClass: "code",
+      domainId: "code",
+    }))).toMatchObject({ outcome: "DOMAIN_CONFIG_STALE", attempted: 0, verified: 0 });
+    db.prepare("DELETE FROM orchestration_domains WHERE project_id = ? AND config_revision = 1 AND domain_id = 'editorial'").run(PROJECT_ID);
+    expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({ outcome: "DOMAIN_CONFIG_STALE", attempted: 0, verified: 0 });
+  });
+
+  it("seats interleaved generations independently for each configured domain", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: domainRoleConfig() });
+    const seat = (domainId: "editorial" | "code", suffix: string, expectedGeneration: number | null, predecessorGeneration: number | null) => {
+      const roleRequirementId = `orchestrator-v1-${domainId}`;
+      const qualificationId = `qualification-${suffix}`;
+      const roleContext = {
+        threadId: `thread-${suffix}`,
+        requestEventId: `request-${suffix}`,
+        requestEventSeq: 1,
+        completionEventId: `completion-${suffix}`,
+        completionEventSeq: 4,
+      };
+      const facts = roleReader((value) => {
+        value.thread.id = roleContext.threadId;
+        value.thread.environmentId = `environment-${suffix}`;
+        value.environment.id = roleContext.threadId.replace("thread", "environment");
+        value.events[0]!.id = roleContext.requestEventId;
+        value.events[0]!.data.requestId = `request-id-${suffix}`;
+        value.events[1]!.data.clientRequestId = `request-id-${suffix}`;
+        value.events[3]!.id = roleContext.completionEventId;
+      });
+      expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+        idempotencyKey: `${suffix}-qualification`, domainId, roleRequirementId, qualificationId, roleContext,
+      }), null, facts).outcome).toBe("OK");
+      const succession = applyWithFixtureReceipt(db, successionRequest(fenceToken, {
+        idempotencyKey: `${suffix}-succession`, domainId, roleRequirementId, qualificationId,
+        expectedGeneration, predecessorGeneration, roleContext,
+      }), null, facts);
+      expect(succession.outcome).toBe("OK");
+    };
+
+    seat("editorial", "editorial-one", null, null);
+    seat("code", "code-one", null, null);
+    seat("code", "code-two", 1, 1);
+    seat("editorial", "editorial-two", 1, 1);
+    expect(db.prepare(
+      "SELECT domain_id, generation FROM role_generations WHERE project_id = ? AND role_id = 'project-orchestrator' ORDER BY domain_id, generation",
+    ).all(PROJECT_ID)).toEqual([
+      { domain_id: "code", generation: 1 }, { domain_id: "code", generation: 2 },
+      { domain_id: "editorial", generation: 1 }, { domain_id: "editorial", generation: 2 },
+    ]);
+  });
+
+  it("reports complete per-domain queue heads while retaining one project-wide count", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-domain-queue-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '[[{\"number\":301,\"labels\":[{\"name\":\"queue:startable\"}]},{\"number\":302,\"labels\":[{\"name\":\"queue:startable\"}]}]]'\n");
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const host = await loadedHost();
+      const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: domainRoleConfig() });
+      for (const item of [
+        { workItemId: "domain-editorial-queue", taskClass: "editorial", domainId: "editorial", issue: 301 },
+        { workItemId: "domain-code-queue", taskClass: "code", domainId: "code", issue: 302 },
+      ]) {
+        expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+          idempotencyKey: `${item.workItemId}-create`, taskClass: item.taskClass, domainId: item.domainId,
+          workItem: { workItemId: item.workItemId, title: item.workItemId, body: item.workItemId, taskClass: item.taskClass, domainId: item.domainId },
+        })).outcome).toBe("OK");
+        expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1, {
+          idempotencyKey: `${item.workItemId}-ready`, workItemId: item.workItemId,
+        })).outcome).toBe("OK");
+        bindFixtureGithubIssue(db, item.issue, item.workItemId);
+      }
+      const queue = await startableQueueStateAsync(db, PROJECT_ID, ["example/project"]);
+      expect(queue).toMatchObject({ count: 2, head: "example/project#301", domains: {
+        editorial: { count: 1, head: "example/project#301", known: true },
+        code: { count: 1, head: "example/project#302", known: true },
+      }});
+      expect(queue!.count).toBe(Object.values(queue!.domains).reduce((total, state) => total + state.count, 0));
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when any startable issue has zero, multiple, or out-of-domain bindings", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-domain-queue-coverage-"));
+    const gh = join(bin, "gh");
+    const phase = join(bin, "phase");
+    writeFileSync(phase, "zero");
+    writeFileSync(gh, `#!/bin/sh
+mode=$(cat '${phase}')
+if [ "$mode" = zero ]; then printf '%s\\n' '[[{"number":301,"labels":[{"name":"queue:startable"}]},{"number":302,"labels":[{"name":"queue:startable"}]},{"number":303,"labels":[{"name":"queue:startable"}]}]]';
+elif [ "$mode" = multiple ]; then printf '%s\\n' '[[{"number":304,"labels":[{"name":"queue:startable"}]}]]';
+else printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue:startable"}]}]]'; fi
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const host = await loadedHost();
+      const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: domainRoleConfig() });
+      const createReady = (workItemId: string, domainId: string, taskClass: string) => {
+        expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+          idempotencyKey: `${workItemId}-create`, taskClass, domainId,
+          workItem: { workItemId, title: workItemId, body: workItemId, taskClass, domainId },
+        })).outcome).toBe("OK");
+        expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1, {
+          idempotencyKey: `${workItemId}-ready`, workItemId,
+        })).outcome).toBe("OK");
+      };
+      createReady("coverage-editorial", "editorial", "editorial");
+      createReady("coverage-code", "code", "code");
+      bindFixtureGithubIssue(db, 301, "coverage-editorial");
+      bindFixtureGithubIssue(db, 302, "coverage-code");
+
+      const zero = await startableQueueStateAsync(db, PROJECT_ID, ["example/project"]);
+      expect(zero).toMatchObject({ count: 3, domains: {
+        editorial: { count: 1, known: false, reason: "startable-queue-bindings:0" },
+        code: { count: 1, known: false, reason: "startable-queue-bindings:0" },
+      }});
+      expect(Object.values(zero!.domains).some((state) => state.known)).toBe(false);
+
+      createReady("coverage-multiple-a", "code", "code");
+      createReady("coverage-multiple-b", "code", "code");
+      db.exec("DROP INDEX external_work_refs_issue_identity");
+      bindFixtureGithubIssue(db, 304, "coverage-multiple-a");
+      bindFixtureGithubIssue(db, 304, "coverage-multiple-b");
+      writeFileSync(phase, "multiple");
+      const multiple = await startableQueueStateAsync(db, PROJECT_ID, ["example/project"]);
+      expect(Object.values(multiple!.domains).every((state) => !state.known)).toBe(true);
+      expect(Object.values(multiple!.domains).every((state) => state.reason === "startable-queue-bindings:2")).toBe(true);
+
+      createReady("coverage-out-of-domain", "code", "code");
+      db.prepare("UPDATE work_items SET domain_id = 'rogue', task_class = 'rogue' WHERE project_id = ? AND work_item_id = ?").run(PROJECT_ID, "coverage-out-of-domain");
+      bindFixtureGithubIssue(db, 305, "coverage-out-of-domain");
+      writeFileSync(phase, "rogue");
+      const rogue = await startableQueueStateAsync(db, PROJECT_ID, ["example/project"]);
+      expect(Object.values(rogue!.domains).every((state) => !state.known)).toBe(true);
+      expect(Object.values(rogue!.domains).every((state) => state.reason === "startable-queue-domain-unknown:rogue")).toBe(true);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
   it("loads one CLI/RPC seam and refuses production apply before any write", async () => {
     const host = await loadedHost();
     const db = host.bb.storage.database();
@@ -2763,11 +2962,11 @@ describe("bb-collab plugin boundary", () => {
     }
 
     expect(db.prepare(
-      "SELECT project_id, role_id, current_generation FROM role_generation_heads WHERE project_id = ? ORDER BY role_id",
+      "SELECT project_id, role_id, domain_id, current_generation FROM role_generation_heads WHERE project_id = ? ORDER BY role_id, domain_id",
     ).all(secondProject)).toEqual([
-      { project_id: secondProject, role_id: "independent-reviewer", current_generation: 1 },
-      { project_id: secondProject, role_id: "project-orchestrator", current_generation: 1 },
-      { project_id: secondProject, role_id: "worker", current_generation: 1 },
+      { project_id: secondProject, role_id: "independent-reviewer", domain_id: "default", current_generation: 1 },
+      { project_id: secondProject, role_id: "project-orchestrator", domain_id: "default", current_generation: 1 },
+      { project_id: secondProject, role_id: "worker", domain_id: "default", current_generation: 1 },
     ]);
     expect(exportFoundation(db, PROJECT_ID)).toEqual(existingBefore);
   });
@@ -2779,7 +2978,7 @@ describe("bb-collab plugin boundary", () => {
     const legacyGenesis = "legacy-v28-genesis";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -4)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -5)) db.exec(statement);
       })();
       seedVerifiedFixtureReceipt(db, {
         projectId: legacyProject,
@@ -2794,8 +2993,11 @@ describe("bb-collab plugin boundary", () => {
       }));
       expect(bootstrapped).toMatchObject({ outcome: "OK" });
       const legacyFence = (bootstrapped.evidence as { fenceToken: string }).fenceToken;
+      db.exec(MIGRATIONS.at(-5)!);
       db.exec(MIGRATIONS.at(-4)!);
       db.exec(MIGRATIONS.at(-3)!);
+      db.exec(MIGRATIONS.at(-2)!);
+      db.exec(MIGRATIONS.at(-1)!);
 
       const legacyRoleFacts = () => roleReader((facts) => {
         facts.thread.projectId = legacyProject;
@@ -4087,7 +4289,7 @@ fi
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-role-queue-complete-"));
     const gh = join(bin, "gh");
     const inventory = join(bin, "inventory.json");
-    const issues = Array.from({ length: 1001 }, (_, index) => ({ number: index + 1, labels: [{ name: "queue:startable" }] }));
+    const issues = [{ number: 1, labels: [{ name: "queue:startable" }] }, ...Array.from({ length: 1000 }, (_, index) => ({ number: index + 2, labels: [{ name: "queue:blocked" }] }))];
     writeFileSync(inventory, JSON.stringify(Array.from({ length: 11 }, (_, index) => issues.slice(index * 100, (index + 1) * 100))));
     writeFileSync(gh, `#!/bin/sh
 exec /bin/cat '${inventory}'
@@ -9095,7 +9297,7 @@ else printf '%s\\n' '[]'; fi
     const first = await host.harness.callRpc("export", { projectId: PROJECT_ID });
     const second = await host.harness.callRpc("export", { projectId: PROJECT_ID });
     expect(second).toEqual(first);
-    expect(first).toMatchObject({ outcome: "OK", expected: 8, attempted: 8, verified: 8 });
+    expect(first).toMatchObject({ outcome: "OK", expected: 9, attempted: 9, verified: 9 });
     expect((first as { export: { manifest: { schemaVersion: number } } }).export.manifest.schemaVersion).toBe(SCHEMA_VERSION);
     expect((first as { export: { manifest: { migrationStatementIds: number[]; schemaDigest: string } } }).export.manifest.migrationStatementIds).toEqual(
       Array.from({ length: MIGRATIONS.length }, (_, index) => index),
@@ -9250,19 +9452,19 @@ else printf '%s\\n' '[]'; fi
     const db = new Database(":memory:");
     databaseIsReady(db);
     try {
-    for (const statement of MIGRATIONS.slice(0, -17)) db.exec(statement);
+    for (const statement of MIGRATIONS.slice(0, -18)) db.exec(statement);
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, '{}', ?, 1)").run(PROJECT_ID, sha256("{}"));
       db.prepare("INSERT INTO project_config_heads (project_id, config_revision, updated_at_ms) VALUES (?, 1, 1)").run(PROJECT_ID);
       db.prepare(`INSERT INTO operator_messages (project_id, recipient, sender_thread_id, severity, message_text, created_at_ms, reply_text, reply_delivery_error) VALUES (?, 'operator', 'fixture-thread', 'routine', 'failed delivery', 10, 'reply retained', 'delivery failed')`).run(PROJECT_ID);
-      db.exec(MIGRATIONS.at(-6)!);
+      db.exec(MIGRATIONS.at(-7)!);
       expect(db.prepare("SELECT reply_text, reply_delivery_error, replied_at_ms, archived_at_ms FROM operator_messages").get()).toEqual({ reply_text: "reply retained", reply_delivery_error: "delivery failed", replied_at_ms: null, archived_at_ms: null });
     } finally { db.close(); }
   });
 
   it("appends authority-root schema and bumps the runtime contract", () => {
-    expect(SCHEMA_VERSION).toBe(32);
-    expect(RUNTIME_CONTRACT_VERSION).toBe(27);
-    expect(MIGRATIONS).toHaveLength(45);
+    expect(SCHEMA_VERSION).toBe(33);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(28);
+    expect(MIGRATIONS).toHaveLength(46);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
     expect(sha256(MIGRATIONS.slice(0, GH636_PREVIOUS_MIGRATION_ID + 1).join("\n"))).toBe("b8beac282f4b36cf0dca454f3be9ffc11bae6a3d2c66388c9e43210928e4a5c8");
@@ -9285,33 +9487,33 @@ else printf '%s\\n' '[]'; fi
     ]);
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 31,
-      newSchemaVersion: 32,
-      oldContractVersion: 26,
-      newContractVersion: 27,
+      oldSchemaVersion: 32,
+      newSchemaVersion: 33,
+      oldContractVersion: 27,
+      newContractVersion: 28,
       action: "refused",
       expected: 4,
       attempted: 4,
       verified: 0,
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(20, 22))).toMatchObject({
-      oldSchemaVersion: 31,
-      newSchemaVersion: 32,
-      oldContractVersion: 26,
-      newContractVersion: 27,
+      oldSchemaVersion: 32,
+      newSchemaVersion: 33,
+      oldContractVersion: 27,
+      newContractVersion: 28,
       action: "refused",
       expected: 4,
       attempted: 4,
       verified: 0,
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ action: "refused", verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(32, 27))).toMatchObject({ action: "reread", verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(33, 28))).toMatchObject({ action: "reread", verified: 4 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
-      oldSchemaVersion: 31,
-      newSchemaVersion: 32,
-      oldContractVersion: 26,
-      newContractVersion: 27,
+      oldSchemaVersion: 32,
+      newSchemaVersion: 33,
+      oldContractVersion: 27,
+      newContractVersion: 28,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -9333,11 +9535,11 @@ else printf '%s\\n' '[]'; fi
       expect((db.prepare("PRAGMA table_info(mutation_receipts)").all() as Array<{ name: string }>).map((row) => row.name)).toContain("operator_receipt_id");
       expect((db.prepare("PRAGMA table_info(actor_receipts)").all() as Array<{ name: string }>).map((row) => row.name)).toEqual(expect.arrayContaining(["operator_receipt_id", "retirement_condition"]));
       expect((db.prepare("PRAGMA table_info(work_item_waits)").all() as Array<{ name: string }>).map((row) => row.name)).toEqual([
-        "project_id", "work_item_id", "waker", "declared_at_ms", "declared_by_seat", "waker_kind", "note",
+        "project_id", "work_item_id", "waker", "declared_at_ms", "declared_by_seat", "waker_kind", "note", "domain_id",
       ]);
       expect((db.prepare("PRAGMA table_info(lane_capacity_intervals)").all() as Array<{ name: string }>).map((row) => row.name)).toEqual([
         "interval_id", "project_id", "orchestrator_thread_id", "orchestrator_role_generation", "coverage_state",
-        "active_lane_count", "writing_lane_ceiling", "startable_work", "reason", "started_at_ms", "last_confirmed_at_ms", "ended_at_ms", "lane_capacity_observation_id",
+        "active_lane_count", "writing_lane_ceiling", "startable_work", "reason", "started_at_ms", "last_confirmed_at_ms", "ended_at_ms", "lane_capacity_observation_id", "domain_id",
       ]);
       expect(db.prepare("SELECT COUNT(*) AS count FROM lane_capacity_intervals").get()).toEqual({ count: 0 });
       expect((db.prepare("PRAGMA index_list(migration_runs)").all() as Array<{ name: string; unique: number; partial: number }>).filter((row) => row.name.startsWith("migration_runs_"))).toEqual(expect.arrayContaining([
@@ -9355,7 +9557,7 @@ else printf '%s\\n' '[]'; fi
     databaseIsReady(db);
     const projectId = "proj_gh200_migration";
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -10)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -11)) db.exec(statement); })();
       for (const configRevision of [5, 6]) {
         db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, ?, '{}', ?, ?)")
           .run(projectId, configRevision, sha256("{}"), configRevision);
@@ -9392,7 +9594,7 @@ else printf '%s\\n' '[]'; fi
          WHERE work_items.project_id = ? ORDER BY work_items.work_item_id`,
       ).all(projectId);
       const before = snapshot();
-      db.transaction(() => db.exec(MIGRATIONS.at(-11)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-12)!))();
       expect(snapshot()).toEqual(before);
       expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
       expect(db.prepare("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
@@ -9409,15 +9611,15 @@ else printf '%s\\n' '[]'; fi
     const projectId = "proj_gh295_migration";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -15)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -16)) db.exec(statement);
       })();
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, '{}', ?, 1)").run(projectId, sha256("{}"));
       db.prepare("INSERT INTO repository_targets (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest) VALUES (?, 'target-main', 1, 'source', 'host', '/migration', NULL, 'main', 'target-digest')").run(projectId);
       db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, 'historical', 1, 'target-main', 'Historical', 'preserve me', 'in_progress', 3, 10, 20)").run(projectId);
       const beforeRows = db.prepare("SELECT * FROM work_items WHERE project_id = ?").all(projectId);
-      const priorStatementDigests = MIGRATIONS.slice(0, -15).map(sha256);
-      db.transaction(() => db.exec(MIGRATIONS.at(-16)!))();
-      expect(MIGRATIONS.slice(0, -15).map(sha256)).toEqual(priorStatementDigests);
+      const priorStatementDigests = MIGRATIONS.slice(0, -16).map(sha256);
+      db.transaction(() => db.exec(MIGRATIONS.at(-17)!))();
+      expect(MIGRATIONS.slice(0, -16).map(sha256)).toEqual(priorStatementDigests);
       expect(db.prepare("SELECT * FROM work_items WHERE project_id = ?").all(projectId)).toEqual(beforeRows);
       expect(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'work_items'").get()).toMatchObject({ sql: expect.stringContaining("review_pending") });
       db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, 'reviewable', 1, 'target-main', 'Reviewable', 'new state', 'review_pending', 1, 30, 30)").run(projectId);
@@ -9433,7 +9635,7 @@ else printf '%s\\n' '[]'; fi
     databaseIsReady(db);
     const projectId = "proj_review_linkage_migration";
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -13)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -14)) db.exec(statement); })();
       const configJson = "{}";
       db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, ?, ?, 1)").run(projectId, configJson, sha256(configJson));
       db.prepare("INSERT INTO project_config_heads (project_id, config_revision, updated_at_ms) VALUES (?, 1, 1)").run(projectId);
@@ -9448,7 +9650,7 @@ else printf '%s\\n' '[]'; fi
       const before = db.prepare(`SELECT ${existingColumns.join(", ")} FROM execution_attempts`).all();
       const rowCount = (db.prepare("SELECT COUNT(*) AS count FROM execution_attempts").get() as { count: number }).count;
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-13)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-14)!))();
 
       expect((db.prepare("SELECT COUNT(*) AS count FROM execution_attempts").get() as { count: number }).count).toBe(rowCount);
       expect(db.prepare(`SELECT ${existingColumns.join(", ")} FROM execution_attempts`).all()).toEqual(before);
@@ -9464,7 +9666,7 @@ else printf '%s\\n' '[]'; fi
     const db = new Database(":memory:");
     databaseIsReady(db);
     try {
-      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -12)) db.exec(statement); })();
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, -13)) db.exec(statement); })();
       db.pragma("foreign_keys = OFF");
       db.prepare("INSERT INTO project_config_revisions VALUES ('project', 1, '{}', 'config-digest', 1)").run();
       db.prepare("INSERT INTO repository_targets VALUES ('project', 'target', 1, 'source', 'host', '/target', NULL, 'main', 'target-digest')").run();
@@ -9496,11 +9698,11 @@ else printf '%s\\n' '[]'; fi
         eligibility: db.prepare("SELECT profile_digest, derivation_digest FROM eligibility_projections").get(),
         generation: db.prepare("SELECT holder_executed_profile_digest, holder_context_digest, eligibility_derivation_digest FROM role_generations").get(),
       };
-      const priorStatementDigests = MIGRATIONS.slice(0, -11).map(sha256);
+      const priorStatementDigests = MIGRATIONS.slice(0, -12).map(sha256);
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-12)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-13)!))();
 
-      expect(MIGRATIONS.slice(0, -11).map(sha256)).toEqual(priorStatementDigests);
+      expect(MIGRATIONS.slice(0, -12).map(sha256)).toEqual(priorStatementDigests);
       expect(db.prepare("SELECT requested_provider_id, requested_model, requested_reasoning_level, requested_permission_mode, requested_service_tier, requested_visibility, requested_profile_digest, attempt_digest FROM execution_attempts").get()).toEqual(Object.fromEntries(Object.entries(before.attempt as Record<string, unknown>).map(([name, value]) => [name.replace(/^actual_/u, "requested_"), value])));
       expect(db.prepare("SELECT requested_profile_digest, requested_provider_id, requested_model, requested_reasoning_level, requested_permission_mode, requested_service_tier, requested_visibility, evidence_digest, observation_digest FROM qualification_observations").get()).toEqual({
         requested_profile_digest: "legacy-profile-digest", requested_provider_id: "provider", requested_model: "model",
@@ -9544,7 +9746,7 @@ else printf '%s\\n' '[]'; fi
     databaseIsReady(db);
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -14)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -15)) db.exec(statement);
       })();
       const legacyResult = JSON.stringify({
         projectId: "proj_backfill_legacy",
@@ -9565,7 +9767,7 @@ else printf '%s\\n' '[]'; fi
         "SELECT project_id, epoch_created_at_ms, state, result_json, created_at_ms, updated_at_ms FROM work_item_github_backfills",
       ).get();
 
-      db.transaction(() => db.exec(MIGRATIONS.at(-14)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-15)!))();
 
       expect((db.prepare("PRAGMA table_info(work_item_github_backfills)").all() as Array<{ name: string }>).map((column) => column.name)).toEqual([
         "project_id", "epoch_created_at_ms", "state", "result_json", "created_at_ms", "updated_at_ms", "config_revision", "attempt_reason",
@@ -9580,9 +9782,9 @@ else printf '%s\\n' '[]'; fi
   });
 
   it("assembles the production v22 cached-consumer rollout receipt with stale-v21 refusal semantics", async () => {
-    expect(RUNTIME_CONTRACT_VERSION).toBe(27);
-    expect(SCHEMA_VERSION).toBe(32);
-    expect(MIGRATIONS).toHaveLength(45);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(28);
+    expect(SCHEMA_VERSION).toBe(33);
+    expect(MIGRATIONS).toHaveLength(46);
     expect(contractDigest).not.toBe("d4e51b0b1fd68957120cea5febb7762d6c3b9eddab76f67916e556830b062b83");
     const host = await loadedHost();
     const { db } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
@@ -9599,7 +9801,7 @@ else printf '%s\\n' '[]'; fi
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 32, observedContractVersion: 27 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 33, observedContractVersion: 28 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -9751,6 +9953,68 @@ else printf '%s\\n' '[]'; fi
     }
   });
 
+  it("maps populated pre-domain rows to reserved default and refuses ambiguous or mixed activation", () => {
+    const oldConfig = canonicalJson({ extensions: { bbCollab: { roleRequirements: [] } } });
+    const db = new Database(":memory:");
+    databaseIsReady(db);
+    try {
+      db.transaction(() => { for (const statement of MIGRATIONS.slice(0, GH637_DOMAIN_MIGRATION_ID)) db.exec(statement); })();
+      for (const projectId of ["domain-migration-one", "domain-migration-two"]) {
+        db.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES (?, 1, ?, ?, 1)").run(projectId, oldConfig, sha256(oldConfig));
+        db.prepare("INSERT INTO project_config_heads (project_id, config_revision, updated_at_ms) VALUES (?, 1, 1)").run(projectId);
+        db.prepare("INSERT INTO repository_targets (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest) VALUES (?, 'target', 1, 'source', 'host', '/domain-migration', NULL, 'main', 'target')").run(projectId);
+        db.prepare("INSERT INTO work_items (project_id, work_item_id, config_revision, repo_target_id, title, body, lifecycle_state, resource_revision, created_at_ms, updated_at_ms) VALUES (?, ?, 1, 'target', 'legacy', 'legacy', 'proposed', 1, 1, 1)").run(projectId, `${projectId}-work`);
+      }
+      db.exec(MIGRATIONS[GH637_DOMAIN_MIGRATION_ID]!);
+      expect(db.prepare("SELECT project_id, domain_id, task_classes_json FROM orchestration_domains ORDER BY project_id").all()).toEqual([
+        { project_id: "domain-migration-one", domain_id: "default", task_classes_json: '["default"]' },
+        { project_id: "domain-migration-two", domain_id: "default", task_classes_json: '["default"]' },
+      ]);
+      expect(db.prepare("SELECT domain_id, task_class FROM work_items ORDER BY project_id").all()).toEqual([
+        { domain_id: "default", task_class: "default" },
+        { domain_id: "default", task_class: "default" },
+      ]);
+      expect((db.prepare("PRAGMA table_info(role_generations)").all() as Array<{ name: string; pk: number }>).filter((column) => column.pk > 0).map((column) => column.name)).toEqual([
+        "project_id", "role_id", "generation", "domain_id",
+      ]);
+      expect(db.prepare("PRAGMA foreign_key_list(role_generations)").all()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ table: "role_generations", from: "domain_id", to: "domain_id" }),
+        expect.objectContaining({ table: "role_generations", from: "predecessor_generation", to: "generation" }),
+      ]));
+      expect(db.prepare("PRAGMA foreign_key_list(assignments)").all()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ table: "role_generations", from: "domain_id", to: "domain_id" }),
+        expect.objectContaining({ table: "role_generations", from: "role_generation", to: "generation" }),
+      ]));
+      expect(db.pragma("integrity_check", { simple: true })).toBe("ok");
+      expect(db.pragma("foreign_key_check")).toEqual([]);
+    } finally {
+      db.close();
+    }
+
+    const ambiguous = new Database(":memory:");
+    databaseIsReady(ambiguous);
+    try {
+      ambiguous.transaction(() => { for (const statement of MIGRATIONS.slice(0, GH637_DOMAIN_MIGRATION_ID)) ambiguous.exec(statement); })();
+      const explicit = canonicalJson({ extensions: { bbCollab: { domains: [{ domainId: "code", taskClasses: ["code"], roleRequirements: [] }] } } });
+      ambiguous.prepare("INSERT INTO project_config_revisions (project_id, config_revision, canonical_config_json, config_digest, created_at_ms) VALUES ('ambiguous', 1, ?, ?, 1)").run(explicit, sha256(explicit));
+      expect(() => migrateCanonicalStore(ambiguous, () => undefined)).toThrow(/explicit multi-domain authority/iu);
+      expect(ambiguous.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orchestration_domains'").get()).toBeUndefined();
+    } finally {
+      ambiguous.close();
+    }
+
+    const mixed = new Database(":memory:");
+    databaseIsReady(mixed);
+    try {
+      mixed.transaction(() => { for (const statement of MIGRATIONS.slice(0, GH637_DOMAIN_MIGRATION_ID)) mixed.exec(statement); })();
+      mixed.exec("CREATE TABLE orchestration_domains (project_id TEXT, config_revision INTEGER, domain_id TEXT, task_classes_json TEXT, role_requirements_json TEXT, domain_digest TEXT)");
+      expect(() => migrateCanonicalStore(mixed, () => undefined)).toThrow(/mixed-version/iu);
+      expect((mixed.prepare("PRAGMA table_info(work_items)").all() as Array<{ name: string }>).some((row) => row.name === "domain_id")).toBe(false);
+    } finally {
+      mixed.close();
+    }
+  });
+
   it("atomically rebuilds attempts with populated production child FKs and rejects the parent-drop mutant", () => {
     const directory = mkdtempSync(join(tmpdir(), "bb-collab-gh636-"));
     const path = join(directory, "fixture.db");
@@ -9763,6 +10027,7 @@ else printf '%s\\n' '[]'; fi
     };
     const tableDigest = (table: string) => {
       const columns = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(({ name }) => name)
+        .filter((name) => name !== "domain_id" && name !== "task_class")
         .filter((name) => table !== "execution_attempts" || ![
           "terminalization_class", "terminal_report_json", "terminal_actual_profile_digest", "interruption_reason",
           "interruption_event_id", "interruption_event_seq", "interruption_turn_id", "interruption_evidence_digest",
@@ -9781,7 +10046,7 @@ else printf '%s\\n' '[]'; fi
     const dispositionDigest = () => sha256(canonicalJson(db.prepare("SELECT decision_id, disposition_sequence, disposition, actor_receipt_id FROM decision_dispositions ORDER BY decision_id, disposition_sequence").all()));
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -2)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -3)) db.exec(statement);
       })();
       db.pragma("defer_foreign_keys = ON");
       db.transaction(() => {
@@ -9918,7 +10183,7 @@ else printf '%s\\n' '[]'; fi
     const projectId = "proj_gh300_rebuild";
     try {
       db.transaction(() => {
-        for (const statement of MIGRATIONS.slice(0, -17)) db.exec(statement);
+        for (const statement of MIGRATIONS.slice(0, -18)) db.exec(statement);
       })();
       db.pragma("foreign_keys = OFF");
       const insert = (table: string, row: Record<string, unknown>) => {
@@ -9976,7 +10241,7 @@ else printf '%s\\n' '[]'; fi
       const before = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
       expect(Object.values(before).every((value) => value !== null)).toBe(true);
       expect(new Set(Object.values(before).map((value) => String(value))).size).toBeGreaterThan(20);
-      db.transaction(() => db.exec(MIGRATIONS.at(-17)!))();
+      db.transaction(() => db.exec(MIGRATIONS.at(-18)!))();
       const after = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, "attempt-rebuild") as Record<string, unknown>;
       expect(Object.fromEntries(columns.map((column) => [column, after[column]]))).toEqual(Object.fromEntries(columns.map((column) => [column, before[column]])));
       expect(after.progress_json).toBe("{}");
@@ -10014,9 +10279,9 @@ else printf '%s\\n' '[]'; fi
     try {
       const executed: number[] = [];
       migrateCanonicalStore(succeeded, (database, statements) => sdkMigrate(database, statements, executed));
-      expect(executed).toEqual([GH636_REPAIR_MIGRATION_ID]);
+      expect(executed).toEqual([GH636_REPAIR_MIGRATION_ID, GH637_DOMAIN_MIGRATION_ID]);
       expect(succeeded.prepare("SELECT id FROM _bb_migrations ORDER BY id").all()).toEqual(
-        Array.from({ length: GH636_REPAIR_MIGRATION_ID + 1 }, (_, id) => ({ id })),
+        Array.from({ length: GH637_DOMAIN_MIGRATION_ID + 1 }, (_, id) => ({ id })),
       );
       expect(succeeded.pragma("integrity_check", { simple: true })).toBe("ok");
       expect(succeeded.pragma("foreign_key_check")).toEqual([]);
@@ -10100,8 +10365,8 @@ else printf '%s\\n' '[]'; fi
     const before = exportFoundation(db, PROJECT_ID);
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
-      observedSchemaVersion: 32,
-      observedContractVersion: 27,
+      observedSchemaVersion: 33,
+      observedContractVersion: 28,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -10182,8 +10447,8 @@ else printf '%s\\n' '[]'; fi
       outcome: "OK",
       evidence: {
         cachedConsumers: {
-          oldContractVersion: 26,
-          newContractVersion: 27,
+          oldContractVersion: 27,
+          newContractVersion: 28,
           action: "unknown",
           expected: 4,
           attempted: 0,
@@ -10331,7 +10596,7 @@ else printf '%s\\n' '[]'; fi
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 32, schemaDigest, contractVersion: 27, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 33, schemaDigest, contractVersion: 28, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -11561,8 +11826,8 @@ else printf '%s\\n' '[]'; fi
           artifactCount: 1,
           relationCount: 1,
         },
-        cachedConsumers: { oldSchemaVersion: 31, newSchemaVersion: 32, action: "unknown", expected: 4, attempted: 0, verified: 0 },
-        schema: { version: 32 },
+        cachedConsumers: { oldSchemaVersion: 32, newSchemaVersion: 33, action: "unknown", expected: 4, attempted: 0, verified: 0 },
+        schema: { version: 33 },
       },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -13020,7 +13285,7 @@ else printf '%s\\n' '[]'; fi
     const listed = await host.harness.runCli(["role-list", "--project", PROJECT_ID]);
     expect(listed.exitCode).toBe(0);
     expect(JSON.parse(listed.stdout).evidence).toEqual([
-      { roleId: "project-orchestrator", generation: 2, executionAttemptId, threadId: successorContext.threadId },
+      { roleId: "project-orchestrator", domainId: "default", generation: 2, executionAttemptId, threadId: successorContext.threadId },
     ]);
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeList);
     expect(host.harness.inspection.sdk.callsTo("threads.list")).toEqual([]);
@@ -13159,6 +13424,10 @@ else printf '%s\\n' '[]'; fi
     db.prepare(
       "UPDATE project_config_revisions SET canonical_config_json = ?, config_digest = ? WHERE project_id = ? AND config_revision = 1",
     ).run(historicalConfig, sha256(historicalConfig), PROJECT_ID);
+    const historicalRoleRequirements = (directorSeatConfig(DIRECTOR_K3_PROFILE, DIRECTOR_PROFILE).extensions.bbCollab as { roleRequirements?: unknown }).roleRequirements ?? [];
+    const historicalIdentity = { projectId: PROJECT_ID, configRevision: 1, domainId: "default", taskClasses: ["default"], roleRequirements: historicalRoleRequirements };
+    db.prepare("UPDATE orchestration_domains SET role_requirements_json = ?, domain_digest = ? WHERE project_id = ? AND config_revision = 1 AND domain_id = 'default'")
+      .run(canonicalJson(historicalRoleRequirements), sha256(canonicalJson(historicalIdentity)), PROJECT_ID);
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({ outcome: "OK" });
     expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
       roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID,
@@ -14009,7 +14278,7 @@ else printf '%s\\n' '[]'; fi
     db.exec("DROP TABLE execution_attempts; DROP TABLE assignments");
     db.pragma("foreign_keys = ON");
     db.exec(MIGRATIONS.find((statement) => statement.includes("CREATE TABLE IF NOT EXISTS assignments"))!);
-    for (const statement of MIGRATIONS.at(-12)!.split(";").filter((statement) => statement.includes("ALTER TABLE execution_attempts"))) db.exec(statement);
+    for (const statement of MIGRATIONS.at(-13)!.split(";").filter((statement) => statement.includes("ALTER TABLE execution_attempts"))) db.exec(statement);
     expect(db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ?").get(holder.holder_execution_attempt_id)).toBeUndefined();
     expect(exportFoundation(db, PROJECT_ID)).toEqual(exportFoundation(db, PROJECT_ID));
     expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
@@ -14029,10 +14298,10 @@ else printf '%s\\n' '[]'; fi
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 31, newSchemaVersion: 32, oldContractVersion: 26, newContractVersion: 27, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 31, newSchemaVersion: 32, oldContractVersion: 26, newContractVersion: 27, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 31, newSchemaVersion: 32, oldContractVersion: 26, newContractVersion: 27, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(32, 27))).toMatchObject({ oldSchemaVersion: 31, newSchemaVersion: 32, oldContractVersion: 26, newContractVersion: 27, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 33, oldContractVersion: 27, newContractVersion: 28, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 33, oldContractVersion: 27, newContractVersion: 28, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 33, oldContractVersion: 27, newContractVersion: 28, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(33, 28))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 33, oldContractVersion: 27, newContractVersion: 28, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 

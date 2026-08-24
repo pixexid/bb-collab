@@ -99,19 +99,25 @@ the same current root.
    and exact repository target all agree. Do not deploy, reload, create
    external projections, or mutate the amiga repository as part of bootstrap.
 
-## Seat topology proven by the runtime
+## Domain-scoped seat topology
 
-The schema keys both `project_governorship_heads` and
-`role_generation_heads` by `project_id`; `roleRequirementSchema` makes the
-director and project-orchestrator project-scoped. The role-context preflight
-also requires the holder thread and environment to belong to the request's
-exact project. Therefore the current runtime does not support one native
-director thread holding multiple tenant governorships. Use one project-scoped
-director and one project-scoped orchestrator per tenant; worker and reviewer
-seats bind to that tenant's exact repository targets. The isolated second-tenant
-test in `tests/server.test.ts` bootstraps two projects, preserves the first
-export, and establishes all three configured non-director role generations for
-the second.
+The schema keys `role_generation_heads` by `project_id`, role, and configured
+`domain_id`. Each domain declares its task classes and exact role profiles;
+workers and reviewers additionally bind to exact repository targets. Existing
+configs are represented by one append-only reserved `default` domain. The
+role-context preflight still requires the holder thread and environment to
+belong to the exact project, and domain is carried through role standing,
+succession, WorkItems, attempts, waits, and watchdog keys. Capacity remains a
+project-wide admission count while queue and diagnostic identity remains
+domain-scoped.
+
+## BenchBait first-cutover boundary
+
+At the first BenchBait cutover, the current seat becomes the editorial-domain
+Managing Editor canonical fact. The code-domain seat is a fresh generation;
+code work remains held until exact qualification, domain route, project-wide
+capacity, Doctor, and export proofs all pass. This section records a boundary,
+not a deployment or a claim that the cutover has occurred.
 
 ## Stall Guard dependency and Phase-3 activation check
 

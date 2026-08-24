@@ -10,14 +10,14 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
-export const RUNTIME_CONTRACT_VERSION = 27;
-export const SCHEMA_VERSION = 32;
+export const RUNTIME_CONTRACT_VERSION = 28;
+export const SCHEMA_VERSION = 33;
 // v27 records correlated terminal evidence and first-class interrupted attempts.
-const PREVIOUS_RUNTIME_CONTRACT_VERSION = 26;
+const PREVIOUS_RUNTIME_CONTRACT_VERSION = 27;
 export const DEFAULT_WRITING_LANE_CEILING = 3;
 export const MAX_WRITING_LANE_CEILING = 3;
 // Schema v32 repairs the append-only v31 migration ledger without changing runtime state.
-const PREVIOUS_SCHEMA_VERSION = 31;
+const PREVIOUS_SCHEMA_VERSION = 32;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const DIRECTOR_SEAT_ROLE_REQUIREMENT_ID = "director-seat" as const;
 const directorSeatPrimaryProfile = {
@@ -58,6 +58,7 @@ export const MAX_SOURCE_EVIDENCE_MANIFEST_BYTES = Math.floor(MAX_EXPORT_BYTES / 
 export const TABLES = [
   "project_config_revisions",
   "project_config_heads",
+  "orchestration_domains",
   "repository_targets",
   "project_governorships",
   "project_governorship_heads",
@@ -1257,8 +1258,195 @@ ${GH636_REPAIR_CHILD_TABLES}
      BEGIN SELECT RAISE(ABORT, 'lane capacity observation identifier is immutable'); END;`;
 MIGRATIONS.push(GH636_REPAIR_CHILD_TABLES);
 
-export const GH636_PREVIOUS_MIGRATION_ID = MIGRATIONS.length - 2;
-export const GH636_REPAIR_MIGRATION_ID = MIGRATIONS.length - 1;
+const GH637_DOMAIN_MIGRATION = `
+  CREATE TABLE orchestration_domains (
+    project_id TEXT NOT NULL,
+    config_revision INTEGER NOT NULL,
+    domain_id TEXT NOT NULL,
+    task_classes_json TEXT NOT NULL CHECK (json_valid(task_classes_json)),
+    role_requirements_json TEXT NOT NULL CHECK (json_valid(role_requirements_json)),
+    domain_digest TEXT NOT NULL,
+    PRIMARY KEY (project_id, config_revision, domain_id),
+    FOREIGN KEY (project_id, config_revision)
+      REFERENCES project_config_revisions(project_id, config_revision)
+  );
+  ALTER TABLE actor_receipts ADD COLUMN domain_id TEXT;
+  ALTER TABLE work_items ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'default';
+  ALTER TABLE work_items ADD COLUMN task_class TEXT NOT NULL DEFAULT 'default';
+  ALTER TABLE work_item_waits ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'default';
+  ALTER TABLE qualification_observations ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'default';
+  ALTER TABLE eligibility_projections ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'default';
+  ALTER TABLE role_generations ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'default';
+  ALTER TABLE assignments ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'default';
+  ALTER TABLE execution_attempts ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'default';
+  ALTER TABLE lane_capacity_intervals ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'default';
+  ALTER TABLE lane_capacity_refresh_evidence ADD COLUMN domain_id TEXT NOT NULL DEFAULT 'default';
+  INSERT INTO orchestration_domains
+    (project_id, config_revision, domain_id, task_classes_json, role_requirements_json, domain_digest)
+  SELECT project_id, config_revision, 'default', '["default"]',
+         COALESCE(json_extract(canonical_config_json, '$.extensions.bbCollab.roleRequirements'), '[]'),
+         config_digest
+    FROM project_config_revisions;
+  PRAGMA defer_foreign_keys = ON;
+  CREATE TEMP TABLE gh637_role_generations AS SELECT * FROM role_generations;
+  CREATE TEMP TABLE gh637_assignments AS SELECT * FROM assignments;
+  CREATE TEMP TABLE gh637_role_generation_heads AS SELECT * FROM role_generation_heads;
+  CREATE TEMP TABLE gh637_execution_attempts AS SELECT * FROM execution_attempts;
+  CREATE TEMP TABLE gh637_evidence_artifacts AS SELECT * FROM evidence_artifacts;
+  CREATE TEMP TABLE gh637_decision_evidence AS SELECT * FROM decision_evidence;
+  CREATE TEMP TABLE gh637_lane_capacity_refresh_evidence AS SELECT * FROM lane_capacity_refresh_evidence;
+  DROP TRIGGER IF EXISTS lane_capacity_refresh_evidence_immutable_update;
+  DROP TRIGGER IF EXISTS lane_capacity_refresh_evidence_immutable_delete;
+  DELETE FROM decision_evidence;
+  DELETE FROM evidence_artifacts;
+  DELETE FROM lane_capacity_refresh_evidence;
+  DELETE FROM execution_attempts;
+  DELETE FROM assignments;
+  DELETE FROM role_generation_heads;
+  DELETE FROM role_generations;
+  DROP TABLE role_generation_heads;
+  DROP TABLE assignments;
+  DROP TABLE role_generations;
+  CREATE TABLE role_generations (
+    project_id TEXT NOT NULL,
+    role_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    role_requirement_id TEXT NOT NULL,
+    config_revision INTEGER NOT NULL,
+    repo_target_id TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'draining', 'retired', 'invalidated')),
+    predecessor_generation INTEGER,
+    holder_execution_attempt_id TEXT NOT NULL,
+    holder_context_digest TEXT NOT NULL,
+    holder_requested_profile_digest TEXT NOT NULL,
+    qualification_id TEXT NOT NULL,
+    eligibility_derivation_digest TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    activated_at_ms INTEGER NOT NULL,
+    retired_at_ms INTEGER,
+    standby_profile_json TEXT CHECK (standby_profile_json IS NULL OR json_valid(standby_profile_json)),
+    domain_id TEXT NOT NULL DEFAULT 'default',
+    PRIMARY KEY (project_id, role_id, generation, domain_id),
+    FOREIGN KEY (project_id, config_revision)
+      REFERENCES project_config_revisions(project_id, config_revision),
+    FOREIGN KEY (project_id, repo_target_id, config_revision)
+      REFERENCES repository_targets(project_id, repo_target_id, config_revision),
+    FOREIGN KEY (project_id, qualification_id)
+      REFERENCES qualification_observations(project_id, qualification_id),
+    FOREIGN KEY (project_id, role_id, predecessor_generation, domain_id)
+      REFERENCES role_generations(project_id, role_id, generation, domain_id),
+    CHECK ((generation = 1 AND predecessor_generation IS NULL) OR
+           (generation > 1 AND predecessor_generation = generation - 1))
+  );
+  CREATE TABLE assignments (
+    project_id TEXT NOT NULL,
+    assignment_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL,
+    assignment_kind TEXT NOT NULL CHECK (assignment_kind IN ('write', 'review', 'probe')),
+    lane_id TEXT NOT NULL,
+    role_requirement_id TEXT NOT NULL,
+    role_id TEXT NOT NULL,
+    role_generation INTEGER NOT NULL CHECK (role_generation > 0),
+    config_revision INTEGER NOT NULL,
+    governance_epoch INTEGER NOT NULL CHECK (governance_epoch > 0),
+    work_item_revision INTEGER NOT NULL CHECK (work_item_revision > 0),
+    repo_target_id TEXT NOT NULL,
+    branch_name TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    candidate_semantics TEXT NOT NULL CHECK (candidate_semantics IN ('base', 'frozen')),
+    candidate_sha TEXT,
+    bb_server_id TEXT NOT NULL,
+    environment_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    environment_path TEXT NOT NULL,
+    environment_mode TEXT NOT NULL CHECK (environment_mode = 'managed-worktree'),
+    frozen_brief_version INTEGER NOT NULL CHECK (frozen_brief_version = 1),
+    frozen_brief_digest TEXT NOT NULL,
+    requested_provider_id TEXT NOT NULL,
+    requested_model TEXT NOT NULL,
+    requested_reasoning_level TEXT NOT NULL,
+    requested_permission_mode TEXT NOT NULL CHECK (requested_permission_mode = 'full'),
+    requested_service_tier TEXT NOT NULL,
+    requested_visibility TEXT NOT NULL CHECK (requested_visibility = 'visible'),
+    requested_profile_digest TEXT NOT NULL,
+    dispatch_kind TEXT NOT NULL CHECK (dispatch_kind IN ('spawn', 'attach')),
+    attach_thread_id TEXT,
+    parent_assignment_id TEXT,
+    depth INTEGER NOT NULL CHECK (depth = 0),
+    deadline_at_ms INTEGER NOT NULL CHECK (deadline_at_ms >= 0),
+    assignment_digest TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    creation_event_sequence INTEGER NOT NULL CHECK (creation_event_sequence > 0),
+    created_at_ms INTEGER NOT NULL,
+    domain_id TEXT NOT NULL DEFAULT 'default',
+    PRIMARY KEY (project_id, assignment_id),
+    FOREIGN KEY (project_id, work_item_id)
+      REFERENCES work_items(project_id, work_item_id),
+    FOREIGN KEY (project_id, repo_target_id, config_revision)
+      REFERENCES repository_targets(project_id, repo_target_id, config_revision),
+    FOREIGN KEY (project_id, role_id, role_generation, domain_id)
+      REFERENCES role_generations(project_id, role_id, generation, domain_id),
+    FOREIGN KEY (project_id, parent_assignment_id)
+      REFERENCES assignments(project_id, assignment_id),
+    CHECK ((candidate_semantics = 'base' AND candidate_sha IS NULL) OR
+           (candidate_semantics = 'frozen' AND candidate_sha IS NOT NULL)),
+    CHECK ((dispatch_kind = 'spawn' AND attach_thread_id IS NULL) OR
+           (dispatch_kind = 'attach' AND attach_thread_id IS NOT NULL))
+  );
+  CREATE TABLE role_generation_heads (
+    project_id TEXT NOT NULL,
+    role_id TEXT NOT NULL,
+    domain_id TEXT NOT NULL DEFAULT 'default',
+    current_generation INTEGER NOT NULL CHECK (current_generation > 0),
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (project_id, role_id, domain_id),
+    FOREIGN KEY (project_id, role_id, current_generation, domain_id)
+      REFERENCES role_generations(project_id, role_id, generation, domain_id)
+  );
+  INSERT INTO role_generations (
+    project_id, role_id, generation, role_requirement_id, config_revision, repo_target_id, status,
+    predecessor_generation, holder_execution_attempt_id, holder_context_digest, holder_requested_profile_digest,
+    qualification_id, eligibility_derivation_digest, created_at_ms, activated_at_ms, retired_at_ms,
+    standby_profile_json, domain_id
+  ) SELECT project_id, role_id, generation, role_requirement_id, config_revision, repo_target_id, status,
+    predecessor_generation, holder_execution_attempt_id, holder_context_digest, holder_requested_profile_digest,
+    qualification_id, eligibility_derivation_digest, created_at_ms, activated_at_ms, retired_at_ms,
+    standby_profile_json, COALESCE(domain_id, 'default') FROM gh637_role_generations;
+  INSERT INTO assignments SELECT project_id, assignment_id, work_item_id, assignment_kind, lane_id,
+    role_requirement_id, role_id, role_generation, config_revision, governance_epoch, work_item_revision,
+    repo_target_id, branch_name, base_sha, candidate_semantics, candidate_sha, bb_server_id, environment_id,
+    source_id, host_id, environment_path, environment_mode, frozen_brief_version, frozen_brief_digest,
+    requested_provider_id, requested_model, requested_reasoning_level, requested_permission_mode,
+    requested_service_tier, requested_visibility, requested_profile_digest, dispatch_kind, attach_thread_id,
+    parent_assignment_id, depth, deadline_at_ms, assignment_digest, idempotency_key, creation_event_sequence,
+    created_at_ms, COALESCE(domain_id, 'default') FROM gh637_assignments;
+  INSERT INTO role_generation_heads (project_id, role_id, domain_id, current_generation, updated_at_ms)
+    SELECT project_id, role_id, 'default', current_generation, updated_at_ms FROM gh637_role_generation_heads;
+  INSERT INTO execution_attempts SELECT * FROM gh637_execution_attempts;
+  INSERT INTO evidence_artifacts SELECT * FROM gh637_evidence_artifacts;
+  INSERT INTO decision_evidence SELECT * FROM gh637_decision_evidence;
+  INSERT INTO lane_capacity_refresh_evidence SELECT * FROM gh637_lane_capacity_refresh_evidence;
+  CREATE TRIGGER lane_capacity_refresh_evidence_immutable_update
+    BEFORE UPDATE ON lane_capacity_refresh_evidence
+    BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;
+  CREATE TRIGGER lane_capacity_refresh_evidence_immutable_delete
+    BEFORE DELETE ON lane_capacity_refresh_evidence
+    BEGIN SELECT RAISE(ABORT, 'lane capacity refresh evidence is immutable'); END;
+  DROP TABLE gh637_lane_capacity_refresh_evidence;
+  DROP TABLE gh637_decision_evidence;
+  DROP TABLE gh637_evidence_artifacts;
+  DROP TABLE gh637_execution_attempts;
+  DROP TABLE gh637_role_generation_heads;
+  DROP TABLE gh637_assignments;
+  DROP TABLE gh637_role_generations;
+`;
+MIGRATIONS.push(GH637_DOMAIN_MIGRATION);
+
+export const GH637_DOMAIN_MIGRATION_ID = MIGRATIONS.length - 1;
+
+export const GH636_PREVIOUS_MIGRATION_ID = MIGRATIONS.length - 3;
+export const GH636_REPAIR_MIGRATION_ID = MIGRATIONS.length - 2;
 
 export const schemaDigest = sha256(MIGRATIONS.join("\n"));
 export const GH300_BACKFILL_MIGRATION_ID = MIGRATIONS.findIndex((statement) => statement.includes("CREATE TABLE execution_attempts_gh300"));
@@ -1504,12 +1692,14 @@ export const contractDigest = sha256(canonicalJson({
   migrationSteps: MIGRATION_STEPS,
   roleCapacityPolicy: {
     roleIds: [...ROLE_IDS],
-    maxRequirements: ROLE_IDS.length,
+    maxDomains: 128,
+    maxTaskClassesPerDomain: 128,
+    identity: "configured-domain-scoped-role-requirement",
     scoping: {
-      director: "project",
-      "project-orchestrator": "project",
-      worker: "repository-target",
-      "independent-reviewer": "repository-target",
+      director: "project-domain",
+      "project-orchestrator": "project-domain",
+      worker: "repository-target-domain",
+      "independent-reviewer": "repository-target-domain",
     },
   },
   roleStandbyPolicy: {
@@ -1862,6 +2052,7 @@ export const WORK_ITEM_IDLE_BLIND_ATTEMPT_STATES = ["dispatch_unknown"] as const
 
 export interface WorkItemCapacityLaneEvidence {
   execution_attempt_id: string;
+  domain_id: string;
   lane_id: string;
   thread_id: string | null;
   state: (typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES)[number];
@@ -1885,6 +2076,7 @@ export interface WorkItemDispatchThread {
 export interface WorkItemDispatchWedge {
   executionAttemptId: string;
   workItemId: string;
+  domainId?: string;
 }
 
 export interface WorkItemDispatchIntent {
@@ -1950,8 +2142,9 @@ export function reconcilePreparedWorkItemDispatches(
 }
 
 export function workItemCapacityLaneEvidence(db: SqliteDatabase, projectId: string): WorkItemCapacityEvidence {
+  const hasDomainColumn = tableColumns(db, "execution_attempts").includes("domain_id");
   const lanes = (db.prepare(
-    `SELECT execution_attempts.execution_attempt_id, execution_attempts.lane_id, execution_attempts.thread_id, execution_attempts.state, execution_attempts.observed_at_ms
+    `SELECT execution_attempts.execution_attempt_id, execution_attempts.lane_id, execution_attempts.thread_id, execution_attempts.state, execution_attempts.observed_at_ms, ${hasDomainColumn ? "execution_attempts.domain_id" : "'default' AS domain_id"}
      FROM execution_attempts
      JOIN work_items ON work_items.project_id = execution_attempts.project_id
        AND work_items.work_item_id = execution_attempts.work_item_id
@@ -1963,6 +2156,7 @@ export function workItemCapacityLaneEvidence(db: SqliteDatabase, projectId: stri
      ORDER BY execution_attempts.lane_id, execution_attempts.execution_attempt_id`,
   ).all(projectId, ...WORK_ITEM_CAPACITY_LIFECYCLE_STATES, ...WORK_ITEM_CAPACITY_ATTEMPT_STATES) as Array<{
     execution_attempt_id: string;
+    domain_id: string;
     lane_id: string;
     thread_id: string | null;
     state: (typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES)[number];
@@ -2000,6 +2194,8 @@ const workItemInputSchema = z
     workItemId: id,
     title: z.string().max(4096),
     body: z.string().max(64 * 1024),
+    taskClass: id.optional(),
+    domainId: id.optional(),
     githubIssue: githubIssueBindingSchema.optional(),
   })
   .strict();
@@ -2177,6 +2373,32 @@ const roleRequirementsSchema = z.array(roleRequirementSchema).max(ROLE_IDS.lengt
     roleIds.add(requirement.roleId);
   });
 });
+const domainSchema = z.object({
+  domainId: id,
+  taskClasses: z.array(id).min(1).max(128),
+  roleRequirements: roleRequirementsSchema,
+}).strict().superRefine((domain, ctx) => {
+  if (new Set(domain.taskClasses).size !== domain.taskClasses.length) {
+    ctx.addIssue({ code: "custom", path: ["taskClasses"], message: "domain task classes must be unique" });
+  }
+});
+const domainsSchema = z.array(domainSchema).min(1).max(128).superRefine((domains, ctx) => {
+  const domainIds = new Set<string>();
+  const taskClasses = new Set<string>();
+  const requirementIds = new Set<string>();
+  for (const [index, domain] of domains.entries()) {
+    if (domainIds.has(domain.domainId)) ctx.addIssue({ code: "custom", path: [index, "domainId"], message: "duplicate domain" });
+    domainIds.add(domain.domainId);
+    for (const taskClass of domain.taskClasses) {
+      if (taskClasses.has(taskClass)) ctx.addIssue({ code: "custom", path: [index, "taskClasses"], message: "task class is ambiguous across domains" });
+      taskClasses.add(taskClass);
+    }
+    for (const requirement of domain.roleRequirements) {
+      if (requirementIds.has(requirement.roleRequirementId)) ctx.addIssue({ code: "custom", path: [index, "roleRequirements"], message: "role requirement identity is ambiguous across domains" });
+      requirementIds.add(requirement.roleRequirementId);
+    }
+  }
+});
 const roleContextRefSchema = z
   .object({
     threadId: id,
@@ -2318,6 +2540,8 @@ export const applyRequestSchema = z
     expectedGovernanceEpoch: z.number().int().nonnegative().nullable().optional(),
     expectedFenceToken: id.nullable().optional(),
     repoTargetId: id.nullable().optional(),
+    domainId: id.optional(),
+    taskClass: id.optional(),
     expectedResourceRevision: z.number().int().positive().nullable().optional(),
     runtimeId: id.optional(),
     config: z.unknown().optional(),
@@ -2964,6 +3188,10 @@ export type FoundationCode =
   | "PROJECT_REQUIRED"
   | "PROJECT_CONFIG_REQUIRED"
   | "PROJECT_CONFIG_STALE"
+  | "DOMAIN_REQUIRED"
+  | "DOMAIN_AMBIGUOUS"
+  | "DOMAIN_FOREIGN"
+  | "DOMAIN_CONFIG_STALE"
   | "REPO_TARGET_REQUIRED"
   | "REPO_TARGET_AMBIGUOUS"
   | "REPO_TARGET_FOREIGN"
@@ -3220,8 +3448,16 @@ function validateConfig(value: unknown): string {
         if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
       }
       const roleRequirements = (bbCollab as Record<string, unknown>).roleRequirements;
+      const domains = (bbCollab as Record<string, unknown>).domains;
+      if (domains !== undefined && roleRequirements !== undefined) {
+        throw refusal("INVALID_INPUT", "bbCollab roleRequirements and domains cannot be mixed");
+      }
       if (roleRequirements !== undefined) {
         const parsed = roleRequirementsSchema.safeParse(roleRequirements);
+        if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
+      }
+      if (domains !== undefined) {
+        const parsed = domainsSchema.safeParse(domains);
         if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
       }
       const writingLaneCeiling = (bbCollab as Record<string, unknown>).writingLaneCeiling;
@@ -3250,6 +3486,81 @@ export function requestedProfileDigest(profile: ExecutionProfile): string {
   return sha256(canonicalJson({ provenance: "client/turn/requested", profile }));
 }
 type RoleRequirement = z.infer<typeof roleRequirementSchema>;
+type OrchestrationDomain = z.infer<typeof domainSchema>;
+
+function domainDefinitionsFromConfigJson(configJson: string): OrchestrationDomain[] {
+  const config = JSON.parse(configJson) as {
+    extensions?: { bbCollab?: { domains?: unknown; roleRequirements?: unknown } };
+  };
+  const bbCollab = config.extensions?.bbCollab;
+  const stripLegacyFields = (value: unknown) => Array.isArray(value) ? value.map((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return candidate;
+    const { firstGenerationExemption: _legacy, ...requirement } = candidate as Record<string, unknown>;
+    return requirement;
+  }) : value;
+  if (bbCollab?.domains !== undefined) {
+    const domains = Array.isArray(bbCollab.domains)
+      ? bbCollab.domains.map((domain) => domain && typeof domain === "object" && !Array.isArray(domain)
+        ? { ...(domain as Record<string, unknown>), roleRequirements: stripLegacyFields((domain as { roleRequirements?: unknown }).roleRequirements) }
+        : domain)
+      : bbCollab.domains;
+    const parsed = domainsSchema.safeParse(domains);
+    if (!parsed.success) throw refusal("DOMAIN_CONFIG_STALE", "stored orchestration domains are invalid");
+    return parsed.data;
+  }
+  const legacy = roleRequirementsSchema.safeParse(stripLegacyFields(bbCollab?.roleRequirements ?? []));
+  if (!legacy.success) throw refusal("DOMAIN_CONFIG_STALE", "stored default-domain role requirements are invalid");
+  return [{ domainId: "default", taskClasses: ["default"], roleRequirements: legacy.data }];
+}
+
+function flatDomainRequirements(configJson: string): Array<RoleRequirement & { domainId: string }> {
+  return domainDefinitionsFromConfigJson(configJson).flatMap((domain) => domain.roleRequirements.map((requirement) => ({ ...requirement, domainId: domain.domainId })));
+}
+
+function domainForTaskClass(domains: readonly OrchestrationDomain[], taskClass: string, requestedDomainId?: string): OrchestrationDomain {
+  const matches = domains.filter((domain) => domain.taskClasses.includes(taskClass));
+  if (matches.length === 0) throw refusal("DOMAIN_FOREIGN", "task class is outside the configured orchestration domains");
+  if (matches.length !== 1) throw refusal("DOMAIN_AMBIGUOUS", "task class does not resolve to one configured domain");
+  if (requestedDomainId !== undefined && matches[0]!.domainId !== requestedDomainId) {
+    throw refusal("DOMAIN_FOREIGN", "requested domain does not own the task class");
+  }
+  return matches[0]!;
+}
+
+function persistOrchestrationDomains(db: SqliteDatabase, projectId: string, configRevision: number, configJson: string): void {
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orchestration_domains'").get() === undefined) return;
+  for (const domain of domainDefinitionsFromConfigJson(configJson)) {
+    const identity = { projectId, configRevision, domainId: domain.domainId, taskClasses: domain.taskClasses, roleRequirements: domain.roleRequirements };
+    db.prepare(
+      `INSERT INTO orchestration_domains
+        (project_id, config_revision, domain_id, task_classes_json, role_requirements_json, domain_digest)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(projectId, configRevision, domain.domainId, canonicalJson(domain.taskClasses), canonicalJson(domain.roleRequirements), sha256(canonicalJson(identity)));
+  }
+}
+
+export function configuredDomains(db: SqliteDatabase, projectId: string, configRevision: number): OrchestrationDomain[] {
+  const configJson = storedConfigJson(db, projectId, configRevision);
+  const configured = domainDefinitionsFromConfigJson(configJson);
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orchestration_domains'").get() === undefined) return [{ domainId: "default", taskClasses: ["default"], roleRequirements: configured.flatMap((domain) => domain.roleRequirements) }];
+  const rows = db.prepare(
+    `SELECT domain_id, task_classes_json, role_requirements_json, domain_digest
+       FROM orchestration_domains WHERE project_id = ? AND config_revision = ? ORDER BY domain_id`,
+  ).all(projectId, configRevision) as Array<{ domain_id: string; task_classes_json: string; role_requirements_json: string; domain_digest: string }>;
+  if (rows.length !== configured.length) throw refusal("DOMAIN_CONFIG_STALE", "domain inventory is incomplete for the exact config revision");
+  const result = rows.map((row) => {
+    const domain = configured.find((candidate) => candidate.domainId === row.domain_id);
+    if (!domain || canonicalJson(domain.taskClasses) !== row.task_classes_json || canonicalJson(domain.roleRequirements) !== row.role_requirements_json) {
+      throw refusal("DOMAIN_CONFIG_STALE", "domain inventory does not match the exact immutable config revision");
+    }
+    const identity = { projectId, configRevision, domainId: domain.domainId, taskClasses: domain.taskClasses, roleRequirements: domain.roleRequirements };
+    if (sha256(canonicalJson(identity)) !== row.domain_digest && row.domain_digest !== sha256(configJson)) {
+      throw refusal("DOMAIN_CONFIG_STALE", "domain inventory digest is stale or mixed-version");
+    }
+    return domain;
+  });
+  return result;
+}
 
 function githubConfigFromJson(configJson: string): GithubIssuesConfig | null {
   const config = JSON.parse(configJson) as {
@@ -3349,6 +3660,8 @@ export interface WorkItemDispatchConfigRequest {
   projectId: string;
   workItemId: string;
   repoTargetId: string;
+  domainId?: string;
+  taskClass?: string;
   expectedConfigRevision: number | null | undefined;
   expectedGovernanceEpoch: number | null | undefined;
   expectedFenceToken: string | null | undefined;
@@ -3364,6 +3677,8 @@ export interface WorkItemDispatchConfigProof {
   hostId: string;
   path: string;
   defaultBranch: string;
+  domainId: string;
+  taskClass: string;
   continued: boolean;
   proofDigest: string;
 }
@@ -3389,12 +3704,11 @@ function dispatchTargetIdentity(row: Record<string, unknown>): Record<string, un
   };
 }
 
-function dispatchRoleRequirement(db: SqliteDatabase, projectId: string, configRevision: number, repoTargetId: string): RoleRequirement {
-  const requirements = roleRequirementsFromJson(storedConfigJson(db, projectId, configRevision)).filter((requirement) =>
-    requirement.roleId === "worker" && requirement.repoTargetId === repoTargetId,
-  );
+function dispatchRoleRequirement(db: SqliteDatabase, projectId: string, configRevision: number, repoTargetId: string, domainId: string, taskClass: string): RoleRequirement & { domainId: string } {
+  const domain = domainForTaskClass(configuredDomains(db, projectId, configRevision), taskClass, domainId);
+  const requirements = domain.roleRequirements.filter((requirement) => requirement.roleId === "worker" && requirement.repoTargetId === repoTargetId);
   if (requirements.length !== 1) throw refusal("PROJECT_CONFIG_STALE", "the exact worker role requirement is missing or ambiguous across the config revision");
-  return requirements[0]!;
+  return { ...requirements[0]!, domainId };
 }
 
 export function proveWorkItemDispatchConfig(
@@ -3423,11 +3737,13 @@ export function proveWorkItemDispatchConfig(
       expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? undefined,
     });
   }
-  const workItem = asRow<{ config_revision: number; repo_target_id: string }>(db.prepare(
-    "SELECT config_revision, repo_target_id FROM work_items WHERE project_id = ? AND work_item_id = ?",
+  const workItem = asRow<{ config_revision: number; repo_target_id: string; domain_id: string; task_class: string }>(db.prepare(
+    "SELECT config_revision, repo_target_id, domain_id, task_class FROM work_items WHERE project_id = ? AND work_item_id = ?",
   ).get(request.projectId, request.workItemId));
   if (!workItem) throw refusal("WORK_ITEM_UNKNOWN", "work item is not known in the exact project");
   if (workItem.repo_target_id !== request.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "dispatch target does not match the WorkItem target");
+  if (request.domainId !== undefined && request.domainId !== workItem.domain_id) throw refusal("DOMAIN_FOREIGN", "dispatch domain does not match the immutable WorkItem domain");
+  if (request.taskClass !== undefined && request.taskClass !== workItem.task_class) throw refusal("DOMAIN_FOREIGN", "dispatch task class does not match the immutable WorkItem task class");
 
   const currentTarget = asRow<Record<string, unknown>>(db.prepare(
     "SELECT * FROM repository_targets WHERE project_id = ? AND repo_target_id = ? AND config_revision = ?",
@@ -3437,8 +3753,8 @@ export function proveWorkItemDispatchConfig(
   ).get(request.projectId, request.repoTargetId, workItem.config_revision));
   if (!currentTarget || !historicalTarget) throw refusal("PROJECT_CONFIG_STALE", "the exact WorkItem target is missing from a config revision");
 
-  const historicalRole = dispatchRoleRequirement(db, request.projectId, workItem.config_revision, request.repoTargetId);
-  const currentRole = dispatchRoleRequirement(db, request.projectId, currentConfigRevision, request.repoTargetId);
+  const historicalRole = dispatchRoleRequirement(db, request.projectId, workItem.config_revision, request.repoTargetId, workItem.domain_id, workItem.task_class);
+  const currentRole = dispatchRoleRequirement(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, workItem.task_class);
   const requestedProfile = dispatchProfileIdentity(request.requestedProfile);
   if (!dispatchProfileMatches(request.requestedProfile, historicalRole.executedProfile) || !dispatchProfileMatches(request.requestedProfile, currentRole.executedProfile)) {
     throw refusal("PROJECT_CONFIG_STALE", "dispatch profile does not equal the exact historical and current worker requirement");
@@ -3449,6 +3765,8 @@ export function proveWorkItemDispatchConfig(
     permissionMode: (JSON.parse(historicalConfigJson) as Record<string, unknown>).permissionMode,
     visibility: (JSON.parse(historicalConfigJson) as Record<string, unknown>).visibility,
     writingLaneCeiling: writingLaneCeilingFromJson(historicalConfigJson),
+    domainId: workItem.domain_id,
+    taskClass: workItem.task_class,
     roleRequirement: historicalRole,
     target: dispatchTargetIdentity(historicalTarget),
   };
@@ -3456,6 +3774,8 @@ export function proveWorkItemDispatchConfig(
     permissionMode: (JSON.parse(currentConfigJson) as Record<string, unknown>).permissionMode,
     visibility: (JSON.parse(currentConfigJson) as Record<string, unknown>).visibility,
     writingLaneCeiling: writingLaneCeilingFromJson(currentConfigJson),
+    domainId: workItem.domain_id,
+    taskClass: workItem.task_class,
     roleRequirement: currentRole,
     target: dispatchTargetIdentity(currentTarget),
   };
@@ -3485,6 +3805,8 @@ export function proveWorkItemDispatchConfig(
     hostId: String(currentTarget.host_id),
     path: String(currentTarget.path),
     defaultBranch: String(currentTarget.default_branch),
+    domainId: workItem.domain_id,
+    taskClass: workItem.task_class,
     continued: workItem.config_revision !== currentConfigRevision,
     proofDigest: sha256(canonicalJson(proof)),
   };
@@ -3505,7 +3827,7 @@ function requireMappedTargets(configJson: string, targets: NonNullable<ApplyRequ
   if (github?.repositoryMappings.some((mapping) => !targetIds.has(mapping.repoTargetId))) {
     throw refusal("REPO_TARGET_FOREIGN", "GitHub repository mapping names a target outside the config revision");
   }
-  if (roleRequirementsFromJson(configJson).some((requirement) => requirement.repoTargetId && !targetIds.has(requirement.repoTargetId))) {
+  if (flatDomainRequirements(configJson).some((requirement) => requirement.repoTargetId && !targetIds.has(requirement.repoTargetId))) {
     throw refusal("REPO_TARGET_FOREIGN", "role requirement names a target outside the config revision");
   }
   if (reviewPolicyFromJson(configJson)?.connectors.some((connector) => !targetIds.has(connector.repoTargetId))) {
@@ -3682,8 +4004,9 @@ function actorReceiptDigest(input: {
   verificationState: string;
   operatorReceiptId: string | null;
   retirementCondition: string | null;
+  domainId?: string | null;
 }): string {
-  return sha256(canonicalJson({
+  const payload: Record<string, unknown> = {
     projectId: input.projectId,
     receiptId: input.receiptId,
     actorKind: input.actorKind,
@@ -3693,7 +4016,9 @@ function actorReceiptDigest(input: {
     verificationState: input.verificationState,
     operatorReceiptId: input.operatorReceiptId,
     retirementCondition: input.retirementCondition,
-  }));
+  };
+  if (input.domainId !== undefined && input.domainId !== null) payload.domainId = input.domainId;
+  return sha256(canonicalJson(payload));
 }
 
 export function mutationRequestDigest(request: ApplyRequest): string {
@@ -3782,6 +4107,7 @@ function isLegacyBootstrapGovernor(db: SqliteDatabase, projectId: string, receip
 
 function requireActor(db: SqliteDatabase, request: ApplyRequest): string {
   if (!request.actorReceiptId) throw refusal("ACTOR_RECEIPT_REQUIRED", "a typed actor receipt is required");
+  const hasDomainColumn = tableColumns(db, "actor_receipts").includes("domain_id");
   const row = asRow<{
     project_id: string;
     actor_kind: string;
@@ -3791,9 +4117,10 @@ function requireActor(db: SqliteDatabase, request: ApplyRequest): string {
     verification_state: string;
     operator_receipt_id: string | null;
     retirement_condition: string | null;
+    domain_id: string | null;
     receipt_digest: string;
   }>(
-    db.prepare("SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, operator_receipt_id, retirement_condition, receipt_digest FROM actor_receipts WHERE receipt_id = ?").get(request.actorReceiptId),
+    db.prepare(`SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, operator_receipt_id, retirement_condition, ${hasDomainColumn ? "domain_id" : "NULL AS domain_id"}, receipt_digest FROM actor_receipts WHERE receipt_id = ?`).get(request.actorReceiptId),
   );
   if (!row) throw refusal("ACTOR_RECEIPT_UNKNOWN", "actor receipt is not known");
   if (row.project_id !== request.projectId) throw refusal("ACTOR_RECEIPT_FOREIGN", "actor receipt belongs to another project");
@@ -3811,6 +4138,7 @@ function requireActor(db: SqliteDatabase, request: ApplyRequest): string {
     verificationState: row.verification_state,
     operatorReceiptId: row.operator_receipt_id,
     retirementCondition: row.retirement_condition,
+    domainId: row.domain_id,
   });
   if (row.receipt_digest !== expectedDigest) throw refusal("ACTOR_RECEIPT_UNVERIFIED", "actor receipt digest is invalid");
   return request.actorReceiptId;
@@ -4032,9 +4360,9 @@ function deriveBootstrapActor(
   }
   const sourceActor = asRow<{
     project_id: string; actor_kind: string; subject_id: string; role_id: string | null; role_generation: number | null;
-    verification_state: string; operator_receipt_id: string | null; retirement_condition: string | null; receipt_digest: string;
+    verification_state: string; operator_receipt_id: string | null; retirement_condition: string | null; domain_id: string | null; receipt_digest: string;
   }>(db.prepare(
-    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, operator_receipt_id, retirement_condition, receipt_digest FROM actor_receipts WHERE project_id = ? AND receipt_id = ?",
+    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, operator_receipt_id, retirement_condition, domain_id, receipt_digest FROM actor_receipts WHERE project_id = ? AND receipt_id = ?",
   ).get(authority.sourceProjectId, sourceGovernor.actor_receipt_id));
   const sourceActorDigest = sourceActor && actorReceiptDigest({
     projectId: sourceActor.project_id,
@@ -4046,6 +4374,7 @@ function deriveBootstrapActor(
     verificationState: sourceActor.verification_state,
     operatorReceiptId: sourceActor.operator_receipt_id,
     retirementCondition: sourceActor.retirement_condition,
+    domainId: sourceActor.domain_id,
   });
   if (!sourceActor || sourceActor.project_id !== authority.sourceProjectId || sourceActor.actor_kind !== "plugin" ||
       sourceActor.subject_id !== PLUGIN_ID || sourceActor.verification_state !== "verified" || sourceActor.receipt_digest !== sourceActorDigest) {
@@ -4199,6 +4528,7 @@ function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: strin
     request.projectId,
     createdAtMs,
   );
+  persistOrchestrationDomains(db, request.projectId, 1, config);
   const insertTarget = db.prepare(
     `INSERT INTO repository_targets
       (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest)
@@ -4307,6 +4637,7 @@ function applyConfigRevision(db: SqliteDatabase, request: ApplyRequest, digest: 
       (project_id, config_revision, canonical_config_json, config_digest, created_at_ms)
      VALUES (?, ?, ?, ?, ?)`,
   ).run(request.projectId, nextRevision, configJson, sha256(configJson), createdAtMs);
+  persistOrchestrationDomains(db, request.projectId, nextRevision, configJson);
   const insertTarget = db.prepare(
     `INSERT INTO repository_targets
       (project_id, repo_target_id, config_revision, source_id, host_id, path, remote_url, default_branch, target_digest)
@@ -4552,9 +4883,9 @@ function requireCurrentAdoptedDecision(
   }
   const actor = asRow<{
     project_id: string; actor_kind: string; subject_id: string; role_id: string | null; role_generation: number | null;
-    verification_state: string; operator_receipt_id: string | null; retirement_condition: string | null; receipt_digest: string;
+    verification_state: string; operator_receipt_id: string | null; retirement_condition: string | null; domain_id: string | null; receipt_digest: string;
   }>(db.prepare(
-    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, operator_receipt_id, retirement_condition, receipt_digest FROM actor_receipts WHERE receipt_id = ?",
+    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, operator_receipt_id, retirement_condition, domain_id, receipt_digest FROM actor_receipts WHERE receipt_id = ?",
   ).get(disposition.actor_receipt_id));
   const actorDigest = actor && actorReceiptDigest({
     projectId: actor.project_id,
@@ -4566,6 +4897,7 @@ function requireCurrentAdoptedDecision(
     verificationState: actor.verification_state,
     operatorReceiptId: actor.operator_receipt_id,
     retirementCondition: actor.retirement_condition,
+    domainId: actor.domain_id,
   });
   const bootstrapPluginActor = authorityRoot !== null && disposition.actor_receipt_id === authorityRoot.actorReceiptId &&
     actor?.actor_kind === "plugin" && actor.project_id === projectId && actor.verification_state === "verified" &&
@@ -5392,9 +5724,10 @@ function currentBootstrapDecisionAuthorityRootForActor(db: SqliteDatabase, proje
     verification_state: string;
     operator_receipt_id: string | null;
     retirement_condition: string | null;
+    domain_id: string | null;
     receipt_digest: string;
   }>(db.prepare(
-    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, operator_receipt_id, retirement_condition, receipt_digest FROM actor_receipts WHERE project_id = ? AND receipt_id = ?",
+    "SELECT project_id, actor_kind, subject_id, role_id, role_generation, verification_state, operator_receipt_id, retirement_condition, domain_id, receipt_digest FROM actor_receipts WHERE project_id = ? AND receipt_id = ?",
   ).get(projectId, actorReceiptId));
   if (isBootstrapGenesisReceipt(db, actorReceiptId)) {
     throw refusal("BOOTSTRAP_GENESIS_REUSED", "bootstrap genesis receipt is single-use and cannot authorize a later Decision root");
@@ -5409,6 +5742,7 @@ function currentBootstrapDecisionAuthorityRootForActor(db: SqliteDatabase, proje
     verificationState: actor.verification_state,
     operatorReceiptId: actor.operator_receipt_id,
     retirementCondition: actor.retirement_condition,
+    domainId: actor.domain_id,
   });
   if (!actor || actor.project_id !== projectId || actor.actor_kind !== "plugin" || actor.subject_id !== PLUGIN_ID ||
       actor.verification_state !== "verified" || actor.receipt_digest !== actorDigest) {
@@ -5848,16 +6182,17 @@ function applyDecisionDisposition(db: SqliteDatabase, request: ApplyRequest, dig
 }
 
 interface ResolvedRoleRequirement {
-  requirement: RoleRequirement;
+  requirement: RoleRequirement & { domainId: string };
   digest: string;
   configRevision: number;
+  domainId: string;
 }
 
 function requireRoleRequirement(db: SqliteDatabase, request: ApplyRequest, configRevision: number): ResolvedRoleRequirement {
   if (!request.roleRequirementId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "role requirement identity is required");
-  const requirements = roleRequirementsFromJson(storedConfigJson(db, request.projectId, configRevision));
-  const matches = requirements.filter((candidate) => candidate.roleRequirementId === request.roleRequirementId);
-  if (matches.length !== 1) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "role requirement is not uniquely configured");
+  const requirements = flatDomainRequirements(storedConfigJson(db, request.projectId, configRevision));
+  const matches = requirements.filter((candidate) => candidate.roleRequirementId === request.roleRequirementId && (request.domainId === undefined || candidate.domainId === request.domainId));
+  if (matches.length !== 1) throw refusal(matches.length === 0 ? "ROLE_REQUIREMENT_UNKNOWN" : "DOMAIN_AMBIGUOUS", "role requirement is not uniquely configured for the orchestration domain");
   const requirement = matches[0]!;
   if (request.roleId && request.roleId !== requirement.roleId) throw refusal("ROLE_REQUIREMENT_UNKNOWN", "logical role does not match its requirement");
   if (requirement.repoTargetId === null) {
@@ -5867,7 +6202,7 @@ function requireRoleRequirement(db: SqliteDatabase, request: ApplyRequest, confi
     if (request.repoTargetId !== requirement.repoTargetId) throw refusal("REPO_TARGET_FOREIGN", "role requirement target does not match the exact repository target");
     requireTarget(db, request.projectId, configRevision, request.repoTargetId);
   }
-  return { requirement, digest: sha256(canonicalJson(requirement)), configRevision };
+  return { requirement, digest: sha256(canonicalJson(requirement)), configRevision, domainId: requirement.domainId };
 }
 
 function requireRoleTargetContext(
@@ -5890,8 +6225,8 @@ function requireRoleTargetContext(
 
 function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest, required = true): void {
   if (!request.actorReceiptId) return;
-  const actor = asRow<{ actor_kind: string; subject_id: string; role_id: string | null; role_generation: number | null }>(
-    db.prepare("SELECT actor_kind, subject_id, role_id, role_generation FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(
+  const actor = asRow<{ actor_kind: string; subject_id: string; role_id: string | null; role_generation: number | null; domain_id: string | null }>(
+    db.prepare("SELECT actor_kind, subject_id, role_id, role_generation, domain_id FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(
       request.projectId,
       request.actorReceiptId,
     ),
@@ -5901,8 +6236,10 @@ function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest, requ
     throw refusal("ACTOR_RECEIPT_UNVERIFIED", "current role actor receipt is required");
   }
   if (!actor.role_id || actor.role_generation === null) throw refusal("ROLE_HOLDER_MISMATCH", "role actor receipt has no exact generation");
+  const domainId = actor.domain_id ?? request.domainId ?? "default";
+  if (request.domainId !== undefined && request.domainId !== domainId) throw refusal("DOMAIN_FOREIGN", "role actor is bound to another orchestration domain");
   const head = asRow<{ current_generation: number }>(
-    db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?").get(request.projectId, actor.role_id),
+    db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ? AND domain_id = ?").get(request.projectId, actor.role_id, domainId),
   );
   const generation = asRow<{
     status: string;
@@ -5913,14 +6250,16 @@ function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest, requ
     holder_requested_profile_digest: string;
     qualification_id: string;
     eligibility_derivation_digest: string;
+    domain_id: string;
   }>(
     db.prepare(`SELECT status, role_requirement_id, config_revision, holder_execution_attempt_id,
                        holder_context_digest, holder_requested_profile_digest, qualification_id,
-                       eligibility_derivation_digest
-                FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?`).get(
+                       eligibility_derivation_digest, domain_id
+                FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ? AND domain_id = ?`).get(
       request.projectId,
       actor.role_id,
       actor.role_generation,
+      domainId,
     ),
   );
   if (!head || head.current_generation !== actor.role_generation) throw refusal("ROLE_GENERATION_STALE", "role actor is not the current generation");
@@ -5950,8 +6289,8 @@ function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest, requ
   }>(db.prepare(
     `SELECT current_qualification_id, effective_status, config_revision, expires_at_ms, derivation_digest
      FROM eligibility_projections
-     WHERE project_id = ? AND role_requirement_id = ? AND requested_profile_digest = ?`,
-  ).get(request.projectId, generation.role_requirement_id, generation.holder_requested_profile_digest));
+     WHERE project_id = ? AND role_requirement_id = ? AND requested_profile_digest = ? AND domain_id = ?`,
+  ).get(request.projectId, generation.role_requirement_id, generation.holder_requested_profile_digest, domainId));
   if (
     !eligibility || eligibility.current_qualification_id !== generation.qualification_id ||
     eligibility.effective_status !== "eligible" || eligibility.config_revision !== generation.config_revision ||
@@ -5981,6 +6320,7 @@ function qualificationContextDigest(
     configRevision: resolved.configRevision,
     roleId: resolved.requirement.roleId,
     roleRequirementId: resolved.requirement.roleRequirementId,
+    domainId: resolved.domainId,
     roleRequirementDigest: resolved.digest,
     repoTargetId: resolved.requirement.repoTargetId,
     fixtureContextDigest: request.fixtureContextDigest,
@@ -6046,17 +6386,18 @@ function applyQualificationObservation(
   const observationDigest = sha256(canonicalJson(observation));
   db.prepare(
     `INSERT INTO qualification_observations (
-      project_id, qualification_id, role_requirement_id, config_revision, repo_target_id,
+      project_id, qualification_id, role_requirement_id, domain_id, config_revision, repo_target_id,
       role_requirement_digest, requested_profile_digest, requested_provider_id, requested_model, requested_reasoning_level,
       requested_permission_mode, requested_service_tier, requested_visibility, thread_id, environment_id, source_id, host_id,
       provider_thread_id, request_event_id, request_event_seq, completion_event_id, completion_event_seq,
       bb_version, plugin_sdk_version, qualification_context_digest, fixture_context_digest, outcome,
       observed_at_ms, expires_at_ms, evidence_digest, observation_digest, reason_code
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     request.projectId,
     qualificationId,
     resolved.requirement.roleRequirementId,
+    resolved.domainId,
     configRevision,
     resolved.requirement.repoTargetId,
     resolved.digest,
@@ -6101,10 +6442,10 @@ function applyQualificationObservation(
   }));
   db.prepare(
     `INSERT INTO eligibility_projections (
-      project_id, role_requirement_id, requested_profile_digest, current_qualification_id,
+      project_id, role_requirement_id, domain_id, requested_profile_digest, current_qualification_id,
       effective_status, qualification_context_digest, config_revision, role_requirement_digest,
       derived_at_ms, expires_at_ms, derivation_digest, reason_code
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(project_id, role_requirement_id, requested_profile_digest) DO UPDATE SET
       current_qualification_id = excluded.current_qualification_id,
       effective_status = excluded.effective_status,
@@ -6118,6 +6459,7 @@ function applyQualificationObservation(
   ).run(
     request.projectId,
     resolved.requirement.roleRequirementId,
+    resolved.domainId,
     context.requestedProfileDigest,
     qualificationId,
     effectiveStatus,
@@ -6191,6 +6533,7 @@ function materializeRoleHolderAttempt(
     projectId: request.projectId,
     executionAttemptId: context.holderExecutionAttemptId,
     configRevision: resolved.configRevision,
+    domainId: resolved.domainId,
     governanceEpoch,
     repoTargetId: resolved.requirement.repoTargetId,
     roleId: resolved.requirement.roleId,
@@ -6281,6 +6624,9 @@ function materializeRoleHolderAttempt(
     createdAtMs,
     attemptDigest,
   );
+  db.prepare("UPDATE execution_attempts SET domain_id = ? WHERE project_id = ? AND execution_attempt_id = ?").run(
+    resolved.domainId, request.projectId, context.holderExecutionAttemptId,
+  );
 }
 
 function applyRoleGenerationSuccession(
@@ -6318,10 +6664,11 @@ function applyRoleGenerationSuccession(
   );
   if (!observation) throw refusal("ROLE_UNQUALIFIED", "qualification observation is not known");
   const projection = asRow<EligibilityProjectionRow>(
-    db.prepare("SELECT * FROM eligibility_projections WHERE project_id = ? AND role_requirement_id = ? AND requested_profile_digest = ?").get(
+    db.prepare("SELECT * FROM eligibility_projections WHERE project_id = ? AND role_requirement_id = ? AND requested_profile_digest = ? AND domain_id = ?").get(
       request.projectId,
       resolved.requirement.roleRequirementId,
       request.profileDigest,
+      resolved.domainId,
     ),
   );
   if (!projection) throw refusal("CAPABILITY_UNKNOWN", "current eligibility projection is unavailable");
@@ -6363,13 +6710,13 @@ function applyRoleGenerationSuccession(
     }
   }
   const head = asRow<{ current_generation: number }>(
-    db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ?").get(request.projectId, request.roleId),
+    db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ? AND domain_id = ?").get(request.projectId, request.roleId, resolved.domainId),
   );
   const first = request.expectedGeneration === null && request.predecessorGeneration === null;
   let nextGeneration: number;
   if (first) {
     if (head) throw refusal("ROLE_GENERATION_STALE", "first generation requires no current role head", { currentResourceRevision: head.current_generation });
-    nextGeneration = 1;
+    nextGeneration = ((db.prepare("SELECT COALESCE(MAX(generation), 0) AS generation FROM role_generations WHERE project_id = ? AND role_id = ? AND domain_id = ?").get(request.projectId, request.roleId, resolved.domainId) as { generation: number }).generation) + 1;
   } else {
     if (request.expectedGeneration === null || request.predecessorGeneration === null) {
       throw refusal("ROLE_PREDECESSOR_MISMATCH", "successor requires matching expected and predecessor generations");
@@ -6383,16 +6730,18 @@ function applyRoleGenerationSuccession(
     }
     if (request.predecessorGeneration !== request.expectedGeneration) throw refusal("ROLE_PREDECESSOR_MISMATCH", "predecessor does not match the expected current generation");
     const predecessor = asRow<{ status: string }>(
-      db.prepare("SELECT status FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ?").get(
+      db.prepare("SELECT status, domain_id FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ? AND domain_id = ?").get(
         request.projectId,
         request.roleId,
         request.predecessorGeneration,
+        resolved.domainId,
       ),
     );
     if (!predecessor || !["active", "draining"].includes(predecessor.status)) throw refusal("ROLE_NOT_ACTIVE", "predecessor is not current and active or draining");
     nextGeneration = request.expectedGeneration + 1;
   }
   const createdAtMs = now();
+  const persistedPredecessorGeneration = request.predecessorGeneration ?? null;
   materializeRoleHolderAttempt(
     db,
     request,
@@ -6404,19 +6753,20 @@ function applyRoleGenerationSuccession(
   );
   db.prepare(
     `INSERT INTO role_generations (
-      project_id, role_id, generation, role_requirement_id, config_revision, repo_target_id,
+      project_id, role_id, generation, domain_id, role_requirement_id, config_revision, repo_target_id,
       status, predecessor_generation, holder_execution_attempt_id, holder_context_digest,
       holder_requested_profile_digest, qualification_id, eligibility_derivation_digest,
       created_at_ms, activated_at_ms, retired_at_ms, standby_profile_json
-    ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
   ).run(
     request.projectId,
     request.roleId,
     nextGeneration,
+    resolved.domainId,
     resolved.requirement.roleRequirementId,
     configRevision,
     resolved.requirement.repoTargetId,
-    request.predecessorGeneration,
+    persistedPredecessorGeneration,
     context.holderExecutionAttemptId,
     expectedContextDigest,
     context.requestedProfileDigest,
@@ -6427,21 +6777,23 @@ function applyRoleGenerationSuccession(
     standbyProfile ? canonicalJson(standbyProfile) : null,
   );
   if (first) {
-    db.prepare("INSERT INTO role_generation_heads (project_id, role_id, current_generation, updated_at_ms) VALUES (?, ?, 1, ?)").run(
+    db.prepare("INSERT INTO role_generation_heads (project_id, role_id, domain_id, current_generation, updated_at_ms) VALUES (?, ?, ?, ?, ?)").run(
       request.projectId,
       request.roleId,
+      resolved.domainId,
+      nextGeneration,
       createdAtMs,
     );
   } else {
     const retired = db.prepare(
       `UPDATE role_generations SET status = 'retired', retired_at_ms = ?
-       WHERE project_id = ? AND role_id = ? AND generation = ? AND status IN ('active', 'draining')`,
-    ).run(createdAtMs, request.projectId, request.roleId, request.predecessorGeneration);
+       WHERE project_id = ? AND role_id = ? AND generation = ? AND domain_id = ? AND status IN ('active', 'draining')`,
+    ).run(createdAtMs, request.projectId, request.roleId, request.predecessorGeneration, resolved.domainId);
     if (retired.changes !== 1) throw refusal("ROLE_NOT_ACTIVE", "predecessor retirement compare-and-swap failed");
     const advanced = db.prepare(
       `UPDATE role_generation_heads SET current_generation = ?, updated_at_ms = ?
-       WHERE project_id = ? AND role_id = ? AND current_generation = ?`,
-    ).run(nextGeneration, createdAtMs, request.projectId, request.roleId, request.expectedGeneration);
+       WHERE project_id = ? AND role_id = ? AND domain_id = ? AND current_generation = ?`,
+    ).run(nextGeneration, createdAtMs, request.projectId, request.roleId, resolved.domainId, request.expectedGeneration);
     if (advanced.changes !== 1) throw refusal("ROLE_GENERATION_STALE", "role head compare-and-swap failed");
   }
   return commitMutation(
@@ -6456,6 +6808,7 @@ function applyRoleGenerationSuccession(
       eventType: "role_generation_succeeded",
       event: {
         roleId: request.roleId,
+        domainId: resolved.domainId,
         generation: nextGeneration,
         predecessorGeneration: request.predecessorGeneration,
         qualificationId: request.qualificationId,
@@ -6514,6 +6867,8 @@ interface WorkItemRow {
   work_item_id: string;
   config_revision: number;
   repo_target_id: string;
+  domain_id: string;
+  task_class: string;
   title: string;
   body: string;
   lifecycle_state: WorkItemState;
@@ -6548,13 +6903,14 @@ function parseBackfillLane(body: string): { token: string; strippedBody: string 
 function workAttemptId(input: {
   projectId: string;
   workItemId: string;
+  domainId?: string;
   attemptOrdinal: number;
   laneId: string;
   threadId: string | null;
   reviewPrNumber: number | null;
   reviewPrHeadSha: string | null;
 }): string {
-  return sha256(canonicalJson({ origin: "work_item", ...input }));
+  return sha256(canonicalJson({ origin: "work_item", ...input, domainId: input.domainId ?? "default" }));
 }
 
 function insertWorkItemAttempt(
@@ -6562,6 +6918,7 @@ function insertWorkItemAttempt(
   input: {
     projectId: string;
     workItemId: string;
+    domainId?: string;
     configRevision: number;
     repoTargetId: string;
     laneId: string;
@@ -6586,6 +6943,7 @@ function insertWorkItemAttempt(
     executionAttemptId,
     projectId: input.projectId,
     workItemId: input.workItemId,
+    domainId: input.domainId ?? "default",
     laneId: input.laneId,
     threadId: input.threadId,
     assignmentKind: input.assignmentKind,
@@ -6638,6 +6996,9 @@ function insertWorkItemAttempt(
     completedAtMs: input.completedAtMs,
     attemptDigest,
   });
+  if (input.domainId !== undefined) {
+    db.prepare("UPDATE execution_attempts SET domain_id = ? WHERE project_id = ? AND execution_attempt_id = ?").run(input.domainId, input.projectId, executionAttemptId);
+  }
   return executionAttemptId;
 }
 
@@ -6656,8 +7017,9 @@ function gh300BackfillEpochMs(db: SqliteDatabase): number {
 
 export function backfillWorkItemAttempts(db: SqliteDatabase, migrationAppliedAtMs = gh300BackfillEpochMs(db)): WorkItemBackfillCounts {
   return transaction(db, () => {
+    const hasDomainColumns = tableColumns(db, "work_items").includes("domain_id");
     const rows = db.prepare(
-      `SELECT project_id, work_item_id, config_revision, repo_target_id, body, lifecycle_state, created_at_ms, updated_at_ms
+      `SELECT project_id, work_item_id, config_revision, repo_target_id, ${hasDomainColumns ? "domain_id, task_class," : "'default' AS domain_id, 'default' AS task_class,"} body, lifecycle_state, created_at_ms, updated_at_ms
        FROM work_items WHERE body LIKE '%thr\\_%' ESCAPE '\\' AND created_at_ms <= ? ORDER BY project_id, work_item_id`,
     ).all(migrationAppliedAtMs) as Array<WorkItemRow>;
     const counts: WorkItemBackfillCounts = { candidates: rows.length, attributable: 0, inserted: 0, alreadyBound: 0, residualProposed: 0, unresolved: 0 };
@@ -6695,6 +7057,7 @@ export function backfillWorkItemAttempts(db: SqliteDatabase, migrationAppliedAtM
       insertWorkItemAttempt(db, {
         projectId: row.project_id,
         workItemId: row.work_item_id,
+        domainId: row.domain_id ?? "default",
         configRevision: row.config_revision,
         repoTargetId: row.repo_target_id,
         laneId: parsed.token,
@@ -7278,6 +7641,8 @@ function requireWorkItem(
   }
   if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "work item mutation requires its exact repository target");
   if (request.repoTargetId !== row.repo_target_id) throw refusal("REPO_TARGET_FOREIGN", "work item target does not match the exact repository target");
+  if (request.domainId !== undefined && request.domainId !== row.domain_id) throw refusal("DOMAIN_FOREIGN", "work item is bound to another orchestration domain");
+  if (request.taskClass !== undefined && request.taskClass !== row.task_class) throw refusal("DOMAIN_FOREIGN", "work item is bound to another task class");
   requireTarget(db, request.projectId, configRevision, request.repoTargetId, allowStaleConfig);
   if (expectedRevision !== row.resource_revision) {
     throw refusal("WORK_ITEM_REVISION_STALE", "work item resource revision is stale", {
@@ -7296,6 +7661,10 @@ function applyWorkItemCreate(db: SqliteDatabase, request: ApplyRequest, digest: 
   if (request.workItemWait !== undefined) throw refusal("WORK_ITEM_STATE_INVALID", "work item wait requires a work item transition");
   if (!request.repoTargetId) throw refusal("REPO_TARGET_REQUIRED", "work item create requires an exact repository target");
   requireTarget(db, request.projectId, configRevision, request.repoTargetId);
+  const configured = configuredDomains(db, request.projectId, configRevision);
+  const taskClass = request.taskClass ?? request.workItem.taskClass ?? (configured.length === 1 && configured[0]!.domainId === "default" ? "default" : undefined);
+  if (!taskClass) throw refusal("DOMAIN_REQUIRED", "multi-domain work item creation requires an exact task class");
+  const domain = domainForTaskClass(configured, taskClass, request.domainId ?? request.workItem.domainId);
   if (request.workItemId && request.workItemId !== request.workItem.workItemId) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item identities conflict");
   }
@@ -7310,14 +7679,16 @@ function applyWorkItemCreate(db: SqliteDatabase, request: ApplyRequest, digest: 
   const createdAtMs = now();
   db.prepare(
     `INSERT INTO work_items
-      (project_id, work_item_id, config_revision, repo_target_id, title, body,
+      (project_id, work_item_id, config_revision, repo_target_id, domain_id, task_class, title, body,
        lifecycle_state, resource_revision, created_at_ms, updated_at_ms)
-     VALUES (?, ?, ?, ?, ?, ?, 'proposed', 1, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', 1, ?, ?)`,
   ).run(
     request.projectId,
     request.workItem.workItemId,
     configRevision,
     request.repoTargetId,
+    domain.domainId,
+    taskClass,
     request.workItem.title,
     request.workItem.body,
     createdAtMs,
@@ -7328,6 +7699,8 @@ function applyWorkItemCreate(db: SqliteDatabase, request: ApplyRequest, digest: 
     work_item_id: request.workItem.workItemId,
     config_revision: configRevision,
     repo_target_id: request.repoTargetId,
+    domain_id: domain.domainId,
+    task_class: taskClass,
     title: request.workItem.title,
     body: request.workItem.body,
     lifecycle_state: "proposed" as const,
@@ -7359,6 +7732,8 @@ function applyWorkItemCreate(db: SqliteDatabase, request: ApplyRequest, digest: 
       event: {
         workItemId: request.workItem.workItemId,
         repoTargetId: request.repoTargetId,
+        domainId: domain.domainId,
+        taskClass,
         lifecycleState: "proposed",
         ...(boundGithubIssue === null ? {} : {
           githubIssue: {
@@ -7378,6 +7753,8 @@ function applyWorkItemCreate(db: SqliteDatabase, request: ApplyRequest, digest: 
       evidence: {
         workItemId: request.workItem.workItemId,
         repoTargetId: request.repoTargetId,
+        domainId: domain.domainId,
+        taskClass,
         lifecycleState: "proposed",
         ...(boundGithubIssue === null ? {} : {
           githubIssue: {
@@ -7637,9 +8014,9 @@ function applyWorkItemTransition(
     } else {
       if (wait.kind !== "schedule" && wait.kind !== "seat") throw refusal("WORK_ITEM_STATE_INVALID", "machine-evaluable blocker requires blocked");
       db.prepare(
-        `INSERT INTO work_item_waits (project_id, work_item_id, waker, waker_kind, declared_at_ms, declared_by_seat, note)
-         VALUES (?, ?, ?, ?, ?, ?, NULL)`,
-      ).run(request.projectId, workItem.work_item_id, wait.kind === "schedule" ? wait.schedule : wait.seat, wait.kind, now(), wait.declaredBySeat);
+        `INSERT INTO work_item_waits (project_id, work_item_id, domain_id, waker, waker_kind, declared_at_ms, declared_by_seat, note)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+      ).run(request.projectId, workItem.work_item_id, workItem.domain_id, wait.kind === "schedule" ? wait.schedule : wait.seat, wait.kind, now(), wait.declaredBySeat);
     }
     return commitMutation(
       db,
@@ -7768,6 +8145,7 @@ function applyWorkItemTransition(
     const executionAttemptId = insertWorkItemAttempt(db, {
       projectId: request.projectId,
       workItemId: workItem.work_item_id,
+      domainId: workItem.domain_id,
       configRevision: workItem.config_revision,
       repoTargetId: workItem.repo_target_id,
       laneId: workAttempt.laneId,
@@ -7894,18 +8272,18 @@ function applyWorkItemTransition(
       ? { kind: machineWait!.kind, workItemId: machineWait!.workItemId }
       : { kind: machineWait!.kind, owner: machineWait!.owner, repo: machineWait!.repo, issueNumber: machineWait!.issueNumber };
     db.prepare(
-      `INSERT INTO work_item_waits (project_id, work_item_id, waker, waker_kind, declared_at_ms, declared_by_seat, note)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(request.projectId, workItem.work_item_id, workItemBlockerWaker(blocker), blocker.kind, now(), machineWait!.declaredBySeat, machineWait!.note ?? null);
+      `INSERT INTO work_item_waits (project_id, work_item_id, domain_id, waker, waker_kind, declared_at_ms, declared_by_seat, note)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(request.projectId, workItem.work_item_id, workItem.domain_id, workItemBlockerWaker(blocker), blocker.kind, now(), machineWait!.declaredBySeat, machineWait!.note ?? null);
   } else if (swappingBlockedWait) {
     const blocker: WorkItemBlocker = machineWait!.kind === "work_item_succeeded"
       ? { kind: machineWait!.kind, workItemId: machineWait!.workItemId }
       : { kind: machineWait!.kind, owner: machineWait!.owner, repo: machineWait!.repo, issueNumber: machineWait!.issueNumber };
     db.prepare(
       `UPDATE work_item_waits
-       SET waker = ?, waker_kind = ?, declared_at_ms = ?, declared_by_seat = ?, note = ?
+       SET domain_id = ?, waker = ?, waker_kind = ?, declared_at_ms = ?, declared_by_seat = ?, note = ?
        WHERE project_id = ? AND work_item_id = ?`,
-    ).run(workItemBlockerWaker(blocker), blocker.kind, now(), machineWait!.declaredBySeat, machineWait!.note ?? null, request.projectId, workItem.work_item_id);
+    ).run(workItem.domain_id, workItemBlockerWaker(blocker), blocker.kind, now(), machineWait!.declaredBySeat, machineWait!.note ?? null, request.projectId, workItem.work_item_id);
   } else if (workItem.lifecycle_state === "blocked") {
     db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(request.projectId, workItem.work_item_id);
   }
@@ -7919,6 +8297,7 @@ function applyWorkItemTransition(
     executionAttemptId = insertWorkItemAttempt(db, {
       projectId: request.projectId,
       workItemId: workItem.work_item_id,
+      domainId: workItem.domain_id,
       configRevision: workItem.config_revision,
       repoTargetId: workItem.repo_target_id,
       laneId: workAttempt!.laneId,
@@ -7944,6 +8323,7 @@ function applyWorkItemTransition(
       reviewExecutionAttemptId = insertWorkItemAttempt(db, {
         projectId: request.projectId,
         workItemId: workItem.work_item_id,
+        domainId: workItem.domain_id,
         configRevision: workItem.config_revision,
         repoTargetId: workItem.repo_target_id,
         laneId: workAttempt.laneId,
@@ -8250,8 +8630,9 @@ export function backfillWorkItemGithubIssues(
       return { result: existing.result as WorkItemGithubBackfillResult, rows: null as WorkItemRow[] | null };
     }
     const epoch = existing?.result.epochCreatedAtMs ?? epochCreatedAtMs;
+    const hasDomainColumns = tableColumns(db, "work_items").includes("domain_id");
     const rows = db.prepare(
-      `SELECT project_id, work_item_id, config_revision, repo_target_id, title, body,
+      `SELECT project_id, work_item_id, config_revision, repo_target_id, title, ${hasDomainColumns ? "domain_id, task_class," : "'default' AS domain_id, 'default' AS task_class,"} body,
               lifecycle_state, resource_revision, created_at_ms, updated_at_ms
        FROM work_items
        WHERE project_id = ? AND created_at_ms <= ?
@@ -9237,6 +9618,7 @@ function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId
   const orderBy: Record<(typeof TABLES)[number], string> = {
     project_config_revisions: "config_revision",
     project_config_heads: "project_id",
+    orchestration_domains: "config_revision, domain_id",
     repository_targets: "repo_target_id, config_revision",
     project_governorships: "governance_epoch",
     project_governorship_heads: "project_id",
@@ -9260,7 +9642,7 @@ function tableRows(db: SqliteDatabase, table: (typeof TABLES)[number], projectId
     assignments: "assignment_id",
     execution_attempts: "execution_attempt_id",
     role_generations: "role_id, generation",
-    role_generation_heads: "role_id",
+    role_generation_heads: "role_id, domain_id",
     lane_capacity_intervals: "interval_id",
     lane_capacity_refresh_evidence: "lane_capacity_observation_id, execution_attempt_id",
     operator_messages: "message_id",
@@ -9599,7 +9981,7 @@ function decisionDoctorEvidence(db: SqliteDatabase, projectId: string): {
     for (const [index, disposition] of dispositions.entries()) {
       const sequence = Number(disposition.disposition_sequence);
       if (sequence !== index + 1) issues.push({ decisionId: decision.decision_id, reason: "disposition_sequence_not_contiguous" });
-      const actor = asRow<{ actor_kind: string; project_id: string; verification_state: string; receipt_digest: string; subject_id: string; role_id: string | null; role_generation: number | null; operator_receipt_id: string | null; retirement_condition: string | null }>(
+      const actor = asRow<{ actor_kind: string; project_id: string; verification_state: string; receipt_digest: string; subject_id: string; role_id: string | null; role_generation: number | null; operator_receipt_id: string | null; retirement_condition: string | null; domain_id: string | null }>(
         db.prepare("SELECT * FROM actor_receipts WHERE receipt_id = ?").get(disposition.actor_receipt_id),
       );
       const linkedReceipt = actor?.operator_receipt_id ? asRow<{ caller_plugin_id: string; mutation_class: string }>(db.prepare(
@@ -9624,11 +10006,12 @@ function decisionDoctorEvidence(db: SqliteDatabase, projectId: string): {
           verificationState: actor.verification_state,
           operatorReceiptId: actor.operator_receipt_id,
           retirementCondition: actor.retirement_condition,
+          domainId: actor.domain_id,
         });
         if (receiptDigest !== actor.receipt_digest) issues.push({ decisionId: decision.decision_id, reason: "decision_actor_digest_invalid" });
         if (actor.actor_kind === "role") {
-          const role = asRow<{ current_generation: number; status: string; holder_execution_attempt_id: string; holder_context_digest: string; holder_requested_profile_digest: string; qualification_id: string; eligibility_derivation_digest: string; role_requirement_id: string }>(db.prepare(
-            `SELECT role_generation_heads.current_generation, role_generations.status,
+          const role = asRow<{ current_generation: number; domain_id: string; status: string; holder_execution_attempt_id: string; holder_context_digest: string; holder_requested_profile_digest: string; qualification_id: string; eligibility_derivation_digest: string; role_requirement_id: string }>(db.prepare(
+          `SELECT role_generation_heads.current_generation, role_generation_heads.domain_id, role_generations.status,
                     role_generations.holder_execution_attempt_id, role_generations.holder_context_digest,
                     role_generations.holder_requested_profile_digest, role_generations.qualification_id,
                     role_generations.eligibility_derivation_digest, role_generations.role_requirement_id
@@ -9636,14 +10019,15 @@ function decisionDoctorEvidence(db: SqliteDatabase, projectId: string): {
                ON role_generations.project_id = role_generation_heads.project_id
               AND role_generations.role_id = role_generation_heads.role_id
               AND role_generations.generation = role_generation_heads.current_generation
-             WHERE role_generation_heads.project_id = ? AND role_generation_heads.role_id = ?`,
-          ).get(projectId, actor.role_id));
+              AND role_generations.domain_id = role_generation_heads.domain_id
+             WHERE role_generation_heads.project_id = ? AND role_generation_heads.role_id = ? AND role_generation_heads.domain_id = COALESCE((SELECT domain_id FROM actor_receipts WHERE project_id = ? AND receipt_id = ?), 'default')`,
+          ).get(projectId, actor.role_id, projectId, disposition.actor_receipt_id));
           const holder = role && asRow<{ state: string; origin: string; native_receipt_digest: string | null; requested_profile_digest: string | null }>(
             db.prepare("SELECT state, origin, native_receipt_digest, requested_profile_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, role.holder_execution_attempt_id),
           );
           const eligibility = role && asRow<{ current_qualification_id: string; effective_status: string; expires_at_ms: number | null; derivation_digest: string }>(db.prepare(
-            "SELECT current_qualification_id, effective_status, expires_at_ms, derivation_digest FROM eligibility_projections WHERE project_id = ? AND role_requirement_id = ? AND requested_profile_digest = ?",
-          ).get(projectId, role.role_requirement_id, role.holder_requested_profile_digest));
+            "SELECT current_qualification_id, effective_status, expires_at_ms, derivation_digest FROM eligibility_projections WHERE project_id = ? AND role_requirement_id = ? AND requested_profile_digest = ? AND domain_id = ?",
+          ).get(projectId, role.role_requirement_id, role.holder_requested_profile_digest, role.domain_id));
           if (
             !role || actor.role_generation !== role.current_generation || role.status !== "active" || actor.subject_id !== role.holder_execution_attempt_id ||
             !holder || holder.origin !== "role_holder" || holder.state !== "done" || holder.native_receipt_digest !== role.holder_context_digest ||
@@ -9831,8 +10215,24 @@ export async function doctor(
       return { ...run, state, retentionExpired: Number(run.retention_until_ms) <= now(), unresolvedProof };
     });
     const activeMigrationRun = migrationRuns.find((run) => !["retired", "rolled_back"].includes(String(run.state))) ?? null;
-    const roleGenerationHeads = (db.prepare(
-      `SELECT role_generation_heads.role_id, role_generation_heads.current_generation,
+    const hasDomainRoleShape = ["role_generation_heads", "role_generations"].every((table) => tableColumns(db, table).includes("domain_id"));
+    const roleGenerationHeads = (db.prepare(hasDomainRoleShape
+      ? `SELECT role_generation_heads.role_id, role_generation_heads.domain_id, role_generation_heads.current_generation,
+              role_generations.status, role_generations.qualification_id,
+              role_generations.holder_execution_attempt_id,
+              role_generations.standby_profile_json,
+              execution_attempts.state AS holder_attempt_state,
+              execution_attempts.native_receipt_digest AS holder_native_receipt_digest,
+              execution_attempts.thread_id AS holder_thread_id
+       FROM role_generation_heads
+       JOIN role_generations ON role_generations.project_id = role_generation_heads.project_id
+         AND role_generations.role_id = role_generation_heads.role_id
+         AND role_generations.generation = role_generation_heads.current_generation
+         AND role_generations.domain_id = role_generation_heads.domain_id
+       LEFT JOIN execution_attempts ON execution_attempts.project_id = role_generations.project_id
+         AND execution_attempts.execution_attempt_id = role_generations.holder_execution_attempt_id
+       WHERE role_generation_heads.project_id = ? ORDER BY role_generation_heads.role_id, role_generation_heads.domain_id`
+      : `SELECT role_generation_heads.role_id, 'default' AS domain_id, role_generation_heads.current_generation,
               role_generations.status, role_generations.qualification_id,
               role_generations.holder_execution_attempt_id,
               role_generations.standby_profile_json,
@@ -9845,8 +10245,8 @@ export async function doctor(
          AND role_generations.generation = role_generation_heads.current_generation
        LEFT JOIN execution_attempts ON execution_attempts.project_id = role_generations.project_id
          AND execution_attempts.execution_attempt_id = role_generations.holder_execution_attempt_id
-       WHERE role_generation_heads.project_id = ? ORDER BY role_generation_heads.role_id`,
-    ).all(projectId) as Array<Record<string, unknown>>).map((row): Record<string, unknown> => {
+       WHERE role_generation_heads.project_id = ? ORDER BY role_generation_heads.role_id`)
+    .all(projectId) as Array<Record<string, unknown>>).map((row): Record<string, unknown> => {
       const { standby_profile_json: standbyProfileJson, ...head } = row;
       return {
         ...head,
@@ -9859,17 +10259,21 @@ export async function doctor(
     const observationCount = asRow<{ count: number }>(
       db.prepare("SELECT COUNT(*) AS count FROM qualification_observations WHERE project_id = ?").get(projectId),
     )?.count ?? 0;
-    const configuredRequirements = roleRequirementsFromJson(storedConfigJson(db, projectId, configHead.config_revision));
+    const configuredDomainInventory = configuredDomains(db, projectId, configHead.config_revision);
+    const configuredRequirements = configuredDomainInventory.flatMap((domain) => domain.roleRequirements.map((requirement) => ({ ...requirement, domainId: domain.domainId })));
+    const hasDomainEligibility = tableColumns(db, "eligibility_projections").includes("domain_id");
     const eligibility = (db.prepare(
-      `SELECT role_requirement_id, requested_profile_digest, current_qualification_id, effective_status,
+      `SELECT role_requirement_id, ${hasDomainEligibility ? "domain_id," : "'default' AS domain_id,"} requested_profile_digest, current_qualification_id, effective_status,
               config_revision, role_requirement_digest, expires_at_ms, reason_code
        FROM eligibility_projections WHERE project_id = ? ORDER BY role_requirement_id, requested_profile_digest`,
     ).all(projectId) as Array<Record<string, unknown>>).map((row) => {
-      const requirement = configuredRequirements.find((candidate) => candidate.roleRequirementId === row.role_requirement_id);
+      const domainId = typeof row.domain_id === "string" ? row.domain_id : "default";
+      const requirement = configuredRequirements.find((candidate) => candidate.roleRequirementId === row.role_requirement_id && candidate.domainId === domainId);
       const stale = row.config_revision !== configHead.config_revision || !requirement || sha256(canonicalJson(requirement)) !== row.role_requirement_digest;
       const expired = typeof row.expires_at_ms === "number" && row.expires_at_ms <= now();
       return {
         roleRequirementId: row.role_requirement_id,
+        domainId,
         requestedProfileDigest: row.requested_profile_digest,
         currentQualificationId: row.current_qualification_id,
         effectiveStatus: stale ? "stale" : expired ? "expired" : row.effective_status,
@@ -9898,7 +10302,7 @@ export async function doctor(
     };
     const unresolvedRoleHolders = roleGenerationHeads
       .filter((row) => row.holder_attempt_state !== "done" || !row.holder_native_receipt_digest)
-      .map((row) => ({ roleId: row.role_id, generation: row.current_generation, holderExecutionAttemptId: row.holder_execution_attempt_id, reason: "ROLE_HOLDER_UNRESOLVED" }));
+      .map((row) => ({ roleId: row.role_id, domainId: row.domain_id ?? "default", generation: row.current_generation, holderExecutionAttemptId: row.holder_execution_attempt_id, reason: "ROLE_HOLDER_UNRESOLVED" }));
     const decisionIntegrity = decisionDoctorEvidence(db, projectId);
     const cachedConsumers = persistedCachedConsumerRolloutEvidence(db, projectId);
     const installedPlugins = await sdk.plugins.list();
@@ -9952,6 +10356,11 @@ export async function doctor(
         unresolvedRoleHolders,
         routing,
         qualificationObservationCount: observationCount,
+        domains: configuredDomainInventory.map((domain) => ({
+          domainId: domain.domainId,
+          taskClasses: domain.taskClasses,
+          roleRequirementIds: domain.roleRequirements.map((requirement) => requirement.roleRequirementId),
+        })),
         eligibility,
         assignments: assignmentAttempts,
         profileAudit,
@@ -9982,6 +10391,7 @@ export async function doctor(
       },
     });
   } catch (error) {
+    if (error instanceof Refusal) return refusalResult(projectId, error.data);
     return result("BB_FACTS_UNAVAILABLE", projectId, 1, 0, 0, { message: String(error) });
   }
 }
@@ -10055,7 +10465,9 @@ function migrationSchemaShape(db: SqliteDatabase, version: "schema30" | "schema3
 }
 
 function assertMigratedSchema(db: SqliteDatabase): void {
-  if (!migrationSchemaShape(db, "schema31")) throw new Error("GH636 migration ledger is ambiguous: schema-31 shape is not exact");
+  const schema31 = migrationSchemaShape(db, "schema31");
+  const gh637Append = tableExists(db, "execution_attempts") && tableColumns(db, "execution_attempts").includes("domain_id");
+  if (!schema31 && !gh637Append) throw new Error("GH636 migration ledger is ambiguous: schema-31 shape is not exact");
   if (db.pragma("integrity_check", { simple: true }) !== "ok") throw new Error("GH636 migration produced an integrity-check failure");
   if ((db.pragma("foreign_key_check") as unknown[]).length !== 0) throw new Error("GH636 migration produced foreign-key violations");
 }
@@ -10065,12 +10477,44 @@ function allMigrationIdsBefore(db: SqliteDatabase, id: number): boolean {
   return Array.from({ length: id }, (_, index) => index).every((index) => applied.has(index));
 }
 
+function assertGh637MigrationPreflight(db: SqliteDatabase, latestApplied: boolean): void {
+  const domainTableExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orchestration_domains'").get() !== undefined;
+  if (latestApplied !== domainTableExists) throw new Error("GH637 migration ledger is mixed-version: domain inventory and ledger disagree");
+  if (latestApplied) return;
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'project_config_revisions'").get() === undefined) return;
+  const rows = db.prepare("SELECT canonical_config_json FROM project_config_revisions").all() as Array<{ canonical_config_json: string }>;
+  for (const row of rows) {
+    const config = JSON.parse(row.canonical_config_json) as { extensions?: { bbCollab?: { domains?: unknown } } };
+    if (config.extensions?.bbCollab?.domains !== undefined) {
+      throw new Error("GH637 migration refused: pre-domain schema contains explicit multi-domain authority");
+    }
+    domainDefinitionsFromConfigJson(row.canonical_config_json);
+  }
+}
+
+function assertGh637MigratedSchema(db: SqliteDatabase): void {
+  const requiredColumns = new Map<string, string[]>([
+    ["work_items", ["domain_id", "task_class"]],
+    ["execution_attempts", ["domain_id"]],
+    ["role_generations", ["domain_id"]],
+    ["role_generation_heads", ["domain_id"]],
+  ]);
+  for (const [table, columns] of requiredColumns) {
+    const actual = new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name));
+    if (columns.some((column) => !actual.has(column))) throw new Error(`GH637 migration produced an incomplete ${table} domain shape`);
+  }
+  const configCount = (db.prepare("SELECT COUNT(*) AS count FROM project_config_revisions").get() as { count: number }).count;
+  const domainCount = (db.prepare("SELECT COUNT(*) AS count FROM orchestration_domains").get() as { count: number }).count;
+  if (configCount !== domainCount) throw new Error("GH637 migration did not map every historical config to exactly one default domain");
+}
+
 export function migrateCanonicalStore(
   db: SqliteDatabase,
   migrate: (database: SqliteDatabase, statements: string[]) => void,
 ): void {
   db.exec("CREATE TABLE IF NOT EXISTS _bb_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)");
   const has = (id: number) => db.prepare("SELECT 1 FROM _bb_migrations WHERE id = ?").get(id) !== undefined;
+  assertGh637MigrationPreflight(db, has(GH637_DOMAIN_MIGRATION_ID));
   const previousApplied = has(GH636_PREVIOUS_MIGRATION_ID);
   const repairApplied = has(GH636_REPAIR_MIGRATION_ID);
   if (repairApplied && !previousApplied) throw new Error("GH636 migration ledger is ambiguous: repair is ledgered without schema 31");
@@ -10090,7 +10534,7 @@ export function migrateCanonicalStore(
     migrate(db, [
       ...MIGRATIONS.slice(0, GH636_PREVIOUS_MIGRATION_ID),
       GH636_SCHEMA30_REPAIR_MIGRATION,
-      MIGRATIONS[GH636_REPAIR_MIGRATION_ID]!,
+      ...MIGRATIONS.slice(GH636_REPAIR_MIGRATION_ID),
     ]);
   } else if (!repairApplied) {
     if (!migrationSchemaShape(db, "schema31")) throw new Error("GH636 migration ledger is ambiguous: migration 43 is ledgered without schema 31");
@@ -10098,6 +10542,8 @@ export function migrateCanonicalStore(
   }
   if (!has(GH636_PREVIOUS_MIGRATION_ID) || !has(GH636_REPAIR_MIGRATION_ID)) throw new Error("GH636 migration ledger is incomplete");
   assertMigratedSchema(db);
+  if (!has(GH637_DOMAIN_MIGRATION_ID)) throw new Error("GH637 migration ledger is incomplete");
+  assertGh637MigratedSchema(db);
 }
 
 export function databaseIsReady(db: SqliteDatabase): void {

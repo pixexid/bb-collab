@@ -244,6 +244,7 @@ export function createStallGuardCycle(options: StallGuardCycleOptions) {
           const role: RoleIdleView = {
             projectId: holder.project_id,
             roleId: holder.role_id,
+            domainId: holder.domain_id ?? "default",
             roleGeneration: holder.role_generation,
             executionAttemptId: holder.execution_attempt_id,
             threadId: holder.thread_id,

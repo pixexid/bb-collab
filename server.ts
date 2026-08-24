@@ -33,6 +33,7 @@ import {
   applyRequestSchema,
   databaseIsReady,
   doctor,
+  configuredDomains,
   exportFoundation,
   canonicalJson,
   sha256,
@@ -131,7 +132,7 @@ export const fleetWatchdogBlockerFiredKey = (projectId: string, workItemId: stri
 const fleetWatchdogLegacyBlockerFiredKey = (workItemId: string, subject: string) =>
   `fleet-watchdog:blocker-fired:${workItemId}:${subject}`;
 export const fleetWatchdogRoleLivenessKey = (holder: RoleHolderState) => fleetWatchdogCompositeKey(
-  holder.project_id, holder.role_id, String(holder.role_generation), holder.execution_attempt_id, holder.thread_id,
+  holder.project_id, holder.role_id, holder.domain_id ?? "default", String(holder.role_generation), holder.execution_attempt_id, holder.thread_id,
 );
 export const fleetWatchdogEpisodeKey = (
   holder: RoleHolderState,
@@ -139,7 +140,7 @@ export const fleetWatchdogEpisodeKey = (
   activeLaneCount = 0,
   writingLaneCeiling = 0,
 ) => fleetWatchdogCompositeKey(
-  holder.project_id, holder.role_id, String(holder.role_generation), holder.execution_attempt_id, holder.thread_id,
+  holder.project_id, holder.role_id, holder.domain_id ?? "default", String(holder.role_generation), holder.execution_attempt_id, holder.thread_id,
   `activeLanes=${activeLaneCount}`, `writingLaneCeiling=${writingLaneCeiling}`, queueHead,
 );
 const fleetWatchdogLegacyEpisodeKey = (
@@ -170,7 +171,8 @@ function githubRepository(remoteUrl: string | null): string | null {
 }
 
 type GithubQueueIssue = { repository: string; number: number };
-type StartableQueueState = { count: number; head: string | null; unlabelledCount: number; blockedCount: number; waitingExternalCount: number; dispatched: GithubQueueIssue[] };
+type StartableQueueDomainState = { count: number; head: string | null; known: boolean; reason: string | null };
+type StartableQueueState = { count: number; head: string | null; domains: Record<string, StartableQueueDomainState>; unlabelledCount: number; blockedCount: number; waitingExternalCount: number; dispatched: GithubQueueIssue[] };
 export const ROLE_QUEUE_MAX_REPOSITORIES = 4;
 export const ROLE_QUEUE_REFRESH_TIMEOUT_MS = 8_000;
 export const ROLE_QUEUE_CACHE_MS = 20_000;
@@ -280,7 +282,7 @@ function githubJsonAsync(args: string[], connectorHost: string): Promise<unknown
   });
 }
 
-async function startableQueueStateAsync(db: SqliteDatabase | null, projectId: string, repositories: string[]): Promise<StartableQueueState | null> {
+export async function startableQueueStateAsync(db: SqliteDatabase | null, projectId: string, repositories: string[]): Promise<StartableQueueState | null> {
   if (repositories.length > ROLE_QUEUE_MAX_REPOSITORIES || new Set(repositories).size !== repositories.length) return null;
   const mappings = repositories.map((repository) => {
     const [owner, repo, extra] = repository.split("/");
@@ -292,6 +294,20 @@ async function startableQueueStateAsync(db: SqliteDatabase | null, projectId: st
   let blockedCount = 0;
   let waitingExternalCount = 0;
   const heads: string[] = [];
+  const domainStates: Record<string, StartableQueueDomainState> = {};
+  const markDomainCoverageUnknown = (reason: string) => {
+    for (const state of Object.values(domainStates)) {
+      state.known = false;
+      state.reason = reason;
+    }
+  };
+  try {
+    const configHead = db?.prepare("SELECT config_revision FROM project_config_heads WHERE project_id = ?").get(projectId) as { config_revision: number } | undefined;
+    if (!db || !configHead) return null;
+    for (const domain of configuredDomains(db, projectId, configHead.config_revision)) domainStates[domain.domainId] = { count: 0, head: null, known: true, reason: null };
+  } catch {
+    return null;
+  }
   const dispatched: GithubQueueIssue[] = [];
   type QueueInventoryIssue = { number: number; labels: Array<{ name: string }>; [key: string]: unknown };
   const isIssue = (issue: unknown): issue is QueueInventoryIssue => Boolean(issue && typeof issue === "object" && !Array.isArray(issue)
@@ -318,8 +334,32 @@ async function startableQueueStateAsync(db: SqliteDatabase | null, projectId: st
       && issue.labels.some((label) => label.name === "queue:dispatched")).map((issue) => ({ repository, number: issue.number })));
     const numbers = exactStartable.map((issue) => issue.number);
     if (numbers.length > 0) heads.push(`${repository}#${Math.min(...numbers)}`);
+    for (const issue of exactStartable) {
+      const [owner, repo] = repository.split("/");
+      const matches = db.prepare(
+        `SELECT items.domain_id
+           FROM work_items AS items JOIN external_work_refs AS refs
+             ON refs.project_id = items.project_id AND refs.work_item_id = items.work_item_id
+          WHERE items.project_id = ? AND items.lifecycle_state IN ('proposed', 'ready')
+            AND refs.provider = 'github' AND refs.owner = ? AND refs.repo = ? AND refs.issue_number = ?`,
+      ).all(projectId, owner, repo, issue.number) as Array<{ domain_id: string | null }>;
+      if (matches.length !== 1) {
+        markDomainCoverageUnknown(`startable-queue-bindings:${matches.length}`);
+        continue;
+      }
+      const domainId = matches[0]!.domain_id ?? "default";
+      const state = domainStates[domainId];
+      if (!state) {
+        markDomainCoverageUnknown(`startable-queue-domain-unknown:${domainId}`);
+        continue;
+      }
+      if (!state.known) continue;
+      state.count += 1;
+      const issueHead = `${repository}#${issue.number}`;
+      if (state.head === null || issueHead < state.head) state.head = issueHead;
+    }
   }
-  return { count, head: heads.sort()[0] ?? null, unlabelledCount, blockedCount, waitingExternalCount, dispatched: dispatched.sort((left, right) => left.repository.localeCompare(right.repository) || left.number - right.number) };
+  return { count, head: heads.sort()[0] ?? null, domains: domainStates, unlabelledCount, blockedCount, waitingExternalCount, dispatched: dispatched.sort((left, right) => left.repository.localeCompare(right.repository) || left.number - right.number) };
 }
 
 function dispatchedWithoutLiveLane(
@@ -2999,7 +3039,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     if (db === null) return {};
     try {
       const holder = db.prepare(
-        `SELECT project_id, role_id, role_generation, execution_attempt_id, thread_id
+        `SELECT project_id, role_id, domain_id, role_generation, execution_attempt_id, thread_id
          FROM execution_attempts
          WHERE project_id = ? AND thread_id = ? AND origin = 'role_holder'
          ORDER BY rowid DESC LIMIT 1`,
@@ -3239,6 +3279,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     known: boolean;
     reason: string | null;
     head: { workItemId: string; resourceRevision: number } | null;
+    domains: Record<string, { known: boolean; reason: string | null; head: { workItemId: string; resourceRevision: number } | null }>;
   };
   type RoleQueueConfig = { identity: string; repositories: string[]; reason: string | null };
   const roleQueueCache = new Map<string, RoleQueueRead>();
@@ -3272,26 +3313,48 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     }
   };
   const bindRoleQueueHead = (projectId: string, configIdentity: string, queue: StartableQueueState, observedAtMs: number): RoleQueueRead => {
-    let head: RoleQueueRead["head"] = null;
-    let reason: string | null = null;
-    if (queue.head !== null) {
-      const match = queue.head.match(/^([^/]+)\/([^/#]+)#([1-9][0-9]*)$/u);
-      const issueNumber = match?.[3] === undefined ? Number.NaN : Number(match[3]);
-      if (!match?.[1] || !match[2] || !Number.isSafeInteger(issueNumber)) {
-        reason = "startable-queue-head-malformed";
-      } else {
-        const matches = db?.prepare(
-          `SELECT items.work_item_id, items.resource_revision
-           FROM work_items AS items JOIN external_work_refs AS refs
-             ON refs.project_id = items.project_id AND refs.work_item_id = items.work_item_id
-           WHERE items.project_id = ? AND items.lifecycle_state IN ('proposed', 'ready')
-             AND refs.provider = 'github' AND refs.owner = ? AND refs.repo = ? AND refs.issue_number = ?`,
-        ).all(projectId, match[1], match[2], issueNumber) as Array<{ work_item_id: string; resource_revision: number }> | undefined;
-        if (!matches || matches.length !== 1) reason = `startable-queue-head-bindings:${matches?.length ?? 0}`;
-        else head = { workItemId: matches[0]!.work_item_id, resourceRevision: matches[0]!.resource_revision };
+    const bind = (queueHead: string | null, domainId?: string): { head: RoleQueueRead["head"]; reason: string | null } => {
+      let head: RoleQueueRead["head"] = null;
+      let reason: string | null = null;
+      if (queueHead !== null) {
+        const match = queueHead.match(/^([^/]+)\/([^/#]+)#([1-9][0-9]*)$/u);
+        const issueNumber = match?.[3] === undefined ? Number.NaN : Number(match[3]);
+        if (!match?.[1] || !match[2] || !Number.isSafeInteger(issueNumber)) {
+          reason = "startable-queue-head-malformed";
+        } else {
+          const matches = db?.prepare(
+            `SELECT items.work_item_id, items.resource_revision
+             FROM work_items AS items JOIN external_work_refs AS refs
+               ON refs.project_id = items.project_id AND refs.work_item_id = items.work_item_id
+             WHERE items.project_id = ? AND items.lifecycle_state IN ('proposed', 'ready')
+               AND refs.provider = 'github' AND refs.owner = ? AND refs.repo = ? AND refs.issue_number = ?`,
+          ).all(projectId, match[1], match[2], issueNumber) as Array<{ work_item_id: string; resource_revision: number }> | undefined;
+          if (!matches || matches.length !== 1) reason = `startable-queue-head-bindings:${matches?.length ?? 0}`;
+          else if (domainId !== undefined) {
+            const item = db?.prepare("SELECT domain_id FROM work_items WHERE project_id = ? AND work_item_id = ?").get(projectId, matches[0]!.work_item_id) as { domain_id?: string } | undefined;
+            if ((item?.domain_id ?? "default") !== domainId) reason = `startable-queue-head-out-of-domain:${domainId}`;
+            else head = { workItemId: matches[0]!.work_item_id, resourceRevision: matches[0]!.resource_revision };
+          } else {
+            head = { workItemId: matches[0]!.work_item_id, resourceRevision: matches[0]!.resource_revision };
+          }
+        }
       }
-    }
-    return { observedAtMs, configIdentity, known: reason === null, reason, head };
+      return { head, reason };
+    };
+    const domains = Object.fromEntries(Object.entries(queue.domains).map(([domainId, state]) => {
+      if (!state.known) return [domainId, { known: false, reason: state.reason, head: null }];
+      const bound = bind(state.head, domainId);
+      return [domainId, { known: bound.reason === null, reason: bound.reason, head: bound.head }];
+    }));
+    const global = bind(queue.head);
+    const domainReason = Object.values(domains).find((state) => state.reason !== null)?.reason ?? null;
+    const reason = global.reason ?? domainReason;
+    return { observedAtMs, configIdentity, known: reason === null, reason, head: global.head, domains };
+  };
+  const scopeRoleQueueRead = (projectId: string, domainId: string, queue: RoleQueueRead): RoleQueueRead => {
+    const scoped = queue.domains[domainId];
+    if (!scoped) return { ...queue, known: false, reason: `role-queue-domain-unknown:${domainId}`, head: null };
+    return { ...queue, known: scoped.known, reason: scoped.reason, head: scoped.head };
   };
   const readProjectRoleQueue = async (projectId: string, refresh = false): Promise<RoleQueueRead> => {
     const now = Date.now();
@@ -3304,11 +3367,12 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       if (refreshing.configIdentity === config.identity) return refreshing.promise;
       const reason = "project-config-superseded-in-flight";
       bb.log.warn(`role queue coverage=degraded project=${projectId} reason=${reason}`);
-      return { observedAtMs: now, configIdentity: config.identity, known: false, reason, head: null };
+      return { observedAtMs: now, configIdentity: config.identity, known: false, reason, head: null, domains: {} };
     }
     const next = (async (): Promise<RoleQueueRead> => {
       let reason = config.reason;
       let head: RoleQueueRead["head"] = null;
+      let domains: RoleQueueRead["domains"] = {};
       try {
         if (reason === null) {
           if (!db) throw new Error("canonical-store-unavailable");
@@ -3318,7 +3382,10 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
           } else if (queue.head !== null) {
             const bound = bindRoleQueueHead(projectId, config.identity, queue, Date.now());
             head = bound.head;
+            domains = bound.domains;
             reason = bound.reason;
+          } else if (queue !== null) {
+            domains = Object.fromEntries(Object.entries(queue.domains).map(([domainId, state]) => [domainId, { known: state.known, reason: state.reason, head: null }]));
           }
         }
       } catch (error) {
@@ -3328,8 +3395,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       if (currentConfig.identity !== config.identity) {
         reason = "project-config-moved-during-refresh";
         head = null;
+        domains = {};
       }
-      const result = { observedAtMs: Date.now(), configIdentity: config.identity, known: reason === null, reason, head };
+      const result = { observedAtMs: Date.now(), configIdentity: config.identity, known: reason === null, reason, head, domains };
       if (currentConfig.identity === config.identity) roleQueueCache.set(projectId, result);
       if (reason !== null) bb.log.warn(`role queue coverage=degraded project=${projectId} reason=${reason}`);
       return result;
@@ -3344,13 +3412,19 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
 
   const readRoleScopes = async () => {
     if (!db) throw new Error("canonical role scope unavailable");
-    const projectIds = [...new Set(readProjectQueueRoleHolders().map((holder) => holder.project_id))];
-    return Promise.all(projectIds.map(async (projectId) => {
+    const holders = readProjectQueueRoleHolders();
+    const holderKeys = [...new Set(holders.map((holder) => `${holder.project_id}\u0000${holder.domain_id ?? "default"}`))];
+    return Promise.all(holderKeys.map(async (key) => {
+      const separator = key.indexOf("\u0000");
+      const projectId = key.slice(0, separator);
+      const domainId = key.slice(separator + 1);
       const queue = await readProjectRoleQueue(projectId);
+      const scopedQueue = scopeRoleQueueRead(projectId, domainId, queue);
       return {
         projectId,
-        nextStartable: queue.known && queue.head !== null,
-        queueHeadId: queue.known ? queue.head?.workItemId ?? null : null,
+        domainId,
+        nextStartable: scopedQueue.known && scopedQueue.head !== null,
+        queueHeadId: scopedQueue.known ? scopedQueue.head?.workItemId ?? null : null,
         deferredReason: null,
       };
     }));
@@ -3361,6 +3435,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     const expectedHolder: RoleHolderState = {
       project_id: role.projectId,
       role_id: role.roleId,
+      domain_id: role.domainId,
       role_generation: role.roleGeneration,
       execution_attempt_id: role.executionAttemptId,
       thread_id: role.threadId,
@@ -3370,6 +3445,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       holders = readProjectQueueRoleHolders().filter((holder) =>
         holder.project_id === role.projectId &&
         holder.role_id === role.roleId &&
+        holder.domain_id === role.domainId &&
         holder.role_generation === role.roleGeneration &&
         holder.execution_attempt_id === role.executionAttemptId,
       );
@@ -3416,6 +3492,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     const current = bindRoleQueueHead(role.projectId, capacity.configIdentity, capacity.queue, capacity.observedAtMs);
     if (!current.known) return "error" as const;
     if (!current.head || current.head.workItemId !== role.queueHeadId) return false;
+    const scoped = scopeRoleQueueRead(role.projectId, role.domainId ?? "default", current);
+    if (!scoped.known || !scoped.head || scoped.head.workItemId !== role.queueHeadId) return false;
     if (capacity.activeLaneCount >= capacity.writingLaneCeiling) return false;
     return sendRoleWake(role, `Wrongful idle: queue head ${current.head.workItemId} is startable. Inspect the queue and act or record the blocker.`);
   };
@@ -3470,6 +3548,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   type IdleFleetFact<T> = { known: true; value: T } | { known: false; reason: string };
   type LaneCapacityObservation = {
     projectId: string;
+    domainId: string;
     orchestratorThreadId: string;
     orchestratorRoleGeneration: number;
     coverageState: "known" | "blind";
@@ -3497,13 +3576,14 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       const extended = db!.prepare(
         `UPDATE lane_capacity_intervals SET last_confirmed_at_ms = ?,
            lane_capacity_observation_id = COALESCE(lane_capacity_observation_id, ?)
-         WHERE project_id = ? AND ended_at_ms IS NULL
+           WHERE project_id = ? AND domain_id = ? AND ended_at_ms IS NULL
            AND coverage_state = ? AND active_lane_count IS ?
            AND writing_lane_ceiling IS ? AND startable_work IS ?`,
       ).run(
         observation.observedAtMs,
         observation.laneCapacityObservationId,
         observation.projectId,
+        observation.domainId,
         observation.coverageState,
         observation.activeLaneCount,
         observation.writingLaneCeiling,
@@ -3511,16 +3591,17 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       );
       if (extended.changes !== 1) {
         db!.prepare(
-        "UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE project_id = ? AND ended_at_ms IS NULL",
-      ).run(observation.projectId);
+        "UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE project_id = ? AND domain_id = ? AND ended_at_ms IS NULL",
+      ).run(observation.projectId, observation.domainId);
       db!.prepare(
         `INSERT INTO lane_capacity_intervals (
-           project_id, orchestrator_thread_id, orchestrator_role_generation,
+           project_id, domain_id, orchestrator_thread_id, orchestrator_role_generation,
            coverage_state, active_lane_count, writing_lane_ceiling, startable_work,
            reason, lane_capacity_observation_id, started_at_ms, last_confirmed_at_ms, ended_at_ms
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
         ).run(
           observation.projectId,
+          observation.domainId,
           observation.orchestratorThreadId,
         observation.orchestratorRoleGeneration,
         observation.coverageState,
@@ -3536,9 +3617,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       for (const executionAttemptId of observation.executionAttemptIds) {
         db!.prepare(
           `INSERT OR IGNORE INTO lane_capacity_refresh_evidence (
-             project_id, lane_capacity_observation_id, execution_attempt_id, observed_at_ms
-           ) VALUES (?, ?, ?, ?)`,
-        ).run(observation.projectId, observation.laneCapacityObservationId, executionAttemptId, observation.observedAtMs);
+             project_id, domain_id, lane_capacity_observation_id, execution_attempt_id, observed_at_ms
+           ) VALUES (?, ?, ?, ?, ?)`,
+        ).run(observation.projectId, observation.domainId, observation.laneCapacityObservationId, executionAttemptId, observation.observedAtMs);
       }
     })();
   };
@@ -3711,8 +3792,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     const startableWork = startable.known ? startable.value.count > 0 : null;
     const open = db.prepare(
       `SELECT coverage_state, active_lane_count, writing_lane_ceiling, startable_work, reason, lane_capacity_observation_id
-       FROM lane_capacity_intervals WHERE project_id = ? AND ended_at_ms IS NULL`,
-    ).get(projectId) as {
+       FROM lane_capacity_intervals WHERE project_id = ? AND domain_id = ? AND ended_at_ms IS NULL`,
+    ).get(projectId, holder.domain_id ?? "default") as {
       coverage_state: string; active_lane_count: number | null; writing_lane_ceiling: number | null;
       startable_work: number | null; reason: string | null; lane_capacity_observation_id: string | null;
     } | undefined;
@@ -3726,6 +3807,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       : randomBytes(16).toString("hex");
     return {
       projectId,
+      domainId: holder.domain_id ?? "default",
       orchestratorThreadId: holder.thread_id,
       orchestratorRoleGeneration: holder.role_generation,
       coverageState,
@@ -3824,6 +3906,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     const role = {
       projectId: holder.project_id,
       roleId: holder.role_id,
+      domainId: holder.domain_id ?? "default",
       roleGeneration: holder.role_generation,
       executionAttemptId: holder.execution_attempt_id,
       threadId: holder.thread_id,
@@ -3941,7 +4024,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         && ageMs >= 0 && ageMs < ROLE_QUEUE_CACHE_MS ? queue.head : null;
     },
     wakeRole: async (role) => {
-      const queue = await readProjectRoleQueue(role.projectId, true);
+      const queue = scopeRoleQueueRead(role.projectId, role.domainId ?? "default", await readProjectRoleQueue(role.projectId, true));
       const result = queue.head ? await steerRole({ ...role, queueHeadId: queue.head.workItemId }) : queue.known ? false : "error";
       return result === true
         ? { attempted: true, delivered: true }

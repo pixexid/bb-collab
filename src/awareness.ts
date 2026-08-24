@@ -137,6 +137,7 @@ export function createWaitRegistry(persistence?: WaitRegistryPersistence): WaitR
 export interface RoleHolderState {
   project_id: string;
   role_id: string;
+  domain_id?: string;
   role_generation: number;
   execution_attempt_id: string;
   thread_id: string;
@@ -144,6 +145,7 @@ export interface RoleHolderState {
 
 export interface CurrentRoleBinding {
   roleId: string;
+  domainId?: string;
   generation: number;
   executionAttemptId: string;
   threadId: string;
@@ -162,7 +164,7 @@ export type CurrentRoleBindingResolution =
   | { standing: "unknown"; reason: CurrentRoleBindingUnknownReason };
 
 function roleIdlePrefix(holder: RoleHolderState): string {
-  return `${JSON.stringify([holder.project_id, holder.role_id, holder.role_generation]).slice(0, -1)},`;
+  return `${JSON.stringify([holder.project_id, holder.role_id, holder.domain_id ?? "default", holder.role_generation]).slice(0, -1)},`;
 }
 
 export function roleIdleKey(holder: RoleHolderState, queueHeadId: string): string {
@@ -171,6 +173,7 @@ export function roleIdleKey(holder: RoleHolderState, queueHeadId: string): strin
 
 export interface RoleQueueScope {
   projectId: string;
+  domainId?: string;
   nextStartable: boolean;
   queueHeadId: string | null;
   deferredReason: OperatorWait["reason"] | null;
@@ -179,6 +182,7 @@ export interface RoleQueueScope {
 export interface RoleIdleView {
   projectId: string;
   roleId: string;
+  domainId?: string;
   roleGeneration: number;
   executionAttemptId: string;
   threadId: string;
@@ -424,24 +428,49 @@ interface WaitContext {
 }
 
 export function readRoleHolderStates(db: SqliteDatabase): RoleHolderState[] {
-  return db
-    .prepare(
-      `SELECT attempts.project_id, attempts.role_id, attempts.role_generation,
+  const hasDomainColumns = (table: string) => (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some((column) => column.name === "domain_id");
+  if (hasDomainColumns("execution_attempts") && hasDomainColumns("role_generation_heads") && hasDomainColumns("role_generations")) {
+    return db
+      .prepare(
+      `SELECT attempts.project_id, attempts.role_id, attempts.domain_id, attempts.role_generation,
               attempts.execution_attempt_id, attempts.thread_id
        FROM execution_attempts AS attempts
        JOIN role_generation_heads AS heads
          ON heads.project_id = attempts.project_id
         AND heads.role_id = attempts.role_id
+        AND heads.domain_id = attempts.domain_id
         AND heads.current_generation = attempts.role_generation
        JOIN role_generations AS generations
          ON generations.project_id = attempts.project_id
         AND generations.role_id = attempts.role_id
+        AND generations.domain_id = attempts.domain_id
         AND generations.generation = attempts.role_generation
         AND generations.holder_execution_attempt_id = attempts.execution_attempt_id
        WHERE attempts.origin = 'role_holder'
          AND attempts.thread_id IS NOT NULL
          AND generations.status = 'active'
-       ORDER BY attempts.project_id, attempts.role_id, attempts.role_generation`,
+       ORDER BY attempts.project_id, attempts.role_id, attempts.domain_id, attempts.role_generation`,
+      )
+      .all() as RoleHolderState[];
+  }
+  return db
+    .prepare(
+      `SELECT attempts.project_id, attempts.role_id, 'default' AS domain_id, attempts.role_generation,
+                attempts.execution_attempt_id, attempts.thread_id
+         FROM execution_attempts AS attempts
+         JOIN role_generation_heads AS heads
+           ON heads.project_id = attempts.project_id
+          AND heads.role_id = attempts.role_id
+          AND heads.current_generation = attempts.role_generation
+         JOIN role_generations AS generations
+           ON generations.project_id = attempts.project_id
+          AND generations.role_id = attempts.role_id
+          AND generations.generation = attempts.role_generation
+          AND generations.holder_execution_attempt_id = attempts.execution_attempt_id
+         WHERE attempts.origin = 'role_holder'
+           AND attempts.thread_id IS NOT NULL
+           AND generations.status = 'active'
+         ORDER BY attempts.project_id, attempts.role_id, attempts.role_generation`,
     )
     .all() as RoleHolderState[];
 }
@@ -458,6 +487,7 @@ export function readCurrentRoleBindings(db: SqliteDatabase | null, projectId: st
         .filter((holder) => holder.project_id === projectId)
         .map((holder) => ({
           roleId: holder.role_id,
+          domainId: holder.domain_id ?? "default",
           generation: holder.role_generation,
           executionAttemptId: holder.execution_attempt_id,
           threadId: holder.thread_id,
@@ -566,7 +596,7 @@ export function createLaneWatcher(options: {
     if (!options.readRoleHolders) return null;
     try {
       const current = options.readRoleHolders().filter((candidate) =>
-        candidate.project_id === holder.project_id && candidate.role_id === holder.role_id,
+        candidate.project_id === holder.project_id && candidate.role_id === holder.role_id && (candidate.domain_id ?? "default") === (holder.domain_id ?? "default"),
       );
       return current.length === 1 &&
         current[0]?.role_generation === holder.role_generation &&
@@ -607,12 +637,12 @@ export function createLaneWatcher(options: {
 
     for (const holder of holders) {
       if (signal?.aborted) return;
-      const projectHolders = holders.filter((candidate) => candidate.project_id === holder.project_id && candidate.role_id === holder.role_id);
+      const projectHolders = holders.filter((candidate) => candidate.project_id === holder.project_id && candidate.role_id === holder.role_id && (candidate.domain_id ?? "default") === (holder.domain_id ?? "default"));
       if (projectHolders.length !== 1 || !holder.thread_id) continue;
       const targetThreadId = holder.thread_id;
       if (threadId && targetThreadId !== threadId) continue;
       const prefix = roleIdlePrefix(holder);
-      const scope = scopes.find((candidate) => candidate.projectId === holder.project_id);
+    const scope = scopes.find((candidate) => candidate.projectId === holder.project_id && (candidate.domainId ?? "default") === (holder.domain_id ?? "default"));
       let observation: WorkerObservation;
       try {
         observation = signal ? await options.readWorker(targetThreadId, signal) : await options.readWorker(targetThreadId);
@@ -652,6 +682,7 @@ export function createLaneWatcher(options: {
           await escalateRole(key, {
             projectId: holder.project_id,
             roleId: holder.role_id,
+            domainId: holder.domain_id ?? "default",
             roleGeneration: holder.role_generation,
             executionAttemptId: holder.execution_attempt_id,
             threadId: targetThreadId,
@@ -666,6 +697,7 @@ export function createLaneWatcher(options: {
       const role: RoleIdleView = {
         projectId: holder.project_id,
         roleId: holder.role_id,
+        domainId: holder.domain_id ?? "default",
         roleGeneration: holder.role_generation,
         executionAttemptId: holder.execution_attempt_id,
         threadId: targetThreadId,
@@ -698,6 +730,7 @@ export function createLaneWatcher(options: {
     const holder: RoleHolderState = {
       project_id: role.projectId,
       role_id: role.roleId,
+      domain_id: role.domainId ?? "default",
       role_generation: role.roleGeneration,
       execution_attempt_id: role.executionAttemptId,
       thread_id: role.threadId,
@@ -712,7 +745,7 @@ export function createLaneWatcher(options: {
     } catch {
       return { attempted: false, delivered: false, refusal: "error" };
     }
-    const scope = scopes.find((candidate) => candidate.projectId === role.projectId);
+    const scope = scopes.find((candidate) => candidate.projectId === role.projectId && (candidate.domainId ?? "default") === (role.domainId ?? "default"));
     if (
       !scope?.nextStartable ||
       scope.queueHeadId !== role.queueHeadId ||
