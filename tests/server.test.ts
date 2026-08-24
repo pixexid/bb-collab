@@ -5370,6 +5370,35 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(fixture.db.prepare("SELECT lane_id, thread_id, state FROM execution_attempts WHERE origin = 'work_item' ORDER BY rowid DESC LIMIT 1").get()).toMatchObject({ lane_id: "lane-work-item-1", thread_id: "lane-1", state: "running" });
   });
 
+  it("refuses pull-request review dispatch through the local candidate lane before intent or spawn", async () => {
+    const fixture = await assignmentFixture({ withoutGithubIssues: true });
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, {
+      idempotencyKey: "pull-request-review-pending",
+      workAttempt: undefined,
+    })).outcome).toBe("OK");
+    const before = exportFoundation(fixture.db, PROJECT_ID);
+    fixture.host.harness.sdk.stub("threads.spawn", (async () => { throw new Error("pull-request review must not spawn through dispatch_lane"); }) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, undefined, 4, {
+        idempotencyKey: "pull-request-review-dispatch",
+        workAttempt: {
+          laneId: "lane-pull-request-review",
+          threadId: "thread-pull-request-review",
+          assignmentKind: "review" as const,
+          requestedProfile: ROLE_PROFILE,
+          candidateKind: "pull-request" as const,
+          reviewPrNumber: 644,
+          reviewPrHeadSha: CANDIDATE_SHA,
+        },
+      }),
+      spawn: dispatchSpawn(ROLE_THREAD_ID),
+    }, { projectId: PROJECT_ID, threadId: ROLE_THREAD_ID }) as string);
+    expect(result).toMatchObject({ outcome: "INVALID_INPUT", message: expect.stringContaining("governed review handoff") });
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+  });
+
   it("proves equivalent config cutover before intent and records one governed continuation", async () => {
     const fixture = await fleetWatchdogFixture(0, true, 1, false);
     const stored = fixture.db.prepare(

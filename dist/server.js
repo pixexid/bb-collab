@@ -25658,6 +25658,9 @@ async function dispatchLane(bb, db, input) {
   if (!request.workAttempt || (reviewDispatch ? request.lifecycleState !== void 0 : request.lifecycleState !== "in_progress" && request.lifecycleState !== void 0)) {
     return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: reviewDispatch ? "review dispatch requires a review attempt and review_pending WorkItem" : "lane dispatch requires a writing work attempt and an in-progress transition" };
   }
+  if (reviewDispatch && request.workAttempt.candidateKind !== "local") {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "dispatch_lane only supports explicit local-candidate reviews; pull-request reviews use the governed review handoff" };
+  }
   if (spawn.projectId !== request.projectId) {
     return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "spawn projectId must match request projectId" };
   }
