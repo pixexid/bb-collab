@@ -131,7 +131,7 @@ export const fleetWatchdogBlockerFiredKey = (projectId: string, workItemId: stri
 const fleetWatchdogLegacyBlockerFiredKey = (workItemId: string, subject: string) =>
   `fleet-watchdog:blocker-fired:${workItemId}:${subject}`;
 export const fleetWatchdogRoleLivenessKey = (holder: RoleHolderState) => fleetWatchdogCompositeKey(
-  holder.project_id, holder.role_id, String(holder.role_generation), holder.execution_attempt_id, holder.thread_id,
+  holder.project_id, holder.role_id, holder.domain_id ?? "default", String(holder.role_generation), holder.execution_attempt_id, holder.thread_id,
 );
 export const fleetWatchdogEpisodeKey = (
   holder: RoleHolderState,
@@ -139,7 +139,7 @@ export const fleetWatchdogEpisodeKey = (
   activeLaneCount = 0,
   writingLaneCeiling = 0,
 ) => fleetWatchdogCompositeKey(
-  holder.project_id, holder.role_id, String(holder.role_generation), holder.execution_attempt_id, holder.thread_id,
+  holder.project_id, holder.role_id, holder.domain_id ?? "default", String(holder.role_generation), holder.execution_attempt_id, holder.thread_id,
   `activeLanes=${activeLaneCount}`, `writingLaneCeiling=${writingLaneCeiling}`, queueHead,
 );
 const fleetWatchdogLegacyEpisodeKey = (
@@ -2999,7 +2999,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     if (db === null) return {};
     try {
       const holder = db.prepare(
-        `SELECT project_id, role_id, role_generation, execution_attempt_id, thread_id
+        `SELECT project_id, role_id, domain_id, role_generation, execution_attempt_id, thread_id
          FROM execution_attempts
          WHERE project_id = ? AND thread_id = ? AND origin = 'role_holder'
          ORDER BY rowid DESC LIMIT 1`,
@@ -3293,6 +3293,14 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     }
     return { observedAtMs, configIdentity, known: reason === null, reason, head };
   };
+  const scopeRoleQueueRead = (projectId: string, domainId: string, queue: RoleQueueRead): RoleQueueRead => {
+    if (!queue.head || !db) return queue;
+    const item = db.prepare("SELECT domain_id FROM work_items WHERE project_id = ? AND work_item_id = ?").get(projectId, queue.head.workItemId) as { domain_id?: string } | undefined;
+    if ((item?.domain_id ?? "default") !== domainId) {
+      return { ...queue, known: false, reason: `role-queue-head-out-of-domain:${domainId}`, head: null };
+    }
+    return queue;
+  };
   const readProjectRoleQueue = async (projectId: string, refresh = false): Promise<RoleQueueRead> => {
     const now = Date.now();
     const config = readRoleQueueConfig(projectId);
@@ -3344,13 +3352,19 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
 
   const readRoleScopes = async () => {
     if (!db) throw new Error("canonical role scope unavailable");
-    const projectIds = [...new Set(readProjectQueueRoleHolders().map((holder) => holder.project_id))];
-    return Promise.all(projectIds.map(async (projectId) => {
+    const holders = readProjectQueueRoleHolders();
+    const holderKeys = [...new Set(holders.map((holder) => `${holder.project_id}\u0000${holder.domain_id ?? "default"}`))];
+    return Promise.all(holderKeys.map(async (key) => {
+      const separator = key.indexOf("\u0000");
+      const projectId = key.slice(0, separator);
+      const domainId = key.slice(separator + 1);
       const queue = await readProjectRoleQueue(projectId);
+      const scopedQueue = scopeRoleQueueRead(projectId, domainId, queue);
       return {
         projectId,
-        nextStartable: queue.known && queue.head !== null,
-        queueHeadId: queue.known ? queue.head?.workItemId ?? null : null,
+        domainId,
+        nextStartable: scopedQueue.known && scopedQueue.head !== null,
+        queueHeadId: scopedQueue.known ? scopedQueue.head?.workItemId ?? null : null,
         deferredReason: null,
       };
     }));
@@ -3361,6 +3375,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     const expectedHolder: RoleHolderState = {
       project_id: role.projectId,
       role_id: role.roleId,
+      domain_id: role.domainId,
       role_generation: role.roleGeneration,
       execution_attempt_id: role.executionAttemptId,
       thread_id: role.threadId,
@@ -3370,6 +3385,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       holders = readProjectQueueRoleHolders().filter((holder) =>
         holder.project_id === role.projectId &&
         holder.role_id === role.roleId &&
+        holder.domain_id === role.domainId &&
         holder.role_generation === role.roleGeneration &&
         holder.execution_attempt_id === role.executionAttemptId,
       );
@@ -3416,6 +3432,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     const current = bindRoleQueueHead(role.projectId, capacity.configIdentity, capacity.queue, capacity.observedAtMs);
     if (!current.known) return "error" as const;
     if (!current.head || current.head.workItemId !== role.queueHeadId) return false;
+    const scoped = scopeRoleQueueRead(role.projectId, role.domainId ?? "default", current);
+    if (!scoped.known || !scoped.head || scoped.head.workItemId !== role.queueHeadId) return false;
     if (capacity.activeLaneCount >= capacity.writingLaneCeiling) return false;
     return sendRoleWake(role, `Wrongful idle: queue head ${current.head.workItemId} is startable. Inspect the queue and act or record the blocker.`);
   };
@@ -3470,6 +3488,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   type IdleFleetFact<T> = { known: true; value: T } | { known: false; reason: string };
   type LaneCapacityObservation = {
     projectId: string;
+    domainId: string;
     orchestratorThreadId: string;
     orchestratorRoleGeneration: number;
     coverageState: "known" | "blind";
@@ -3497,13 +3516,14 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       const extended = db!.prepare(
         `UPDATE lane_capacity_intervals SET last_confirmed_at_ms = ?,
            lane_capacity_observation_id = COALESCE(lane_capacity_observation_id, ?)
-         WHERE project_id = ? AND ended_at_ms IS NULL
+           WHERE project_id = ? AND domain_id = ? AND ended_at_ms IS NULL
            AND coverage_state = ? AND active_lane_count IS ?
            AND writing_lane_ceiling IS ? AND startable_work IS ?`,
       ).run(
         observation.observedAtMs,
         observation.laneCapacityObservationId,
         observation.projectId,
+        observation.domainId,
         observation.coverageState,
         observation.activeLaneCount,
         observation.writingLaneCeiling,
@@ -3511,16 +3531,17 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       );
       if (extended.changes !== 1) {
         db!.prepare(
-        "UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE project_id = ? AND ended_at_ms IS NULL",
-      ).run(observation.projectId);
+        "UPDATE lane_capacity_intervals SET ended_at_ms = last_confirmed_at_ms WHERE project_id = ? AND domain_id = ? AND ended_at_ms IS NULL",
+      ).run(observation.projectId, observation.domainId);
       db!.prepare(
         `INSERT INTO lane_capacity_intervals (
-           project_id, orchestrator_thread_id, orchestrator_role_generation,
+           project_id, domain_id, orchestrator_thread_id, orchestrator_role_generation,
            coverage_state, active_lane_count, writing_lane_ceiling, startable_work,
            reason, lane_capacity_observation_id, started_at_ms, last_confirmed_at_ms, ended_at_ms
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
         ).run(
           observation.projectId,
+          observation.domainId,
           observation.orchestratorThreadId,
         observation.orchestratorRoleGeneration,
         observation.coverageState,
@@ -3536,9 +3557,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       for (const executionAttemptId of observation.executionAttemptIds) {
         db!.prepare(
           `INSERT OR IGNORE INTO lane_capacity_refresh_evidence (
-             project_id, lane_capacity_observation_id, execution_attempt_id, observed_at_ms
-           ) VALUES (?, ?, ?, ?)`,
-        ).run(observation.projectId, observation.laneCapacityObservationId, executionAttemptId, observation.observedAtMs);
+             project_id, domain_id, lane_capacity_observation_id, execution_attempt_id, observed_at_ms
+           ) VALUES (?, ?, ?, ?, ?)`,
+        ).run(observation.projectId, observation.domainId, observation.laneCapacityObservationId, executionAttemptId, observation.observedAtMs);
       }
     })();
   };
@@ -3711,8 +3732,8 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     const startableWork = startable.known ? startable.value.count > 0 : null;
     const open = db.prepare(
       `SELECT coverage_state, active_lane_count, writing_lane_ceiling, startable_work, reason, lane_capacity_observation_id
-       FROM lane_capacity_intervals WHERE project_id = ? AND ended_at_ms IS NULL`,
-    ).get(projectId) as {
+       FROM lane_capacity_intervals WHERE project_id = ? AND domain_id = ? AND ended_at_ms IS NULL`,
+    ).get(projectId, holder.domain_id ?? "default") as {
       coverage_state: string; active_lane_count: number | null; writing_lane_ceiling: number | null;
       startable_work: number | null; reason: string | null; lane_capacity_observation_id: string | null;
     } | undefined;
@@ -3726,6 +3747,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       : randomBytes(16).toString("hex");
     return {
       projectId,
+      domainId: holder.domain_id ?? "default",
       orchestratorThreadId: holder.thread_id,
       orchestratorRoleGeneration: holder.role_generation,
       coverageState,
@@ -3824,6 +3846,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     const role = {
       projectId: holder.project_id,
       roleId: holder.role_id,
+      domainId: holder.domain_id ?? "default",
       roleGeneration: holder.role_generation,
       executionAttemptId: holder.execution_attempt_id,
       threadId: holder.thread_id,
