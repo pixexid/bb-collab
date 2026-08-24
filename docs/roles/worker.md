@@ -36,4 +36,4 @@ Live state is never this page. Query the plugin database’s `role_generation_he
 
 ## Silence is a defect signal
 
-Follow the canonical [silence/watch rule](../rules.md#silence-is-a-defect-signal), upward and downward.
+Use the canonical [waiting-subscription rule](../rules.md#waiting-is-a-subscription).

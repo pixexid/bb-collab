@@ -25479,6 +25479,13 @@ function roleForThread(db, projectId, threadId) {
 function roleBriefRole(roleId) {
   return roleId === "director" ? "director" : roleId === "project-orchestrator" ? "orchestrator" : "worker";
 }
+function canonicalSeatBriefInjection(rules) {
+  const marker = "Seat brief injection: ";
+  const start = rules.indexOf(marker);
+  const end = start < 0 ? -1 : rules.indexOf("\n", start + marker.length);
+  if (start < 0 || end < 0) throw new Error("role brief bundle is missing the canonical messaging doctrine");
+  return rules.slice(start, end);
+}
 async function composeRoleBrief(bb, db, input) {
   const bundle = roleBriefBundleSchema.parse(JSON.parse(readFileSync4(roleBriefBundlePath(), "utf8")));
   const project = await bb.sdk.projects.get({ projectId: input.projectId });
@@ -25492,6 +25499,8 @@ async function composeRoleBrief(bb, db, input) {
     bundle.ponytail.trimEnd(),
     "",
     bundle.roles[input.role].trimEnd(),
+    "",
+    canonicalSeatBriefInjection(bundle.rules),
     "",
     "## Read in order",
     `docs/roles/${input.role}.md, docs/operations-model.md, docs/ponytail.md, docs/rules.md, docs/threat-model.md.`,
