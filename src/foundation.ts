@@ -7794,6 +7794,30 @@ function requireBoundGithubIssue(
   return ref;
 }
 
+function assertNoWorkItemBlockerCycle(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  blocker: WorkItemBlocker,
+): void {
+  if (blocker.kind !== "work_item_succeeded") return;
+  if (blocker.workItemId === request.workItemId) throw refusal("WORK_ITEM_STATE_INVALID", "work item cannot block on itself");
+  const visited = new Set<string>([request.workItemId!]);
+  let dependencyId = blocker.workItemId;
+  while (true) {
+    if (visited.has(dependencyId)) throw refusal("WORK_ITEM_STATE_INVALID", "work item blocker dependency is cyclic");
+    visited.add(dependencyId);
+    const dependency = asRow<{ lifecycle_state: WorkItemState }>(db.prepare(
+      "SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?",
+    ).get(request.projectId, dependencyId));
+    if (!dependency) throw refusal("WORK_ITEM_UNKNOWN", "blocking work item does not exist in the exact project");
+    const next = asRow<{ waker: string; waker_kind: string }>(db.prepare(
+      "SELECT waker, waker_kind FROM work_item_waits WHERE project_id = ? AND work_item_id = ?",
+    ).get(request.projectId, dependencyId));
+    if (!next || next.waker_kind !== "work_item_succeeded") return;
+    dependencyId = next.waker;
+  }
+}
+
 function blockerConditionSatisfied(
   db: SqliteDatabase,
   request: ApplyRequest,
@@ -7801,30 +7825,18 @@ function blockerConditionSatisfied(
   githubObservation: GitHubIssueSnapshot | null,
 ): boolean {
   if (blocker.kind === "work_item_succeeded") {
-    if (blocker.workItemId === request.workItemId) throw refusal("WORK_ITEM_STATE_INVALID", "work item cannot block on itself");
-    const visited = new Set<string>([request.workItemId!]);
-    let dependencyId = blocker.workItemId;
-    while (true) {
-      if (visited.has(dependencyId)) throw refusal("WORK_ITEM_STATE_INVALID", "work item blocker dependency is cyclic");
-      visited.add(dependencyId);
-      const dependency = asRow<{ lifecycle_state: WorkItemState }>(db.prepare(
-        "SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?",
-      ).get(request.projectId, dependencyId));
-      if (!dependency) throw refusal("WORK_ITEM_UNKNOWN", "blocking work item does not exist in the exact project");
-      if (["failed", "cancelled"].includes(dependency.lifecycle_state)) {
-        throw refusal("WORK_ITEM_STATE_INVALID", "work item cannot block on a terminal dependency that did not succeed");
-      }
-      if (dependency.lifecycle_state === "succeeded") return true;
-      const next = asRow<{ waker: string; waker_kind: string }>(db.prepare(
-        "SELECT waker, waker_kind FROM work_item_waits WHERE project_id = ? AND work_item_id = ?",
-      ).get(request.projectId, dependencyId));
-      if (!next || next.waker_kind !== "work_item_succeeded") return false;
-      dependencyId = next.waker;
+    assertNoWorkItemBlockerCycle(db, request, blocker);
+    const dependency = asRow<{ lifecycle_state: WorkItemState }>(db.prepare(
+      "SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?",
+    ).get(request.projectId, blocker.workItemId));
+    if (!dependency) throw refusal("WORK_ITEM_UNKNOWN", "blocking work item does not exist in the exact project");
+    if (["failed", "cancelled"].includes(dependency.lifecycle_state)) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "work item cannot block on a terminal dependency that did not succeed");
     }
-  } else {
-    if (!githubObservation) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub blocker observation is unavailable");
-    return githubObservation.state === "closed";
+    return dependency.lifecycle_state === "succeeded";
   }
+  if (!githubObservation) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub blocker observation is unavailable");
+  return githubObservation.state === "closed";
 }
 
 function requireBlockerCondition(
