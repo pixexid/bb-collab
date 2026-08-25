@@ -10865,16 +10865,11 @@ function decisionDoctorEvidence(db: SqliteDatabase, projectId: string): {
       const actor = asRow<{ actor_kind: string; project_id: string; verification_state: string; receipt_digest: string; subject_id: string; role_id: string | null; role_generation: number | null; operator_receipt_id: string | null; retirement_condition: string | null; domain_id: string | null }>(
         db.prepare("SELECT * FROM actor_receipts WHERE receipt_id = ?").get(disposition.actor_receipt_id),
       );
-      const linkedReceipt = actor?.operator_receipt_id ? asRow<{ caller_plugin_id: string; mutation_class: string }>(db.prepare(
-        "SELECT caller_plugin_id, mutation_class FROM operator_receipts WHERE project_id = ? AND receipt_id = ?",
-      ).get(projectId, actor.operator_receipt_id)) : undefined;
-      const pluginActor = actor?.actor_kind === "plugin" && decision.decision_class === "operator_only" && actor.subject_id === PLUGIN_ID &&
-        actor.retirement_condition === OPERATOR_RECEIPT_RETIREMENT_CONDITION && linkedReceipt?.caller_plugin_id === PLUGIN_ID &&
-        linkedReceipt.mutation_class === "decision_disposition";
       const bootstrapPluginActor = bootstrapAuthorityRoot !== null && disposition.actor_receipt_id === bootstrapAuthorityRoot.actorReceiptId &&
         actor?.actor_kind === "plugin" && actor.project_id === projectId && actor.verification_state === "verified" &&
         actor.receipt_digest === bootstrapAuthorityRoot.actorReceiptDigest;
-      if (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || (!pluginActor && !bootstrapPluginActor && !["role", "operator"].includes(actor.actor_kind))) {
+      if (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" ||
+          (bootstrapAuthorityRoot !== null && !bootstrapPluginActor)) {
         issues.push({ decisionId: decision.decision_id, reason: "decision_actor_invalid" });
       } else {
         const receiptDigest = actorReceiptDigest({

@@ -12338,7 +12338,7 @@ else printf '%s\\n' '[]'; fi
   });
 
   it("uses any verified actor receipt for Decision authority", async () => {
-    const { db, fenceToken } = await assignmentFixture();
+    const { host, db, fenceToken } = await assignmentFixture();
     seedVerifiedFixtureReceipt(db, {
       projectId: PROJECT_ID,
       receiptId: "verified-plugin-decision-actor",
@@ -12353,6 +12353,10 @@ else printf '%s\\n' '[]'; fi
       idempotencyKey: "adopt-plugin-decision",
       actorReceiptId: "verified-plugin-decision-actor",
     })).outcome).toBe("OK");
+    expect(await host.harness.callRpc("doctor", { projectId: PROJECT_ID })).toMatchObject({
+      outcome: "OK",
+      evidence: { decisionIntegrity: { issues: [] } },
+    });
     db.prepare("UPDATE actor_receipts SET receipt_digest = ? WHERE receipt_id = ?").run("0".repeat(64), "verified-plugin-decision-actor");
     const beforeTamperedReceipt = exportFoundation(db, PROJECT_ID);
     expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "tampered-plugin-decision", {
@@ -12553,7 +12557,7 @@ else printf '%s\\n' '[]'; fi
   it("kills bootstrap authority mutants and preserves ordinary role authority", async () => {
     const { db, fenceToken } = await assignmentFixture();
     seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "bootstrap-plugin", actorKind: "plugin", subjectId: PLUGIN_ID });
-    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "wrong-plugin", actorKind: "plugin", subjectId: "other-plugin" });
+    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "wrong-plugin", actorKind: "plugin", subjectId: PLUGIN_ID });
     db.prepare("UPDATE project_governorships SET actor_receipt_id = ? WHERE project_id = ? AND governance_epoch = 1").run("bootstrap-plugin", PROJECT_ID);
     const exact = {
       repoTargetId: null,

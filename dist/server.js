@@ -17117,7 +17117,6 @@ var roleContextRefSchema = external_exports.object({
   completionEventId: id,
   completionEventSeq: external_exports.number().int().positive()
 }).strict();
-var OPERATOR_RECEIPT_RETIREMENT_CONDITION = "host-issued receipt get-bb/bb#1541";
 var CANONICAL_MUTATION_CLASSES = [
   "bootstrap",
   "config_revision",
@@ -23465,12 +23464,8 @@ function decisionDoctorEvidence(db, projectId) {
       const actor = asRow(
         db.prepare("SELECT * FROM actor_receipts WHERE receipt_id = ?").get(disposition.actor_receipt_id)
       );
-      const linkedReceipt = actor?.operator_receipt_id ? asRow(db.prepare(
-        "SELECT caller_plugin_id, mutation_class FROM operator_receipts WHERE project_id = ? AND receipt_id = ?"
-      ).get(projectId, actor.operator_receipt_id)) : void 0;
-      const pluginActor = actor?.actor_kind === "plugin" && decision.decision_class === "operator_only" && actor.subject_id === PLUGIN_ID && actor.retirement_condition === OPERATOR_RECEIPT_RETIREMENT_CONDITION && linkedReceipt?.caller_plugin_id === PLUGIN_ID && linkedReceipt.mutation_class === "decision_disposition";
       const bootstrapPluginActor = bootstrapAuthorityRoot !== null && disposition.actor_receipt_id === bootstrapAuthorityRoot.actorReceiptId && actor?.actor_kind === "plugin" && actor.project_id === projectId && actor.verification_state === "verified" && actor.receipt_digest === bootstrapAuthorityRoot.actorReceiptDigest;
-      if (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || !pluginActor && !bootstrapPluginActor && !["role", "operator"].includes(actor.actor_kind)) {
+      if (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || bootstrapAuthorityRoot !== null && !bootstrapPluginActor) {
         issues.push({ decisionId: decision.decision_id, reason: "decision_actor_invalid" });
       } else {
         const receiptDigest = actorReceiptDigest({
