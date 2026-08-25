@@ -21313,7 +21313,9 @@ function applyThreadlessPreparedClosure(db, request, digest2) {
     "interruption_turn_id",
     "interruption_evidence_digest",
     "conflicting_terminal_digest",
-    "completed_at_ms"
+    "completed_at_ms",
+    "lease_owner_thread_id",
+    "lease_expires_at_ms"
   ];
   if (nativeEvidence.some((column) => attempt[column] !== null)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure requires zero native request, content, and terminal evidence");

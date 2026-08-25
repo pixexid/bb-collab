@@ -8104,6 +8104,7 @@ function applyThreadlessPreparedClosure(
     "terminalization_class", "terminal_report_json", "terminal_actual_profile_digest",
     "interruption_reason", "interruption_event_id", "interruption_event_seq", "interruption_turn_id",
     "interruption_evidence_digest", "conflicting_terminal_digest", "completed_at_ms",
+    "lease_owner_thread_id", "lease_expires_at_ms",
   ];
   if (nativeEvidence.some((column) => attempt[column] !== null)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure requires zero native request, content, and terminal evidence");
@@ -10280,6 +10281,8 @@ interface ExecutionAttemptRow {
   conflicting_terminal_digest: string | null;
   terminal_event_id: string | null;
   terminal_event_seq: number | null;
+  lease_owner_thread_id: string | null;
+  lease_expires_at_ms: number | null;
   completed_at_ms: number | null;
   reason_code: string | null;
   last_event_seq: number | null;

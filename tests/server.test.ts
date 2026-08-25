@@ -6671,6 +6671,33 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: eventCount });
   });
 
+  it.each([
+    ["live", "thr_live", 4_000_000_000_000],
+    ["expired", "thr_expired", 0],
+  ] as const)("refuses thread-less closure for a %s lease without clearing it", async (_name, leaseOwner, leaseExpiresAtMs) => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const { threadId: _threadId, ...preparedAttempt } = request.workAttempt!;
+    const legacyRequest = { ...request, workAttempt: preparedAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+    expect(applyWithFixtureReceipt(fixture.db, legacyRequest)).toMatchObject({ outcome: "OK" });
+    const attempt = fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string };
+    fixture.db.prepare(
+      "UPDATE execution_attempts SET lease_owner_thread_id = ?, lease_expires_at_ms = ? WHERE project_id = ? AND execution_attempt_id = ?",
+    ).run(leaseOwner, leaseExpiresAtMs, PROJECT_ID, attempt.execution_attempt_id);
+    fixture.host.harness.sdk.stub("threads.list", (async () => []) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("close_threadless_prepared_attempt", {
+      request: { ...request, idempotencyKey: `gh667-${_name}-lease`, lifecycleState: undefined, workAttempt: undefined, reasonCode: undefined, executionAttemptId: attempt.execution_attempt_id, expectedResourceRevision: 3 },
+      correctionId: `gh667-${_name}-lease-correction`,
+      dispatchIntentIdempotencyKey: legacyRequest.idempotencyKey,
+      replayRequestDigest: mutationRequestDigest(parseApplyRequest({ ...legacyRequest, reasonCode: `${legacyRequest.reasonCode}:title=changed` })),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).toBe("WORK_ITEM_STATE_INVALID");
+    expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "in_progress" });
+    expect(fixture.db.prepare("SELECT state, thread_id, lease_owner_thread_id, lease_expires_at_ms FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(PROJECT_ID, attempt.execution_attempt_id)).toEqual({ state: "prepared", thread_id: null, lease_owner_thread_id: leaseOwner, lease_expires_at_ms: leaseExpiresAtMs });
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.list")).toHaveLength(4);
+  });
+
   it("rejects generic apply closure evidence before native inventory or terminalization", async () => {
     const fixture = await fleetWatchdogFixture(0, true, 1, false);
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
