@@ -2128,6 +2128,14 @@ export interface WorkItemDispatchIntent {
   title: string | null;
 }
 
+export const threadlessPreparedClosurePopulation = (projectId: string) => ({
+  projectId,
+  source: "bb.sdk.threads.list",
+  active: "all pages with archived=false",
+  archived: "all pages with archived=true",
+  deleted: "excluded because threads.list does not expose deleted history",
+} as const);
+
 export function parseWorkItemDispatchIntent(reasonCode: string | null): WorkItemDispatchIntent | null {
   const prefix = "work_item_dispatch_intent:";
   if (!reasonCode?.startsWith(prefix)) return null;
@@ -2718,6 +2726,13 @@ const threadlessPreparedClosureSchema = z
       z.object({
         kind: z.literal("zero_thread"),
         reference: id,
+        population: z.object({
+          projectId: id,
+          source: z.literal("bb.sdk.threads.list"),
+          active: z.literal("all pages with archived=false"),
+          archived: z.literal("all pages with archived=true"),
+          deleted: z.literal("excluded because threads.list does not expose deleted history"),
+        }).strict(),
         activeCount: z.number().int().nonnegative(),
         archivedCount: z.number().int().nonnegative(),
         matchingCount: z.literal(0),
@@ -8076,8 +8091,7 @@ function applyThreadlessPreparedClosure(
     attempt.dispatch_kind !== null ||
     attempt.state !== "prepared" ||
     attempt.thread_id !== null ||
-    expectedDispatchMarker === null ||
-    closure.dispatchMarker !== expectedDispatchMarker
+    (expectedDispatchMarker !== null && closure.dispatchMarker !== expectedDispatchMarker)
   ) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure does not match the exact prepared writing attempt");
   }
@@ -8090,6 +8104,7 @@ function applyThreadlessPreparedClosure(
     "terminalization_class", "terminal_report_json", "terminal_actual_profile_digest",
     "interruption_reason", "interruption_event_id", "interruption_event_seq", "interruption_turn_id",
     "interruption_evidence_digest", "conflicting_terminal_digest", "completed_at_ms",
+    "lease_owner_thread_id", "lease_expires_at_ms",
   ];
   if (nativeEvidence.some((column) => attempt[column] !== null)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure requires zero native request, content, and terminal evidence");
@@ -8121,7 +8136,8 @@ function applyThreadlessPreparedClosure(
     dispatchRefusal.reference !== `mutation:${preparationEvent.idempotency_key}` ||
     !originalReceipt ||
     originalReceipt.operation_class !== "work_item_transition" ||
-    originalReceipt.committed_event_sequence !== preparation.eventSequence
+    originalReceipt.committed_event_sequence !== preparation.eventSequence ||
+    closure.dispatchMarker !== `[dispatch:${preparationEvent.idempotency_key}]`
   ) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure dispatch-refusal evidence is not the exact durable intent receipt");
   }
@@ -8162,7 +8178,11 @@ function applyThreadlessPreparedClosure(
   ) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure terminalization-refusal evidence is not exact");
   }
-  if (zeroThread.reference !== "native-thread-inventory" || zeroThread.matchingCount !== 0) {
+  if (
+    zeroThread.reference !== "native-thread-inventory" ||
+    zeroThread.matchingCount !== 0 ||
+    canonicalJson(zeroThread.population) !== canonicalJson(threadlessPreparedClosurePopulation(request.projectId))
+  ) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure requires complete zero-thread inventory evidence");
   }
   const nextRevision = workItem.resource_revision + 1;
@@ -10261,6 +10281,8 @@ interface ExecutionAttemptRow {
   conflicting_terminal_digest: string | null;
   terminal_event_id: string | null;
   terminal_event_seq: number | null;
+  lease_owner_thread_id: string | null;
+  lease_expires_at_ms: number | null;
   completed_at_ms: number | null;
   reason_code: string | null;
   last_event_seq: number | null;

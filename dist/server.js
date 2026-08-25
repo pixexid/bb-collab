@@ -16732,6 +16732,13 @@ var WORK_ITEM_CAPACITY_LIFECYCLE_STATES = ["in_progress"];
 var WORK_ITEM_CAPACITY_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
 var WORK_ITEM_IDLE_ACTIVE_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running"];
 var WORK_ITEM_IDLE_BLIND_ATTEMPT_STATES = ["dispatch_unknown"];
+var threadlessPreparedClosurePopulation = (projectId) => ({
+  projectId,
+  source: "bb.sdk.threads.list",
+  active: "all pages with archived=false",
+  archived: "all pages with archived=true",
+  deleted: "excluded because threads.list does not expose deleted history"
+});
 function parseWorkItemDispatchIntent(reasonCode) {
   const prefix = "work_item_dispatch_intent:";
   if (!reasonCode?.startsWith(prefix)) return null;
@@ -17242,6 +17249,13 @@ var threadlessPreparedClosureSchema = external_exports.object({
     external_exports.object({
       kind: external_exports.literal("zero_thread"),
       reference: id,
+      population: external_exports.object({
+        projectId: id,
+        source: external_exports.literal("bb.sdk.threads.list"),
+        active: external_exports.literal("all pages with archived=false"),
+        archived: external_exports.literal("all pages with archived=true"),
+        deleted: external_exports.literal("excluded because threads.list does not expose deleted history")
+      }).strict(),
       activeCount: external_exports.number().int().nonnegative(),
       archivedCount: external_exports.number().int().nonnegative(),
       matchingCount: external_exports.literal(0),
@@ -21265,7 +21279,7 @@ function applyThreadlessPreparedClosure(db, request, digest2) {
   const attempt = requireAttemptForMutation(db, request, request.executionAttemptId);
   const dispatchIntent = parseWorkItemDispatchIntent(attempt.reason_code);
   const expectedDispatchMarker = dispatchIntent === null ? null : `[dispatch:${dispatchIntent.idempotencyKey}]`;
-  if (attempt.work_item_id !== workItem.work_item_id || attempt.repo_target_id !== workItem.repo_target_id || attempt.config_revision !== configRevision || attempt.assignment_kind !== "write" || attempt.assignment_id !== null || attempt.assignment_digest !== null || attempt.dispatch_kind !== null || attempt.state !== "prepared" || attempt.thread_id !== null || expectedDispatchMarker === null || closure.dispatchMarker !== expectedDispatchMarker) {
+  if (attempt.work_item_id !== workItem.work_item_id || attempt.repo_target_id !== workItem.repo_target_id || attempt.config_revision !== configRevision || attempt.assignment_kind !== "write" || attempt.assignment_id !== null || attempt.assignment_digest !== null || attempt.dispatch_kind !== null || attempt.state !== "prepared" || attempt.thread_id !== null || expectedDispatchMarker !== null && closure.dispatchMarker !== expectedDispatchMarker) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure does not match the exact prepared writing attempt");
   }
   const nativeEvidence = [
@@ -21299,7 +21313,9 @@ function applyThreadlessPreparedClosure(db, request, digest2) {
     "interruption_turn_id",
     "interruption_evidence_digest",
     "conflicting_terminal_digest",
-    "completed_at_ms"
+    "completed_at_ms",
+    "lease_owner_thread_id",
+    "lease_expires_at_ms"
   ];
   if (nativeEvidence.some((column) => attempt[column] !== null)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure requires zero native request, content, and terminal evidence");
@@ -21327,7 +21343,7 @@ function applyThreadlessPreparedClosure(db, request, digest2) {
   const originalReceipt = asRow(db.prepare(
     "SELECT request_digest, committed_event_sequence, operation_class FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?"
   ).get(request.projectId, preparationEvent.idempotency_key));
-  if (dispatchRefusal.reference !== `mutation:${preparationEvent.idempotency_key}` || !originalReceipt || originalReceipt.operation_class !== "work_item_transition" || originalReceipt.committed_event_sequence !== preparation.eventSequence) {
+  if (dispatchRefusal.reference !== `mutation:${preparationEvent.idempotency_key}` || !originalReceipt || originalReceipt.operation_class !== "work_item_transition" || originalReceipt.committed_event_sequence !== preparation.eventSequence || closure.dispatchMarker !== `[dispatch:${preparationEvent.idempotency_key}]`) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure dispatch-refusal evidence is not the exact durable intent receipt");
   }
   const expectedDispatchRefusal = sha256(canonicalJson({
@@ -21360,7 +21376,7 @@ function applyThreadlessPreparedClosure(db, request, digest2) {
   }))) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure terminalization-refusal evidence is not exact");
   }
-  if (zeroThread.reference !== "native-thread-inventory" || zeroThread.matchingCount !== 0) {
+  if (zeroThread.reference !== "native-thread-inventory" || zeroThread.matchingCount !== 0 || canonicalJson(zeroThread.population) !== canonicalJson(threadlessPreparedClosurePopulation(request.projectId))) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure requires complete zero-thread inventory evidence");
   }
   const nextRevision = workItem.resource_revision + 1;
@@ -26298,11 +26314,13 @@ function hasExactDispatchMarker(title, marker) {
 function dispatchInventoryEvidence(threads, projectId, executionAttemptId, dispatchMarker) {
   const active = threads.filter((thread) => thread.archivedAt === null).map((thread) => ({ id: thread.id, projectId: thread.projectId, parentThreadId: thread.parentThreadId, title: thread.title, status: thread.status, archivedAt: thread.archivedAt, deletedAt: thread.deletedAt }));
   const archived = threads.filter((thread) => thread.archivedAt !== null).map((thread) => ({ id: thread.id, projectId: thread.projectId, parentThreadId: thread.parentThreadId, title: thread.title, status: thread.status, archivedAt: thread.archivedAt, deletedAt: thread.deletedAt }));
+  const population = threadlessPreparedClosurePopulation(projectId);
   return {
     active,
     archived,
     matching: threads.filter((thread) => hasExactDispatchMarker(thread.title, dispatchMarker)),
-    digest: sha256(canonicalJson({ projectId, executionAttemptId, dispatchMarker, active, archived }))
+    population,
+    digest: sha256(canonicalJson({ projectId, executionAttemptId, dispatchMarker, population, active, archived }))
   };
 }
 async function closeThreadlessPreparedAttempt(bb, db, input) {
@@ -26340,10 +26358,10 @@ async function closeThreadlessPreparedAttempt(bb, db, input) {
     "SELECT reason_code FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ? AND work_item_id = ?"
   ).get(request.projectId, request.executionAttemptId, request.workItemId);
   const dispatchIntent = parseWorkItemDispatchIntent(attempt?.reason_code ?? null);
-  if (!attempt || !dispatchIntent || dispatchIntent.idempotencyKey !== dispatchIntentIdempotencyKey) {
+  if (!attempt || dispatchIntent !== null && dispatchIntent.idempotencyKey !== dispatchIntentIdempotencyKey) {
     return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure marker does not match the exact canonical attempt" };
   }
-  const dispatchMarker = `[dispatch:${dispatchIntent.idempotencyKey}]`;
+  const dispatchMarker = `[dispatch:${dispatchIntentIdempotencyKey}]`;
   const preparationRows = db.prepare(
     `SELECT event_sequence, event_json, idempotency_key
      FROM state_events
@@ -26424,7 +26442,7 @@ async function closeThreadlessPreparedAttempt(bb, db, input) {
           { kind: "dispatch_refusal", reference: `mutation:${dispatchIntentIdempotencyKey}`, digest: sha256(canonicalJson(dispatchEvidence)) },
           { kind: "replay_conflict", reference: `replay:${dispatchIntentIdempotencyKey}`, requestDigest: replayRequestDigest, digest: sha256(canonicalJson(replayEvidence)) },
           { kind: "terminalization_refusal", reference: "terminalization-refusal", digest: sha256(canonicalJson(terminalizationEvidence)) },
-          { kind: "zero_thread", reference: "native-thread-inventory", activeCount: inventory.active.length, archivedCount: inventory.archived.length, matchingCount: 0, digest: inventoryDigest }
+          { kind: "zero_thread", reference: "native-thread-inventory", population: inventory.population, activeCount: inventory.active.length, archivedCount: inventory.archived.length, matchingCount: 0, digest: inventoryDigest }
         ]
       }
     };
