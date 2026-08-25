@@ -34,6 +34,7 @@ import {
   SCHEMA_VERSION,
   TABLES,
   assembleV22CachedConsumerRolloutEvidence,
+  applyAuthorizedMutationAsync,
   applyFixtureMutation,
   applyAuthorizedMutation,
   backfillWorkItemGithubIssues,
@@ -60,6 +61,8 @@ import {
   type ExportFilePayload,
   type ExportPayload,
   type FoundationResult,
+  type GitHubIssueMutation,
+  type GitHubIssueSnapshot,
   type NativeAssignmentInspection,
   type WorkItemDispatchConfigRequest,
 } from "../src/foundation.js";
@@ -1673,6 +1676,173 @@ exit 0
           ]),
         },
       },
+    });
+  });
+});
+
+describe("GH-676 projection recovery evidence", () => {
+  async function boundIssueFixture() {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    const adapter = new DeterministicGitHubIssueAdapter();
+    adapter.put({
+      owner: GITHUB_OWNER,
+      repo: GITHUB_REPO,
+      issueNumber: 1,
+      title: "Existing issue",
+      body: "Existing body",
+      state: "open",
+      labels: [],
+      externalRevision: "first-observation",
+    });
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      workItem: { workItemId: WORK_ITEM_ID, title: "Ship projection", body: "Keep canonical state local.", githubIssue: { issueNumber: 1 } },
+    })).outcome).toBe("OK");
+    return { db, fenceToken, adapter };
+  }
+
+  function recoveryEvidence(externalRevision: string) {
+    return {
+      kind: "github_issue_unchanged" as const,
+      owner: GITHUB_OWNER,
+      repo: GITHUB_REPO,
+      issueNumber: 1,
+      externalRevision,
+    };
+  }
+
+  it("recovers a ref that becomes ambiguous on its first projection", async () => {
+    const { db, fenceToken, adapter } = await boundIssueFixture();
+    adapter.nextMutationOutcome = "ambiguous";
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1), adapter).outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(db.prepare("SELECT issue_number, projection_state, observed_external_revision, observed_external_digest FROM external_work_refs").get()).toMatchObject({
+      issue_number: 1,
+      projection_state: "delivery_ambiguous",
+      observed_external_revision: "first-observation",
+      observed_external_digest: expect.any(String),
+    });
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, {
+      idempotencyKey: "recover-first-projection",
+      projectionRecoveryEvidence: recoveryEvidence("first-observation"),
+    }), adapter).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, { idempotencyKey: "project-after-first-recovery" }), adapter).outcome).toBe("OK");
+  });
+
+  it("recovers first-projection ambiguity through the async projection seam", async () => {
+    const { db, fenceToken, adapter } = await boundIssueFixture();
+    let asyncReads = 0;
+    let asyncMutations = 0;
+    const asyncAdapter = {
+      connectorHost: adapter.connectorHost,
+      available: adapter.available,
+      read: adapter.read.bind(adapter),
+      mutate: adapter.mutate.bind(adapter),
+      readAsync: async (owner: string, repo: string, issueNumber: number): Promise<GitHubIssueSnapshot | null> => {
+        asyncReads += 1;
+        return adapter.read(owner, repo, issueNumber);
+      },
+      mutateAsync: async (input: GitHubIssueMutation): Promise<GitHubIssueSnapshot> => {
+        asyncMutations += 1;
+        return adapter.mutate(input);
+      },
+    };
+    adapter.nextMutationOutcome = "ambiguous";
+    expect(await applyAuthorizedMutationAsync(db, projectionRequest(fenceToken, 1), asyncAdapter)).toMatchObject({
+      outcome: "EXTERNAL_DELIVERY_AMBIGUOUS",
+      attempted: 1,
+      verified: 0,
+    });
+    expect({ asyncReads, asyncMutations }).toEqual({ asyncReads: 1, asyncMutations: 1 });
+    expect(db.prepare("SELECT issue_number, observed_external_revision, observed_external_digest FROM external_work_refs").get()).toMatchObject({
+      issue_number: 1,
+      observed_external_revision: "first-observation",
+      observed_external_digest: expect.any(String),
+    });
+    expect(await applyAuthorizedMutationAsync(db, projectionRequest(fenceToken, 1, {
+      idempotencyKey: "recover-async-first-projection",
+      projectionRecoveryEvidence: recoveryEvidence("first-observation"),
+    }), asyncAdapter)).toMatchObject({ outcome: "OK", attempted: 1, verified: 1 });
+  });
+
+  it("refuses recovery when the recorded observation shows the write landed", async () => {
+    const { db, fenceToken, adapter } = await boundIssueFixture();
+    const mutate = adapter.mutate.bind(adapter);
+    adapter.mutate = (input) => {
+      const response = mutate(input);
+      adapter.put({ ...response, labels: response.labels.filter((label) => label !== "queue:dispatched"), externalRevision: "landed-desired" });
+      return response;
+    };
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, {
+      idempotencyKey: "landed-but-ambiguous",
+      queueLabel: "queue:dispatched",
+    }), adapter).outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(db.prepare("SELECT observed_external_revision, observed_external_digest FROM external_work_refs").get()).toMatchObject({
+      observed_external_revision: "landed-desired",
+      observed_external_digest: expect.any(String),
+    });
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, {
+      idempotencyKey: "refuse-landed-recovery",
+      projectionRecoveryEvidence: recoveryEvidence("landed-desired"),
+      queueLabel: "queue:dispatched",
+    }), adapter).outcome).toBe("EXTERNAL_RESPONSE_INVALID");
+  });
+
+  it("refuses recovery when the external revision does not match the recorded observation", async () => {
+    const { db, fenceToken, adapter } = await boundIssueFixture();
+    adapter.nextMutationOutcome = "ambiguous";
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1), adapter).outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(db.prepare("SELECT observed_external_revision, observed_external_digest FROM external_work_refs").get()).toMatchObject({
+      observed_external_revision: "first-observation",
+      observed_external_digest: expect.any(String),
+    });
+    const changed = adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)!;
+    adapter.put({ ...changed, externalRevision: "newer-revision" });
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, {
+      idempotencyKey: "refuse-mismatched-recovery",
+      projectionRecoveryEvidence: recoveryEvidence("newer-revision"),
+    }), adapter).outcome).toBe("EXTERNAL_RESPONSE_INVALID");
+    expect(db.prepare("SELECT projection_state FROM external_work_refs").get()).toEqual({ projection_state: "delivery_ambiguous" });
+  });
+
+  it("recovers an already-current ref that later becomes ambiguous", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    const adapter = new DeterministicGitHubIssueAdapter();
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1), adapter).outcome).toBe("OK");
+    const unchanged = adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)!;
+    adapter.put({ ...unchanged, externalRevision: "current-refresh" });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
+    adapter.nextMutationOutcome = "ambiguous";
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 2, { idempotencyKey: "ambiguous-after-current" }), adapter).outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(db.prepare("SELECT observed_external_revision, observed_external_digest FROM external_work_refs").get()).toMatchObject({
+      observed_external_revision: "current-refresh",
+      observed_external_digest: expect.any(String),
+    });
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 2, {
+      idempotencyKey: "recover-after-current",
+      projectionRecoveryEvidence: recoveryEvidence("current-refresh"),
+    }), adapter).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 2, { idempotencyKey: "project-after-current-recovery" }), adapter).outcome).toBe("OK");
+  });
+
+  it("preserves an existing observation when drift recording has no snapshot", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    const adapter = new DeterministicGitHubIssueAdapter();
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1), adapter).outcome).toBe("OK");
+    const before = db.prepare("SELECT issue_number, observed_external_revision, observed_external_digest FROM external_work_refs").get();
+    expect(before).toMatchObject({ issue_number: 1, observed_external_revision: expect.any(String), observed_external_digest: expect.any(String) });
+    const current = adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)!;
+    adapter.put({ ...current, state: "closed", stateReason: "COMPLETED", externalRevision: "drifted-external" });
+    const result = applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, { idempotencyKey: "record-drift-without-observation" }), adapter);
+    expect(result).toMatchObject({ outcome: "EXTERNAL_DIVERGED", attempted: 1, verified: 0 });
+    expect(db.prepare("SELECT issue_number, projection_state, observed_external_revision, observed_external_digest FROM external_work_refs").get()).toMatchObject({
+      issue_number: 1,
+      projection_state: "drifted",
+      observed_external_revision: (before as { observed_external_revision: string }).observed_external_revision,
+      observed_external_digest: (before as { observed_external_digest: string }).observed_external_digest,
     });
   });
 });
