@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "kind": "carrier-only",
+  "cloneUrl": "https://github.com/get-bb/bb.git",
+  "upstream": {
+    "base": "55ad3da49e5d169a7abbad86b67064283bab510a",
+    "candidate": "2cd1dca3503c07a8b64b17fe6a80e9a1690c1810",
+    "immutableCarrierReplacementCommit": "2cd1dca3503c07a8b64b17fe6a80e9a1690c1810",
+    "changedFileCount": 4,
+    "files": [
+      "apps/desktop/src/desktop-shell-path.ts",
+      "apps/desktop/src/main.ts",
+      "apps/desktop/test/desktop-shell-path.test.ts",
+      "apps/desktop/test/preload-build.test.ts"
+    ]
+  },
+  "artifact": {
+    "file": "path-carry-r11.patch.gz",
+    "compression": "gzip -n -9",
+    "compressedBytes": 3789,
+    "uncompressedBytes": 12340,
+    "compressedSha256": "34fae8d929ee81dd33c820b893f5136ab569557c2e449fda63815e76e34ab050",
+    "uncompressedSha256": "f32f272283584d9b80c9822e3f5b18086b9ae9171ed99424518673d17b1791d4"
+  },
+  "managedCarrier": {
+    "repository": "https://github.com/pixexid/bb-collab.git",
+    "base": "1044e4577fb25331394a0e672ddf2cd56485f89f",
+    "branch": "bb/carrier-path-carry-path-fix-r11-thr_ym6ngtz7yf",
+    "finalPrHead": {
+      "binding": "external",
+      "note": "Verified from the final GitHub PR head after push; omitted from this tree to avoid a self-referential commit claim."
+    }
+  },
+  "authorization": {
+    "scope": "CARRIER-ONLY compressed-patch PRs for the remainder of the PATH-carry chain",
+    "expiry": "when the chain completes or the fork cuts over, whichever first",
+    "notGeneralNoPushLifting": true
+  },
+  "disposition": "close-unmerged/delete-after-acceptance"
+}
