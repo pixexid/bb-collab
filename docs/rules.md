@@ -295,6 +295,10 @@ A read does not reserve what it read: two callers gated on "the target is idle" 
 
 > A capability that cannot be exercised through a sanctioned path is not dormant value; it is an unexploded claim on the record. An API or field's existence is not evidence of coverage when no sanctioned path can exercise it.
 
+## A classification expires when its precondition fires
+
+> A no-dispatch or no-action classification expires when its stated precondition is met. Re-check the precondition before re-applying the classification; otherwise a stale classification suppresses an alarm that has become actionable.
+
 ## Report the term that governs the latency
 
 > When two terms govern a latency, change and report the dominant one; moving the minor term and reporting in the major term's units is a check answering the wrong question.

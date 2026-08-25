@@ -2274,6 +2274,7 @@ const gitShaSchema = z.string().regex(/^[0-9a-f]{40,64}$/u);
 const workItemSatisfactionEvidenceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("config_revision"), configRevision: z.number().int().positive(), digest: digestSchema }).strict(),
   z.object({ kind: z.literal("decision"), decisionId: id }).strict(),
+  z.object({ kind: z.literal("github_issue_closed"), owner: githubRefPartSchema, repo: githubRefPartSchema, issueNumber: z.number().int().positive().refine(Number.isSafeInteger) }).strict(),
 ]);
 const projectionRecoveryEvidenceSchema = z.object({
   kind: z.literal("github_issue_unchanged"),
@@ -7935,7 +7936,12 @@ function sameWorkItemBlocker(left: WorkItemBlocker, right: WorkItemBlocker): boo
 }
 
 function workItemGithubReadTarget(request: ApplyRequest): Array<{ owner: string; repo: string; issueNumber: number }> {
-  const targets = [request.workItemWait, request.workItemUnblock, request.workItemExternalEvent]
+  const targets = [
+    request.workItemWait,
+    request.workItemUnblock,
+    request.workItemExternalEvent,
+    request.satisfactionEvidence?.kind === "github_issue_closed" ? request.satisfactionEvidence : undefined,
+  ]
     .flatMap((value) => value && value.kind !== "work_item_succeeded" && value.kind !== "schedule" && value.kind !== "seat"
       ? [{ owner: value.owner, repo: value.repo, issueNumber: value.issueNumber }]
       : []);
@@ -8013,6 +8019,8 @@ function requireWorkItemSatisfactionEvidence(db: SqliteDatabase, request: ApplyR
     if (!decision || !decision.decision_identity_digest || storedDecisionIdentityDigest(decision) !== decision.decision_identity_digest) {
       throw refusal("WORK_ITEM_STATE_INVALID", "satisfaction evidence does not name an exact project Decision");
     }
+  } else {
+    requireBoundGithubIssue(db, request.projectId, request.workItemId!, evidence);
   }
   return evidence;
 }
@@ -8889,6 +8897,10 @@ function applyWorkItemTransition(
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
   }
   const satisfactionEvidence = satisfactionExit ? requireWorkItemSatisfactionEvidence(db, request) : undefined;
+  const githubIssueSatisfaction = satisfactionEvidence?.kind === "github_issue_closed";
+  if (githubIssueSatisfaction && (!githubObservation || githubObservation.state !== "closed")) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "satisfaction evidence does not name a closed GitHub issue");
+  }
   let recordedExternalEvent: { kind: "github_issue_closed" | "github_issue_reopened"; owner: string; repo: string; issueNumber: number; externalRevision: string } | null = null;
   if (githubObservation && !validGithubSnapshotStateReason(githubObservation.state, githubObservation.stateReason)) {
     throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue state and reason do not match");
@@ -8908,7 +8920,7 @@ function applyWorkItemTransition(
       if (unblock !== undefined && !sameWorkItemBlocker(storedBlocker, unblock)) {
         throw refusal("WORK_ITEM_STATE_INVALID", "blocked to succeeded requires the exact stored blocker when blocker evidence is supplied");
       }
-      if (!blockerConditionSatisfied(db, request, storedBlocker, githubObservation)) {
+      if (!githubIssueSatisfaction && !blockerConditionSatisfied(db, request, storedBlocker, githubObservation)) {
         throw refusal("WORK_ITEM_STATE_INVALID", "blocked work item blocker is still live");
       }
     }
