@@ -14055,6 +14055,79 @@ else printf '%s\\n' '[]'; fi
     expect(adapter.mutationCalls).toHaveLength(calls);
   });
 
+  it("recovers delivery ambiguity only from an exact unchanged external observation", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    const adapter = new DeterministicGitHubIssueAdapter();
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1), adapter).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
+    const unchanged = adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)!;
+    adapter.nextMutationOutcome = "ambiguous";
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 2, { idempotencyKey: "ambiguous-recovery-source" }), adapter)).toMatchObject({
+      outcome: "EXTERNAL_DELIVERY_AMBIGUOUS",
+      attempted: 1,
+      verified: 0,
+    });
+    expect(db.prepare("SELECT projection_state FROM external_work_refs").get()).toEqual({ projection_state: "delivery_ambiguous" });
+
+    const callsBeforeFenceCheck = adapter.readCalls.length;
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 2, { idempotencyKey: "ordinary-after-ambiguity" }), adapter).outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(adapter.readCalls).toHaveLength(callsBeforeFenceCheck);
+    expect(adapter.mutationCalls).toHaveLength(2);
+
+    const evidence = {
+      kind: "github_issue_unchanged" as const,
+      owner: GITHUB_OWNER,
+      repo: GITHUB_REPO,
+      issueNumber: 1,
+      externalRevision: unchanged.externalRevision,
+    };
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 2, {
+      idempotencyKey: "invalid-recovery-observation",
+      projectionRecoveryEvidence: { ...evidence, externalRevision: "not-the-observation" },
+    }), adapter).outcome).toBe("EXTERNAL_RESPONSE_INVALID");
+    expect(db.prepare("SELECT projection_state FROM external_work_refs").get()).toEqual({ projection_state: "delivery_ambiguous" });
+
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 2, {
+      idempotencyKey: "valid-recovery-observation",
+      projectionRecoveryEvidence: evidence,
+    }), adapter)).toMatchObject({
+      outcome: "OK",
+      expected: 1,
+      attempted: 1,
+      verified: 1,
+      evidence: { projectionState: "pending", resolution: "external_write_not_observed", observation: evidence },
+    });
+    expect(db.prepare("SELECT projection_state FROM external_work_refs").get()).toEqual({ projection_state: "pending" });
+    expect(db.prepare("SELECT event_type FROM state_events ORDER BY event_sequence DESC LIMIT 1").get()).toEqual({ event_type: "github_issue_projection_recovered" });
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 2, { idempotencyKey: "project-after-recovery" }), adapter).outcome).toBe("OK");
+    expect(db.prepare("SELECT projection_state FROM external_work_refs").get()).toEqual({ projection_state: "current" });
+  });
+
+  it("refuses recovery when the exact external observation shows the write landed", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    const adapter = new DeterministicGitHubIssueAdapter();
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1), adapter).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
+    adapter.readOutcomes.push("normal", "missing");
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 2, { idempotencyKey: "landed-but-unread" }), adapter).outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    const landed = adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)!;
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 2, {
+      idempotencyKey: "recovery-after-landed-write",
+      projectionRecoveryEvidence: {
+        kind: "github_issue_unchanged",
+        owner: GITHUB_OWNER,
+        repo: GITHUB_REPO,
+        issueNumber: 1,
+        externalRevision: landed.externalRevision,
+      },
+    }), adapter).outcome).toBe("EXTERNAL_RESPONSE_INVALID");
+    expect(db.prepare("SELECT projection_state FROM external_work_refs").get()).toEqual({ projection_state: "delivery_ambiguous" });
+  });
+
   it("fences a WorkItem transition/projection race after the one external mutation", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host);
