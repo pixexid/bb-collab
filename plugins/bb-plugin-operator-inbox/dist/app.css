@@ -362,6 +362,9 @@
     .text-center {
       text-align: center;
     }
+    .font-mono {
+      font-family: var(--font-mono);
+    }
     .text-lg {
       font-size: var(--text-lg);
       line-height: var(--tw-leading, var(--text-lg--line-height));
