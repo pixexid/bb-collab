@@ -26165,7 +26165,7 @@ async function closeThreadlessPreparedAttempt(bb, db, input) {
     "SELECT reason_code FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ? AND work_item_id = ?"
   ).get(request.projectId, request.executionAttemptId, request.workItemId);
   const dispatchIntent = parseWorkItemDispatchIntent(attempt?.reason_code ?? null);
-  if (!dispatchIntent || dispatchIntent.idempotencyKey !== dispatchIntentIdempotencyKey) {
+  if (!attempt || !dispatchIntent || dispatchIntent.idempotencyKey !== dispatchIntentIdempotencyKey) {
     return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure marker does not match the exact canonical attempt" };
   }
   const dispatchMarker = `[dispatch:${dispatchIntent.idempotencyKey}]`;
