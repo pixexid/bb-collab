@@ -2639,8 +2639,8 @@ else printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue:startable"}]}]]'; 
     expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "ACTOR_RECEIPT_UNKNOWN" });
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["idle-fleet-detector", "lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "fleet-watchdog", "worktree-cleanup", "thread-archive-sweep"]);
-    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "dispatchLane", "doctor", "export", "registerProject", "registerWait", "roleBrief", "v1-inbox-archive", "v1-inbox-mark-read", "v1-inbox-read", "v1-inbox-reply", "v1-lanes"]);
-    expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["dispatch_lane", "send_to_operator"]);
+    expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "closeThreadlessPreparedAttempt", "dispatchLane", "doctor", "export", "registerProject", "registerWait", "roleBrief", "v1-inbox-archive", "v1-inbox-mark-read", "v1-inbox-read", "v1-inbox-reply", "v1-lanes"]);
+    expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["dispatch_lane", "close_threadless_prepared_attempt", "send_to_operator"]);
   });
 
   it("registers a second synthetic project through the strict seam and preserves tenant isolation", async () => {
@@ -6561,6 +6561,164 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(result.outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
     expect(spawnCalls).toBe(0);
     expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared", thread_id: null });
+  });
+
+  it("closes one exact thread-less prepared attempt only with complete zero-thread proof", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const { threadId: _threadId, ...preparedAttempt } = request.workAttempt!;
+    const legacyRequest = { ...request, workAttempt: preparedAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+    expect(applyWithFixtureReceipt(fixture.db, legacyRequest)).toMatchObject({ outcome: "OK" });
+    const attempt = fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string };
+    const replayRequestDigest = mutationRequestDigest(parseApplyRequest({ ...legacyRequest, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}:title=changed` }));
+    let inventoryReads = 0;
+    fixture.host.harness.sdk.stub("threads.list", (async () => { inventoryReads += 1; return []; }) as never);
+    const input = {
+      request: { ...request, idempotencyKey: "gh659-threadless-close", lifecycleState: undefined, workAttempt: undefined, reasonCode: undefined, executionAttemptId: attempt.execution_attempt_id, expectedResourceRevision: 3 },
+      correctionId: "gh659-correction-1",
+      dispatchIntentIdempotencyKey: legacyRequest.idempotencyKey,
+      replayRequestDigest,
+    };
+    const first = JSON.parse(await fixture.host.harness.callAgentTool("close_threadless_prepared_attempt", input, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(first).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "failed" });
+    expect(fixture.db.prepare("SELECT state, thread_id, terminalization_class FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(PROJECT_ID, attempt.execution_attempt_id)).toEqual({ state: "failed", thread_id: null, terminalization_class: "threadless-prepared-closure" });
+    expect(fixture.db.prepare("SELECT event_type FROM state_events WHERE project_id = ? ORDER BY event_sequence DESC LIMIT 1").get(PROJECT_ID)).toEqual({ event_type: "work_item_threadless_prepared_closure" });
+    expect(inventoryReads).toBe(4);
+    const eventCount = (fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { count: number }).count;
+    const second = JSON.parse(await fixture.host.harness.callAgentTool("close_threadless_prepared_attempt", input, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(second).toMatchObject({ outcome: "OK" });
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: eventCount });
+  });
+
+  it("rejects generic apply closure evidence before native inventory or terminalization", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const { threadId: _threadId, ...preparedAttempt } = request.workAttempt!;
+    const legacyRequest = { ...request, workAttempt: preparedAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+    expect(applyWithFixtureReceipt(fixture.db, legacyRequest)).toMatchObject({ outcome: "OK" });
+    const attempt = fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string };
+    const digest = "0".repeat(64);
+    const result = await fixture.host.harness.callRpc("apply", {
+      ...request,
+      idempotencyKey: "gh659-generic-apply-bypass",
+      lifecycleState: "failed",
+      workAttempt: undefined,
+      executionAttemptId: attempt.execution_attempt_id,
+      expectedResourceRevision: 3,
+      threadlessPreparedClosure: {
+        correctionId: "caller-fabricated",
+        dispatchMarker: `[dispatch:${legacyRequest.idempotencyKey}]`,
+        evidence: [
+          { kind: "preparation", eventSequence: 1, reference: "state-event:1", digest },
+          { kind: "dispatch_refusal", reference: "mutation:dispatch", digest },
+          { kind: "replay_conflict", reference: "replay:dispatch", requestDigest: digest, digest },
+          { kind: "terminalization_refusal", reference: "terminalization-refusal", digest },
+          { kind: "zero_thread", reference: "native-thread-inventory", activeCount: 0, archivedCount: 0, matchingCount: 0, digest },
+        ],
+      },
+    }) as FoundationResult;
+    expect(result).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.list")).toHaveLength(0);
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(PROJECT_ID, attempt.execution_attempt_id)).toEqual({ state: "prepared" });
+  });
+
+  it("refuses a child appearing between complete inventory reads", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const { threadId: _threadId, ...preparedAttempt } = request.workAttempt!;
+    const legacyRequest = { ...request, workAttempt: preparedAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+    expect(applyWithFixtureReceipt(fixture.db, legacyRequest)).toMatchObject({ outcome: "OK" });
+    const attempt = fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string };
+    let activeReads = 0;
+    fixture.host.harness.sdk.stub("threads.list", (async ({ archived }: { archived?: boolean }) => {
+      if (archived) return [];
+      activeReads += 1;
+      return activeReads < 2 ? [] : [makeThreadResponse({ id: "appeared-child", projectId: PROJECT_ID, title: `lane [dispatch:${legacyRequest.idempotencyKey}]` })];
+    }) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("close_threadless_prepared_attempt", {
+      request: { ...request, idempotencyKey: "gh659-toctou", lifecycleState: undefined, workAttempt: undefined, reasonCode: undefined, executionAttemptId: attempt.execution_attempt_id, expectedResourceRevision: 3 },
+      correctionId: "gh659-toctou",
+      dispatchIntentIdempotencyKey: legacyRequest.idempotencyKey,
+      replayRequestDigest: mutationRequestDigest(parseApplyRequest({ ...legacyRequest, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}:title=changed` })),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(PROJECT_ID, attempt.execution_attempt_id)).toEqual({ state: "prepared" });
+    expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "in_progress" });
+  });
+
+  it.each(["exact-marker", "partial-marker", "foreign-parent", "ambiguous-marker", "archived-marker", "capped-inventory", "reordered-reread", "stale-reread", "inventory-unavailable"] as const)("discriminates thread-less closure native marker evidence: %s", async (failure) => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const { threadId: _threadId, ...preparedAttempt } = request.workAttempt!;
+    const legacyRequest = { ...request, workAttempt: preparedAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+    expect(applyWithFixtureReceipt(fixture.db, legacyRequest)).toMatchObject({ outcome: "OK" });
+    const attempt = fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string };
+    const replayRequestDigest = mutationRequestDigest(parseApplyRequest({ ...legacyRequest, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}:title=changed` }));
+    let activeReads = 0;
+    fixture.host.harness.sdk.stub("threads.list", (async ({ archived, offset }: { archived?: boolean; offset?: number }) => {
+      if (failure === "inventory-unavailable") throw new Error("inventory unavailable");
+      if (failure === "capped-inventory" && !archived) {
+        if (offset === 0 || offset === undefined) return Array.from({ length: 1000 }, (_, index) => makeThreadResponse({ id: `capped-${index}`, projectId: PROJECT_ID }));
+        throw new Error("capped inventory cannot be read");
+      }
+      const marker = `[dispatch:${legacyRequest.idempotencyKey}]`;
+      activeReads += archived ? 0 : 1;
+      const threads = failure === "partial-marker"
+        ? [makeThreadResponse({ id: "partial-child", projectId: PROJECT_ID, title: `child ${marker.slice(0, -1)}` })]
+        : failure === "foreign-parent"
+          ? [makeThreadResponse({ id: "foreign-parent", projectId: PROJECT_ID, parentThreadId: "other-orchestrator", title: `child ${marker}` })]
+          : failure === "ambiguous-marker"
+            ? [makeThreadResponse({ id: "one", projectId: PROJECT_ID, title: `child ${marker}` }), makeThreadResponse({ id: "two", projectId: PROJECT_ID, title: `child ${marker}` })]
+            : failure === "reordered-reread"
+              ? (activeReads === 1 ? [makeThreadResponse({ id: "one", projectId: PROJECT_ID }), makeThreadResponse({ id: "two", projectId: PROJECT_ID })] : [makeThreadResponse({ id: "two", projectId: PROJECT_ID }), makeThreadResponse({ id: "one", projectId: PROJECT_ID })])
+              : failure === "stale-reread"
+                ? [makeThreadResponse({ id: "stable-child", projectId: PROJECT_ID, status: activeReads === 1 ? "active" : "idle" })]
+                : [makeThreadResponse({ id: "possible-child", projectId: PROJECT_ID, title: `child ${marker}`, archivedAt: failure === "archived-marker" ? 1 : null })];
+      return threads.filter((thread) => archived ? thread.archivedAt !== null : thread.archivedAt === null);
+    }) as never);
+    const before = (fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { count: number }).count;
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("close_threadless_prepared_attempt", {
+      request: { ...request, idempotencyKey: `gh659-refused-${failure}`, lifecycleState: undefined, workAttempt: undefined, reasonCode: undefined, executionAttemptId: attempt.execution_attempt_id, expectedResourceRevision: 3 },
+      correctionId: `gh659-refused-${failure}`,
+      dispatchIntentIdempotencyKey: legacyRequest.idempotencyKey,
+      replayRequestDigest,
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    if (failure === "partial-marker") {
+      expect(result.outcome).toBe("OK");
+      expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(PROJECT_ID, attempt.execution_attempt_id)).toEqual({ state: "failed", thread_id: null });
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "failed" });
+    } else {
+      expect(result.outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+      expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(PROJECT_ID, attempt.execution_attempt_id)).toEqual({ state: "prepared", thread_id: null });
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "in_progress" });
+      expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: before });
+    }
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+  });
+
+  it("refuses thread-less closure when native evidence is no longer exact", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const { threadId: _threadId, ...preparedAttempt } = request.workAttempt!;
+    const legacyRequest = { ...request, workAttempt: preparedAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+    expect(applyWithFixtureReceipt(fixture.db, legacyRequest)).toMatchObject({ outcome: "OK" });
+    const attempt = fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string };
+    fixture.db.prepare("UPDATE execution_attempts SET native_request_id = 'native-request' WHERE project_id = ? AND execution_attempt_id = ?").run(PROJECT_ID, attempt.execution_attempt_id);
+    fixture.host.harness.sdk.stub("threads.list", (async () => []) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("close_threadless_prepared_attempt", {
+      request: { ...request, idempotencyKey: "gh659-native-evidence", lifecycleState: undefined, workAttempt: undefined, reasonCode: undefined, executionAttemptId: attempt.execution_attempt_id, expectedResourceRevision: 3 },
+      correctionId: "gh659-native-evidence",
+      dispatchIntentIdempotencyKey: legacyRequest.idempotencyKey,
+      replayRequestDigest: mutationRequestDigest(parseApplyRequest({ ...legacyRequest, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}:title=changed` })),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).toBe("WORK_ITEM_STATE_INVALID");
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(PROJECT_ID, attempt.execution_attempt_id)).toEqual({ state: "prepared" });
   });
 
   it("refuses stale lane authorization before spawning", async () => {

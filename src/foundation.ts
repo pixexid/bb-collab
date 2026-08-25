@@ -2668,6 +2668,44 @@ const historicalCorrectionSchema = z
     }).strict()).min(2).max(16),
   })
   .strict();
+const threadlessPreparedClosureSchema = z
+  .object({
+    correctionId: id,
+    dispatchMarker: id,
+    evidence: z.tuple([
+      z.object({
+        kind: z.literal("preparation"),
+        eventSequence: z.number().int().positive(),
+        reference: id,
+        digest: digestSchema,
+      }).strict(),
+      z.object({
+        kind: z.literal("dispatch_refusal"),
+        reference: id,
+        digest: digestSchema,
+      }).strict(),
+      z.object({
+        kind: z.literal("replay_conflict"),
+        reference: id,
+        requestDigest: digestSchema,
+        digest: digestSchema,
+      }).strict(),
+      z.object({
+        kind: z.literal("terminalization_refusal"),
+        reference: id,
+        digest: digestSchema,
+      }).strict(),
+      z.object({
+        kind: z.literal("zero_thread"),
+        reference: id,
+        activeCount: z.number().int().nonnegative(),
+        archivedCount: z.number().int().nonnegative(),
+        matchingCount: z.literal(0),
+        digest: digestSchema,
+      }).strict(),
+    ]),
+  })
+  .strict();
 
 export const applyRequestSchema = z
   .object({
@@ -2730,6 +2768,7 @@ export const applyRequestSchema = z
     terminalReport: terminalReportSchema.optional(),
     interruption: interruptionEvidenceSchema.optional(),
     historicalCorrection: historicalCorrectionSchema.optional(),
+    threadlessPreparedClosure: threadlessPreparedClosureSchema.optional(),
     migration: migrationPrepareSchema.optional(),
     migrationStep: migrationStepSchema.optional(),
   })
@@ -4133,6 +4172,7 @@ function normalizeRequest(request: ApplyRequest): ApplyRequest {
     terminalReport: request.terminalReport ?? undefined,
     interruption: request.interruption ?? undefined,
     historicalCorrection: request.historicalCorrection ?? undefined,
+    threadlessPreparedClosure: request.threadlessPreparedClosure ?? undefined,
   };
 }
 
@@ -7960,6 +8000,173 @@ function requireWorkItem(
   return row;
 }
 
+function applyThreadlessPreparedClosure(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  digest: string,
+): FoundationResult {
+  const closure = request.threadlessPreparedClosure;
+  if (!closure || request.lifecycleState !== "failed" || !request.executionAttemptId || request.workAttempt !== undefined || request.workItemWait !== undefined || request.workItemUnblock !== undefined || request.workItemExternalEvent !== undefined) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure requires a failed lifecycle transition without a work attempt or wait");
+  }
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request, false);
+  const workItem = requireWorkItem(db, request, configRevision);
+  if (workItem.lifecycle_state !== "in_progress") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure requires an in-progress work item");
+  }
+  const attempt = requireAttemptForMutation(db, request, request.executionAttemptId);
+  const dispatchIntent = parseWorkItemDispatchIntent(attempt.reason_code);
+  const expectedDispatchMarker = dispatchIntent === null ? null : `[dispatch:${dispatchIntent.idempotencyKey}]`;
+  if (
+    attempt.work_item_id !== workItem.work_item_id ||
+    attempt.repo_target_id !== workItem.repo_target_id ||
+    attempt.config_revision !== configRevision ||
+    attempt.assignment_kind !== "write" ||
+    attempt.assignment_id !== null ||
+    attempt.assignment_digest !== null ||
+    attempt.dispatch_kind !== null ||
+    attempt.state !== "prepared" ||
+    attempt.thread_id !== null ||
+    expectedDispatchMarker === null ||
+    closure.dispatchMarker !== expectedDispatchMarker
+  ) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure does not match the exact prepared writing attempt");
+  }
+  const nativeEvidence: Array<keyof ExecutionAttemptRow> = [
+    "thread_id", "provider_thread_id", "native_request_id", "request_event_id", "request_event_seq",
+    "accepted_event_id", "accepted_event_seq", "first_action_event_id", "first_action_event_seq",
+    "content_event_id", "content_event_seq", "completion_event_id", "completion_event_seq",
+    "content_receipt_digest", "native_receipt_digest", "last_event_seq", "terminal_event_id",
+    "terminal_event_seq", "terminal_result", "reported_outcome", "terminal_report_digest",
+    "terminalization_class", "terminal_report_json", "terminal_actual_profile_digest",
+    "interruption_reason", "interruption_event_id", "interruption_event_seq", "interruption_turn_id",
+    "interruption_evidence_digest", "conflicting_terminal_digest", "completed_at_ms",
+  ];
+  if (nativeEvidence.some((column) => attempt[column] !== null)) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure requires zero native request, content, and terminal evidence");
+  }
+  const [preparation, dispatchRefusal, replayConflict, terminalizationRefusal, zeroThread] = closure.evidence;
+  if (preparation.reference !== `state-event:${preparation.eventSequence}`) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure preparation evidence reference is not exact");
+  }
+  const preparationEvent = asRow<{ event_type: string; event_json: string; idempotency_key: string }>(db.prepare(
+    `SELECT event_type, event_json, idempotency_key FROM state_events
+     WHERE project_id = ? AND event_sequence = ? AND aggregate_type = 'work_item' AND aggregate_id = ?`,
+  ).get(request.projectId, preparation.eventSequence, workItem.work_item_id));
+  if (!preparationEvent || preparationEvent.event_type !== "work_item_transitioned" || sha256(preparationEvent.event_json) !== preparation.digest) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure preparation evidence is not the exact durable registration event");
+  }
+  let preparationPayload: { workItemId?: unknown; executionAttemptId?: unknown };
+  try {
+    preparationPayload = JSON.parse(preparationEvent.event_json) as { workItemId?: unknown; executionAttemptId?: unknown };
+  } catch {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure preparation event is malformed");
+  }
+  if (preparationPayload.workItemId !== workItem.work_item_id || preparationPayload.executionAttemptId !== attempt.execution_attempt_id) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure preparation event binds another work item or attempt");
+  }
+  const originalReceipt = asRow<{ request_digest: string; committed_event_sequence: number; operation_class: string }>(db.prepare(
+    "SELECT request_digest, committed_event_sequence, operation_class FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?",
+  ).get(request.projectId, preparationEvent.idempotency_key));
+  if (
+    dispatchRefusal.reference !== `mutation:${preparationEvent.idempotency_key}` ||
+    !originalReceipt ||
+    originalReceipt.operation_class !== "work_item_transition" ||
+    originalReceipt.committed_event_sequence !== preparation.eventSequence
+  ) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure dispatch-refusal evidence is not the exact durable intent receipt");
+  }
+  const expectedDispatchRefusal = sha256(canonicalJson({
+    kind: "dispatch_refusal",
+    projectId: request.projectId,
+    workItemId: workItem.work_item_id,
+    executionAttemptId: attempt.execution_attempt_id,
+    idempotencyKey: preparationEvent.idempotency_key,
+    reasonCode: attempt.reason_code,
+  }));
+  if (dispatchRefusal.digest !== expectedDispatchRefusal) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure dispatch-refusal evidence is not exact");
+  }
+  if (
+    replayConflict.reference !== `replay:${preparationEvent.idempotency_key}` ||
+    replayConflict.requestDigest === originalReceipt.request_digest ||
+    replayConflict.digest !== sha256(canonicalJson({
+      kind: "replay_conflict",
+      projectId: request.projectId,
+      workItemId: workItem.work_item_id,
+      executionAttemptId: attempt.execution_attempt_id,
+      idempotencyKey: preparationEvent.idempotency_key,
+      requestDigest: replayConflict.requestDigest,
+    }))
+  ) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure replay-conflict evidence is not exact");
+  }
+  if (
+    terminalizationRefusal.reference !== "terminalization-refusal" ||
+    terminalizationRefusal.digest !== sha256(canonicalJson({
+      kind: "terminalization_refusal",
+      projectId: request.projectId,
+      workItemId: workItem.work_item_id,
+      executionAttemptId: attempt.execution_attempt_id,
+      message: "writing attempt terminalization requires a bound lane with native stop evidence",
+    }))
+  ) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure terminalization-refusal evidence is not exact");
+  }
+  if (zeroThread.reference !== "native-thread-inventory" || zeroThread.matchingCount !== 0) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure requires complete zero-thread inventory evidence");
+  }
+  const nextRevision = workItem.resource_revision + 1;
+  const completedAtMs = now();
+  const attemptUpdated = db.prepare(
+    `UPDATE execution_attempts
+     SET state = 'failed', observed_at_ms = ?, completed_at_ms = ?, lease_owner_thread_id = NULL,
+         progress_json = '{}', terminalization_class = 'threadless-prepared-closure',
+         reason_code = ?
+     WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND thread_id IS NULL AND assignment_id IS NULL`,
+  ).run(completedAtMs, completedAtMs, `threadless-prepared-closure:${closure.correctionId}`, request.projectId, attempt.execution_attempt_id);
+  if (attemptUpdated.changes !== 1) throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared attempt changed before closure");
+  const workItemUpdated = db.prepare(
+    `UPDATE work_items SET lifecycle_state = 'failed', resource_revision = ?, updated_at_ms = ?
+     WHERE project_id = ? AND work_item_id = ? AND lifecycle_state = 'in_progress' AND resource_revision = ?`,
+  ).run(nextRevision, completedAtMs, request.projectId, workItem.work_item_id, workItem.resource_revision);
+  if (workItemUpdated.changes !== 1) throw refusal("WORK_ITEM_REVISION_STALE", "work item compare-and-swap failed during thread-less closure", {
+    currentResourceRevision: workItem.resource_revision,
+    expectedResourceRevision: request.expectedResourceRevision ?? undefined,
+  });
+  const evidence = closure.evidence;
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    {
+      aggregateType: "work_item",
+      aggregateId: workItem.work_item_id,
+      aggregateRevision: nextRevision,
+      eventType: "work_item_threadless_prepared_closure",
+      event: {
+        workItemId: workItem.work_item_id,
+        executionAttemptId: attempt.execution_attempt_id,
+        from: "in_progress",
+        to: "failed",
+        correction: { ...closure, evidence },
+      },
+    },
+    { expected: 1, attempted: 1, verified: 1 },
+    {
+      currentConfigRevision: configRevision,
+      currentGovernanceEpoch: governor.governance_epoch,
+      currentResourceRevision: nextRevision,
+      expectedResourceRevision: request.expectedResourceRevision ?? undefined,
+      evidence: { workItemId: workItem.work_item_id, executionAttemptId: attempt.execution_attempt_id, correction: closure },
+    },
+  );
+}
+
 function applyWorkItemCreate(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
@@ -8198,6 +8405,7 @@ function applyWorkItemTransition(
   digest: string,
   githubObservation: GitHubIssueSnapshot | null,
 ): FoundationResult {
+  if (request.threadlessPreparedClosure !== undefined) return applyThreadlessPreparedClosure(db, request, digest);
   const committedDispatchIntent = request.reasonCode === "dispatch_intent_finalize" && request.lifecycleState === undefined && request.workAttempt?.threadId !== undefined;
   let configRevision: number;
   if (committedDispatchIntent) {
@@ -9824,6 +10032,8 @@ interface ExecutionAttemptRow {
   first_action_event_seq: number | null;
   content_event_id: string | null;
   content_event_seq: number | null;
+  completion_event_id: string | null;
+  completion_event_seq: number | null;
   content_receipt_digest: string | null;
   frozen_brief_digest: string | null;
   environment_digest: string | null;
