@@ -31,6 +31,7 @@ import {
   MIGRATION_STATES,
   MIGRATION_STEPS,
   PLUGIN_ID,
+  PREPARED_DISPATCH_MIN_AGE_MS,
   SCHEMA_VERSION,
   TABLES,
   assembleV22CachedConsumerRolloutEvidence,
@@ -7080,6 +7081,18 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared" });
   });
 
+  it("does not report a fresh prepared dispatch without a matching thread", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    fixture.host.harness.sdk.stub("threads.spawn", (async () => { throw new Error("response lost before spawn"); }) as never);
+    await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+      spawn: dispatchSpawn(fixture.orchestratorThreadId),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId });
+    expect(reconcilePreparedWorkItemDispatches(fixture.db, PROJECT_ID, [])).toEqual([]);
+    expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "prepared", thread_id: null });
+  });
+
   it("keeps a renamed spawned lane as a capacity-consuming wedge", async () => {
     const fixture = await fleetWatchdogFixture(0, true, 1, false);
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
@@ -7088,6 +7101,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       request: transitionRequest(fixture.fenceToken, "in_progress", 2),
       spawn: dispatchSpawn(fixture.orchestratorThreadId),
     }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId });
+    fixture.db.prepare("UPDATE execution_attempts SET created_at_ms = ? WHERE origin = 'work_item'").run(Date.now() - PREPARED_DISPATCH_MIN_AGE_MS - 1);
     const wedges = reconcilePreparedWorkItemDispatches(fixture.db, PROJECT_ID, [{
       id: "lane-renamed",
       parentThreadId: fixture.orchestratorThreadId,
@@ -7116,6 +7130,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
         request: transitionRequest(fixture.fenceToken, "in_progress", 2),
         spawn: dispatchSpawn(fixture.orchestratorThreadId),
       }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId });
+      fixture.db.prepare("UPDATE execution_attempts SET created_at_ms = ? WHERE origin = 'work_item'").run(Date.now() - PREPARED_DISPATCH_MIN_AGE_MS - 1);
       const attempt = fixture.db.prepare("SELECT reason_code FROM execution_attempts WHERE origin = 'work_item'").get() as { reason_code: string };
       const marker = attempt.reason_code.match(/^work_item_dispatch_intent:(.*):parent=/u)?.[1];
       expect(marker).toBeTruthy();

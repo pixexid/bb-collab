@@ -2092,6 +2092,8 @@ export const WORK_ITEM_CAPACITY_LIFECYCLE_STATES = ["in_progress"] as const;
 export const WORK_ITEM_CAPACITY_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"] as const;
 export const WORK_ITEM_IDLE_ACTIVE_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running"] as const;
 export const WORK_ITEM_IDLE_BLIND_ATTEMPT_STATES = ["dispatch_unknown"] as const;
+// 30s is 6x the observed ~5s prepare-to-finalize span; slower dispatches still surface on the next sweep.
+export const PREPARED_DISPATCH_MIN_AGE_MS = 30_000;
 
 export interface WorkItemCapacityLaneEvidence {
   execution_attempt_id: string;
@@ -2162,11 +2164,12 @@ export function reconcilePreparedWorkItemDispatches(
   projectId: string,
   threads: WorkItemDispatchThread[],
 ): WorkItemDispatchWedge[] {
+  const preparedBeforeMs = now() - PREPARED_DISPATCH_MIN_AGE_MS;
   const prepared = db.prepare(
     `SELECT execution_attempt_id, work_item_id, reason_code FROM execution_attempts
      WHERE project_id = ? AND origin = 'work_item' AND assignment_kind IN ('write', 'review')
-       AND state = 'prepared' AND thread_id IS NULL`,
-  ).all(projectId) as Array<{ execution_attempt_id: string; work_item_id: string; reason_code: string | null }>;
+       AND state = 'prepared' AND thread_id IS NULL AND created_at_ms < ?`,
+  ).all(projectId, preparedBeforeMs) as Array<{ execution_attempt_id: string; work_item_id: string; reason_code: string | null }>;
   const wedges: WorkItemDispatchWedge[] = [];
   for (const attempt of prepared) {
     const intent = parseWorkItemDispatchIntent(attempt.reason_code);
