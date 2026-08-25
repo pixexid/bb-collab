@@ -2263,6 +2263,11 @@ const workItemExternalEventSchema = z.object({
   issueNumber: z.number().int().positive().refine(Number.isSafeInteger),
 }).strict();
 const gitShaSchema = z.string().regex(/^[0-9a-f]{40,64}$/u);
+const workItemSatisfactionEvidenceSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("config_revision"), configRevision: z.number().int().positive(), digest: digestSchema }).strict(),
+  z.object({ kind: z.literal("merged_commit"), commitSha: gitShaSchema }).strict(),
+  z.object({ kind: z.literal("decision"), decisionId: id }).strict(),
+]);
 const pullRequestHeadShaSchema = z.string().regex(/^[0-9a-f]{40}$/u);
 const reviewCandidateKindSchema = z.enum(["pull-request", "local"]);
 const reviewCandidateEnvironmentSchema = z
@@ -2754,6 +2759,7 @@ export const applyRequestSchema = z
     workItemWait: workItemWaitSchema.nullable().optional(),
     workItemUnblock: workItemBlockerSchema.optional(),
     workItemExternalEvent: workItemExternalEventSchema.optional(),
+    satisfactionEvidence: workItemSatisfactionEvidenceSchema.optional(),
     workAttempt: workAttemptSchema.optional(),
     projectionKind: z.literal("github_issue").optional(),
     queueLabel: z.literal("queue:dispatched").optional(),
@@ -4160,6 +4166,7 @@ function normalizeRequest(request: ApplyRequest): ApplyRequest {
     workItemBody: request.workItemBody ?? undefined,
     lifecycleState: request.lifecycleState ?? undefined,
     workItemWait: request.workItemWait === undefined ? undefined : request.workItemWait,
+    satisfactionEvidence: request.satisfactionEvidence ?? undefined,
     workAttempt: request.workAttempt ?? undefined,
     projectionKind: request.projectionKind ?? undefined,
     roleId: request.roleId ?? undefined,
@@ -7966,6 +7973,27 @@ function storedConfigJson(db: SqliteDatabase, projectId: string, configRevision:
   return row.canonical_config_json;
 }
 
+function requireWorkItemSatisfactionEvidence(db: SqliteDatabase, request: ApplyRequest): NonNullable<ApplyRequest["satisfactionEvidence"]> {
+  const evidence = request.satisfactionEvidence;
+  if (!evidence) throw refusal("WORK_ITEM_STATE_INVALID", "satisfied-by-another-route success requires satisfaction evidence");
+  if (evidence.kind === "config_revision") {
+    const revision = asRow<{ config_digest: string }>(db.prepare(
+      "SELECT config_digest FROM project_config_revisions WHERE project_id = ? AND config_revision = ?",
+    ).get(request.projectId, evidence.configRevision));
+    if (!revision || revision.config_digest !== evidence.digest) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "satisfaction evidence does not match the exact config revision digest");
+    }
+  } else if (evidence.kind === "decision") {
+    const decision = asRow<DecisionRow>(db.prepare(
+      "SELECT * FROM decisions WHERE project_id = ? AND decision_id = ?",
+    ).get(request.projectId, evidence.decisionId));
+    if (!decision || !decision.decision_identity_digest || storedDecisionIdentityDigest(decision) !== decision.decision_identity_digest) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "satisfaction evidence does not name an exact project Decision");
+    }
+  }
+  return evidence;
+}
+
 function requireGithubMapping(db: SqliteDatabase, projectId: string, configRevision: number, repoTargetId: string) {
   const github = githubConfigFromJson(storedConfigJson(db, projectId, configRevision));
   if (!github) throw refusal("EXTERNAL_TARGET_REQUIRED", "the config has no GitHub Issues mapping");
@@ -8295,10 +8323,10 @@ function applyWorkItemCreate(db: SqliteDatabase, request: ApplyRequest, digest: 
 
 const WORK_ITEM_TRANSITIONS: Readonly<Record<WorkItemState, readonly WorkItemState[]>> = {
   proposed: ["ready", "cancelled"],
-  ready: ["in_progress", "blocked", "cancelled"],
+  ready: ["in_progress", "blocked", "succeeded", "cancelled"],
   in_progress: ["review_pending", "blocked", "failed", "cancelled"],
   review_pending: ["in_progress", "blocked", "succeeded", "failed", "cancelled"],
-  blocked: ["ready", "cancelled"],
+  blocked: ["ready", "succeeded", "cancelled"],
   succeeded: ["ready"],
   failed: [],
   cancelled: [],
@@ -8506,6 +8534,7 @@ function applyWorkItemTransition(
   const unblock = request.workItemUnblock;
   const externalEvent = request.workItemExternalEvent;
   const workAttempt = request.workAttempt;
+  const satisfactionExit = nextState === "succeeded" && (workItem.lifecycle_state === "ready" || workItem.lifecycle_state === "blocked");
   const directMergeClose = request.reasonCode === "fleet-watchdog-merge-close" &&
     workItem.lifecycle_state === "in_progress" &&
     nextState === "succeeded" &&
@@ -8821,6 +8850,7 @@ function applyWorkItemTransition(
   if (!nextState || (!redispatchingReview && !swappingBlockedWait && !directMergeClose && !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState))) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
   }
+  const satisfactionEvidence = satisfactionExit ? requireWorkItemSatisfactionEvidence(db, request) : undefined;
   let recordedExternalEvent: { kind: "github_issue_closed" | "github_issue_reopened"; owner: string; repo: string; issueNumber: number; externalRevision: string } | null = null;
   if (githubObservation && !validGithubSnapshotStateReason(githubObservation.state, githubObservation.stateReason)) {
     throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue state and reason do not match");
@@ -8833,8 +8863,16 @@ function applyWorkItemTransition(
         throw refusal("WORK_ITEM_STATE_INVALID", "blocked to ready requires the exact stored blocker");
       }
       if (!firedReplacementSwap) requireBlockerCondition(db, request, unblock, githubObservation, true);
-    } else if (unblock !== undefined && !swappingBlockedWait) {
+    } else if (unblock !== undefined && !swappingBlockedWait && !satisfactionExit) {
       throw refusal("WORK_ITEM_STATE_INVALID", "work item unblock evidence only permits blocked to ready or an atomic blocker swap");
+    }
+    if (satisfactionExit) {
+      if (unblock !== undefined && !sameWorkItemBlocker(storedBlocker, unblock)) {
+        throw refusal("WORK_ITEM_STATE_INVALID", "blocked to succeeded requires the exact stored blocker when blocker evidence is supplied");
+      }
+      if (!blockerConditionSatisfied(db, request, storedBlocker, githubObservation)) {
+        throw refusal("WORK_ITEM_STATE_INVALID", "blocked work item blocker is still live");
+      }
     }
   } else if (unblock !== undefined) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item unblock evidence requires a blocked work item");
@@ -9011,6 +9049,7 @@ function applyWorkItemTransition(
         ...(workAttempt === undefined ? {} : { workAttempt }),
         ...(machineWait === null ? {} : { blocker: machineWait }),
         ...(unblock === undefined ? {} : { unblock }),
+        ...(satisfactionEvidence === undefined ? {} : { satisfactionEvidence }),
         ...(firedReplacementSwap ? { previousBlocker: unblock, replacementBlocker: machineWait } : {}),
         ...(recordedExternalEvent === null ? {} : { externalEvent: recordedExternalEvent }),
         ...(configContinuation === null ? {} : {
@@ -9037,6 +9076,7 @@ function applyWorkItemTransition(
           ...(reviewExecutionAttemptId === null ? {} : { reviewExecutionAttemptId }),
           ...(machineWait === null ? {} : { blocker: machineWait }),
           ...(unblock === undefined ? {} : { unblock }),
+          ...(satisfactionEvidence === undefined ? {} : { satisfactionEvidence }),
           ...(firedReplacementSwap ? { previousBlocker: unblock, replacementBlocker: machineWait } : {}),
           ...(recordedExternalEvent === null ? {} : { externalEvent: recordedExternalEvent }),
           ...(configContinuation === null ? {} : {

@@ -13366,6 +13366,64 @@ else printf '%s\\n' '[]'; fi
     expect(JSON.parse(event.event_json)).toMatchObject({ externalEvent: { kind: "github_issue_reopened", externalRevision: "open-y" } });
   });
 
+  it("gates satisfied-by-another-route success edges and clears fired blockers", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    const configDigest = (db.prepare(
+      "SELECT config_digest FROM project_config_revisions WHERE project_id = ? AND config_revision = 1",
+    ).get(PROJECT_ID) as { config_digest: string }).config_digest;
+    const transition = (workItemId: string, state: ApplyRequest["lifecycleState"], revision: number, overrides: Partial<ApplyRequest> = {}) =>
+      applyWithFixtureReceipt(db, transitionRequest(fenceToken, state, revision, {
+        idempotencyKey: `${workItemId}-${state}-${revision}`,
+        workItemId,
+        ...overrides,
+      }));
+    const create = (workItemId: string) => applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      idempotencyKey: `${workItemId}-create`,
+      workItemId,
+      workItem: { workItemId, title: workItemId, body: workItemId },
+    }));
+    const evidence = { kind: "config_revision" as const, configRevision: 1, digest: configDigest };
+
+    expect(create(WORK_ITEM_ID).outcome).toBe("OK");
+    expect(transition(WORK_ITEM_ID, "ready", 1).outcome).toBe("OK");
+    expect(transition(WORK_ITEM_ID, "succeeded", 2)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(transition(WORK_ITEM_ID, "succeeded", 2, {
+      satisfactionEvidence: { ...evidence, digest: "0".repeat(64) },
+    })).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(transition(WORK_ITEM_ID, "succeeded", 2, { satisfactionEvidence: evidence })).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+
+    const targetId = "satisfied-blocked-target";
+    const blockerId = "satisfied-blocked-live";
+    expect(create(targetId).outcome).toBe("OK");
+    expect(create(blockerId).outcome).toBe("OK");
+    expect(transition(targetId, "ready", 1).outcome).toBe("OK");
+    expect(transition(blockerId, "ready", 1).outcome).toBe("OK");
+    expect(transition(targetId, "blocked", 2, {
+      workItemWait: { kind: "work_item_succeeded", workItemId: blockerId, declaredBySeat: "worker-seat" },
+    })).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+    expect(transition(targetId, "succeeded", 3, { satisfactionEvidence: evidence })).toMatchObject({
+      outcome: "WORK_ITEM_STATE_INVALID",
+      message: "blocked work item blocker is still live",
+      attempted: 0,
+    });
+
+    expect(transition(blockerId, "in_progress", 2).outcome).toBe("OK");
+    expect(transition(blockerId, "review_pending", 3).outcome).toBe("OK");
+    expect(transition(blockerId, "succeeded", 4).outcome).toBe("OK");
+    expect(transition(targetId, "succeeded", 3)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(transition(targetId, "succeeded", 3, { satisfactionEvidence: evidence })).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    expect(db.prepare("SELECT 1 FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, targetId)).toBeUndefined();
+    const event = db.prepare(
+      "SELECT event_json FROM state_events WHERE project_id = ? AND aggregate_type = 'work_item' AND aggregate_id = ? ORDER BY aggregate_revision DESC LIMIT 1",
+    ).get(PROJECT_ID, targetId) as { event_json: string };
+    expect(JSON.parse(event.event_json)).toMatchObject({
+      from: "blocked",
+      to: "succeeded",
+      satisfactionEvidence: evidence,
+    });
+  });
+
   it("requires review_pending between authorship and terminal success and supports review findings re-entry", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host);
