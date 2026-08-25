@@ -1370,34 +1370,37 @@ describe("GH-658 canonical GitHub PR waits", () => {
   });
 
   it("mutation-tests all ten named negative controls", async () => {
-    const cases: Array<{ name: string; mutate: (request: ApplyRequest) => ApplyRequest }> = [
-      { name: "wrong project", mutate: (request) => ({ ...request, projectId: FOREIGN_PROJECT_ID }) },
-      { name: "wrong repository target", mutate: (request) => ({ ...request, repoTargetId: "foreign-target" }) },
-      { name: "wrong PR", mutate: (request) => ({ ...request, githubPrObservation: githubPrObservation({ pullRequestNumber: 659 }) }) },
-      { name: "wrong head SHA", mutate: (request) => ({ ...request, githubPrObservation: githubPrObservation({ headSha: "c".repeat(40) }) }) },
-      { name: "partial or unknown GitHub response", mutate: (request) => ({ ...request, githubPrObservation: ({ ...githubPrObservation(), reviewDecision: undefined } as unknown as GithubPrObservation) }) },
-      { name: "expired wait", mutate: (request) => ({ ...request, workItemWait: { ...(request.workItemWait as GithubPrWaitRegistration), deadlineAtMs: 0 } }) },
-      { name: "stale config/fence", mutate: (request) => ({ ...request, expectedConfigRevision: 2, expectedFenceToken: "stale-fence" }) },
-      { name: "archived or deleted waiting target", mutate: (request) => ({
+    const cases: Array<{ name: string; expectedRefusal: string; mutate: (request: ApplyRequest) => ApplyRequest }> = [
+      { name: "wrong project", expectedRefusal: "PROJECT_CONFIG_REQUIRED", mutate: (request) => ({ ...request, projectId: FOREIGN_PROJECT_ID }) },
+      { name: "wrong repository target", expectedRefusal: "REPO_TARGET_FOREIGN", mutate: (request) => ({ ...request, repoTargetId: "foreign-target" }) },
+      { name: "wrong PR", expectedRefusal: "EXTERNAL_RESPONSE_INVALID", mutate: (request) => ({ ...request, githubPrObservation: githubPrObservation({ pullRequestNumber: 659 }) }) },
+      { name: "wrong head SHA", expectedRefusal: "EXTERNAL_RESPONSE_INVALID", mutate: (request) => ({ ...request, githubPrObservation: githubPrObservation({ headSha: "c".repeat(40) }) }) },
+      { name: "partial or unknown GitHub response", expectedRefusal: "INVALID_INPUT", mutate: (request) => ({ ...request, githubPrObservation: ({ ...githubPrObservation(), reviewDecision: undefined } as unknown as GithubPrObservation) }) },
+      { name: "expired wait", expectedRefusal: "WORK_ITEM_STATE_INVALID", mutate: (request) => ({ ...request, workItemWait: { ...(request.workItemWait as GithubPrWaitRegistration), deadlineAtMs: 0 } }) },
+      { name: "stale config/fence", expectedRefusal: "PROJECT_CONFIG_STALE", mutate: (request) => ({ ...request, expectedConfigRevision: 2, expectedFenceToken: "stale-fence" }) },
+      { name: "archived or deleted waiting target", expectedRefusal: "ROLE_CONTEXT_FOREIGN", mutate: (request) => ({
         ...request,
         workItemWait: { ...(request.workItemWait as GithubPrWaitRegistration), waitingThreadId: "archived-or-deleted-thread" },
       }) },
     ];
     for (const item of cases) {
+      const baselineFixture = await githubPrBaseFixture();
+      const baselineRequest = transitionRequest(baselineFixture.fixture.fenceToken, "blocked", 3, {
+        idempotencyKey: `github-pr-mutant-${item.name}`,
+        workItemWait: baselineFixture.wait,
+        githubPrObservation: baselineFixture.observation,
+      });
+      const baseline = applyWithFixtureReceipt(baselineFixture.fixture.db, baselineRequest);
+      expect(baseline, `unmutated baseline for ${item.name}`).toMatchObject({ outcome: "OK", registration: "registered" });
       const fixture = await githubPrBaseFixture();
       const request = transitionRequest(fixture.fixture.fenceToken, "blocked", 3, {
-        idempotencyKey: `github-pr-mutant-${item.name}`,
+        idempotencyKey: `github-pr-mutant-${item.name}-mutated`,
         workItemWait: fixture.wait,
         githubPrObservation: fixture.observation,
       });
-      const baseline = applyWithFixtureReceipt(fixture.fixture.db, request);
-      expect(baseline, `unmutated baseline for ${item.name}`).toMatchObject({ outcome: "OK", registration: "registered" });
       const before = exportFoundation(fixture.fixture.db, PROJECT_ID);
-      const result = applyWithFixtureReceipt(fixture.fixture.db, item.mutate({
-        ...request,
-        idempotencyKey: `${request.idempotencyKey}-mutated`,
-      }));
-      expect(result.outcome, item.name).not.toBe("OK");
+      const result = applyWithFixtureReceipt(fixture.fixture.db, item.mutate(request));
+      expect(result.outcome, item.name).toBe(item.expectedRefusal);
       expect(exportFoundation(fixture.fixture.db, PROJECT_ID), item.name).toEqual(before);
     }
   });
