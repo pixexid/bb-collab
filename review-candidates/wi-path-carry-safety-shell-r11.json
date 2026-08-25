@@ -1,0 +1,43 @@
+{
+  "workItemId": "wi-path-carry-safety-shell-r11",
+  "cloneUrl": "https://github.com/get-bb/bb.git",
+  "upstreamBase": "21cb6b68b8fdffe2cd576f11c8af500f98d22c11",
+  "candidateHead": "da5aabc8919865873e838e2473fc79898002f14e",
+  "patchFile": "wi-path-carry-safety-shell-r11.patch",
+  "patchSha256": "607086773e02ca2f72c6a048928add2f1ed006faf1b7726a94b1a53e0d7210e6",
+  "changedFileCount": 20,
+  "checks": [
+    {
+      "command": "pnpm install --frozen-lockfile",
+      "result": "pass"
+    },
+    {
+      "command": "pnpm exec turbo run test --filter=@bb/desktop --output-logs=new-only",
+      "result": "pass; 36 files / 235 tests"
+    },
+    {
+      "command": "pnpm exec turbo run test --filter=bb-app --output-logs=new-only",
+      "result": "pass; 2 files / 71 tests"
+    },
+    {
+      "command": "pnpm exec turbo run typecheck --filter=@bb/desktop --filter=bb-app --filter=@bb/config --output-logs=new-only",
+      "result": "pass; 5 tasks"
+    },
+    {
+      "command": "pnpm build",
+      "result": "pass; 12 tasks"
+    },
+    {
+      "command": "pnpm exec turbo run build --filter=@bb/desktop --output-logs=new-only",
+      "result": "pass; 12 tasks"
+    },
+    {
+      "command": "node scripts/run-electron-builder.mjs --print-config (from apps/desktop)",
+      "result": "pass; fork appId/product/artifact/executable and desktop-path-carry publish URL"
+    },
+    {
+      "command": "pnpm exec oxfmt --write <changed files>, git diff --check, and node --check on changed desktop scripts",
+      "result": "pass"
+    }
+  ]
+}

@@ -1,0 +1,896 @@
+From da5aabc8919865873e838e2473fc79898002f14e Mon Sep 17 00:00:00 2001
+From: Ralph <hello@pixexid.com>
+Date: Mon, 24 Aug 2026 19:31:39 -0700
+Subject: [PATCH] Implement isolated PATH carry safety shell
+
+---
+ apps/desktop/electron-builder.config.json     |  10 +-
+ apps/desktop/scripts/build.mjs                |   4 +-
+ .../scripts/desktop-release-channel.d.mts     |  21 ++-
+ .../scripts/desktop-release-channel.mjs       |  16 ++
+ .../desktop/scripts/generate-version-feed.mts |   7 +-
+ apps/desktop/scripts/run-electron-builder.mjs |   7 +-
+ apps/desktop/scripts/run-packaged-app.mjs     |   9 +-
+ apps/desktop/scripts/smoke-packaged-app.mjs   |   9 +-
+ apps/desktop/src/desktop-auto-update.ts       |   3 +
+ apps/desktop/src/desktop-update-provider.ts   |  18 ++-
+ apps/desktop/src/fork-safety.ts               | 148 ++++++++++++++++++
+ apps/desktop/src/main.ts                      |  31 +++-
+ apps/desktop/src/types.ts                     |   4 +-
+ apps/desktop/test/desktop-auto-update.test.ts |   9 ++
+ .../test/desktop-update-provider.test.ts      |  14 +-
+ .../test/electron-builder-config.test.ts      |  37 ++---
+ apps/desktop/test/fork-safety.test.ts         |  61 ++++++++
+ packages/bb-app/src/launcher.ts               |  40 ++++-
+ packages/bb-app/test/index.test.ts            |  19 +++
+ packages/config/src/runtime.ts                |   4 +
+ 20 files changed, 405 insertions(+), 66 deletions(-)
+ create mode 100644 apps/desktop/src/fork-safety.ts
+ create mode 100644 apps/desktop/test/fork-safety.test.ts
+
+diff --git a/apps/desktop/electron-builder.config.json b/apps/desktop/electron-builder.config.json
+index 9ef39fad7..0eb32e86d 100644
+--- a/apps/desktop/electron-builder.config.json
++++ b/apps/desktop/electron-builder.config.json
+@@ -1,7 +1,7 @@
+ {
+-  "appId": "dev.bb.desktop",
+-  "productName": "bb",
+-  "artifactName": "${productName}-${version}-${arch}.${ext}",
++  "appId": "dev.bb.desktop.path-carry",
++  "productName": "bb PATH Carry",
++  "artifactName": "bb-path-carry-${version}-${arch}.${ext}",
+   "afterPack": "scripts/prepare-native-modules.cjs",
+   "asar": true,
+   "asarUnpack": ["dist/bb-app-bridge.mjs", "node_modules/**"],
+@@ -25,7 +25,7 @@
+     {
+       "channel": "latest",
+       "provider": "generic",
+-      "url": "https://github.com/get-bb/bb/releases/download/desktop-latest/"
++      "url": "https://github.com/get-bb/bb/releases/download/desktop-path-carry/"
+     }
+   ],
+   "mac": {
+@@ -50,7 +50,7 @@
+   },
+   "linux": {
+     "category": "Development",
+-    "executableName": "bb",
++    "executableName": "bb-path-carry",
+     "icon": "assets/icon.png",
+     "target": [{ "target": "AppImage", "arch": ["x64"] }]
+   },
+diff --git a/apps/desktop/scripts/build.mjs b/apps/desktop/scripts/build.mjs
+index 8d91d054d..cadeb0424 100644
+--- a/apps/desktop/scripts/build.mjs
++++ b/apps/desktop/scripts/build.mjs
+@@ -69,7 +69,8 @@ const pluginSdkVersion = readPackageVersion(
+   await readFile(pluginSdkPackageJsonPath, "utf8"),
+   "packages/plugin-sdk/package.json",
+ );
+-const desktopReleaseChannel = resolveDesktopReleaseChannel(process.env);
++resolveDesktopReleaseChannel(process.env);
++const desktopReleaseChannel = "latest";
+ const desktopCommit = readBuildCommit(process.env);
+ const desktopBuildDate = readBuildDate(process.env);
+ 
+@@ -78,6 +79,7 @@ const commonOptions = {
+   define: {
+     "process.env.BB_DESKTOP_BUILD_DATE": JSON.stringify(desktopBuildDate),
+     "process.env.BB_DESKTOP_COMMIT": JSON.stringify(desktopCommit),
++    "process.env.BB_DESKTOP_FORK": JSON.stringify("1"),
+     "process.env.BB_DESKTOP_PLUGIN_SDK_VERSION":
+       JSON.stringify(pluginSdkVersion),
+     "process.env.BB_DESKTOP_RELEASE_CHANNEL": JSON.stringify(
+diff --git a/apps/desktop/scripts/desktop-release-channel.d.mts b/apps/desktop/scripts/desktop-release-channel.d.mts
+index f084557e1..e84b1c76c 100644
+--- a/apps/desktop/scripts/desktop-release-channel.d.mts
++++ b/apps/desktop/scripts/desktop-release-channel.d.mts
+@@ -29,6 +29,25 @@ export function createDesktopReleaseConfig(
+   channel: DesktopReleaseChannel,
+ ): DesktopReleaseConfig;
+ 
++export interface DesktopForkReleaseConfig extends Omit<
++  DesktopReleaseConfig,
++  | "appId"
++  | "applicationName"
++  | "artifactName"
++  | "linuxExecutableName"
++  | "releaseTag"
++> {
++  appId: "dev.bb.desktop.path-carry";
++  applicationName: "bb PATH Carry";
++  artifactName: string;
++  linuxExecutableName: "bb-path-carry";
++  releaseTag: "desktop-path-carry";
++}
++
++export function createDesktopForkReleaseConfig(): DesktopForkReleaseConfig;
++
+ export function createDesktopUpdateReleaseBaseUrl(
+-  releaseTag: DesktopReleaseConfig["releaseTag"],
++  releaseTag:
++    | DesktopReleaseConfig["releaseTag"]
++    | DesktopForkReleaseConfig["releaseTag"],
+ ): string;
+diff --git a/apps/desktop/scripts/desktop-release-channel.mjs b/apps/desktop/scripts/desktop-release-channel.mjs
+index 44eb19b96..8d8376a10 100644
+--- a/apps/desktop/scripts/desktop-release-channel.mjs
++++ b/apps/desktop/scripts/desktop-release-channel.mjs
+@@ -61,6 +61,22 @@ export function createDesktopReleaseConfig(channel) {
+   };
+ }
+ 
++export function createDesktopForkReleaseConfig() {
++  return {
++    appId: "dev.bb.desktop.path-carry",
++    applicationName: "bb PATH Carry",
++    artifactName: "bb-path-carry-${version}-${arch}.${ext}",
++    iconFileName: "icon.png",
++    linuxExecutableName: "bb-path-carry",
++    macIconPath: "assets/icon.icns",
++    releaseTag: "desktop-path-carry",
++    updateMetadataFileNames: {
++      linux: "latest-linux.yml",
++      macos: "latest-mac.yml",
++    },
++  };
++}
++
+ export function createDesktopUpdateReleaseBaseUrl(releaseTag) {
+   return `https://github.com/get-bb/bb/releases/download/${releaseTag}/`;
+ }
+diff --git a/apps/desktop/scripts/generate-version-feed.mts b/apps/desktop/scripts/generate-version-feed.mts
+index 075efc038..6da5c91d4 100644
+--- a/apps/desktop/scripts/generate-version-feed.mts
++++ b/apps/desktop/scripts/generate-version-feed.mts
+@@ -8,15 +8,14 @@ import {
+   type BbDesktopVersionFeed,
+ } from "@bb/desktop-contract";
+ import {
+-  createDesktopReleaseConfig,
++  createDesktopForkReleaseConfig,
+   resolveDesktopBuildPlatform,
+-  resolveDesktopReleaseChannel,
+ } from "./desktop-release-channel.mjs";
+ 
+ const packageRoot = process.cwd();
+ const packageJsonPath = resolve(packageRoot, "package.json");
+-const releaseChannel = resolveDesktopReleaseChannel(process.env);
+-const releaseConfig = createDesktopReleaseConfig(releaseChannel);
++const releaseChannel = "latest";
++const releaseConfig = createDesktopForkReleaseConfig();
+ // The feed describes the artifacts electron-builder just produced, so it always
+ // describes the platform this build ran on.
+ const buildPlatform = resolveDesktopBuildPlatform(process.platform);
+diff --git a/apps/desktop/scripts/run-electron-builder.mjs b/apps/desktop/scripts/run-electron-builder.mjs
+index 9e14bd40a..cbe5dcb2f 100644
+--- a/apps/desktop/scripts/run-electron-builder.mjs
++++ b/apps/desktop/scripts/run-electron-builder.mjs
+@@ -3,7 +3,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+ import { dirname, resolve } from "node:path";
+ import { fileURLToPath } from "node:url";
+ import {
+-  createDesktopReleaseConfig,
++  createDesktopForkReleaseConfig,
+   createDesktopUpdateReleaseBaseUrl,
+   resolveDesktopReleaseChannel,
+ } from "./desktop-release-channel.mjs";
+@@ -160,8 +160,9 @@ function createSigningPlan(env) {
+ 
+ function resolveElectronBuilderConfig(baseConfig, env) {
+   const signingPlan = createSigningPlan(env);
+-  const releaseChannel = resolveDesktopReleaseChannel(env);
+-  const releaseConfig = createDesktopReleaseConfig(releaseChannel);
++  resolveDesktopReleaseChannel(env);
++  const releaseChannel = "latest";
++  const releaseConfig = createDesktopForkReleaseConfig();
+   const config = cloneJson(baseConfig);
+   const mac = {
+     ...config.mac,
+diff --git a/apps/desktop/scripts/run-packaged-app.mjs b/apps/desktop/scripts/run-packaged-app.mjs
+index e8ff42a86..f669b6423 100644
+--- a/apps/desktop/scripts/run-packaged-app.mjs
++++ b/apps/desktop/scripts/run-packaged-app.mjs
+@@ -1,17 +1,12 @@
+ import { join } from "node:path";
+ import { spawn } from "node:child_process";
+ import { once } from "node:events";
+-import {
+-  createDesktopReleaseConfig,
+-  resolveDesktopReleaseChannel,
+-} from "./desktop-release-channel.mjs";
++import { createDesktopForkReleaseConfig } from "./desktop-release-channel.mjs";
+ import { resolvePackagedAppBinary } from "./packaged-app-paths.mjs";
+ 
+ const packageRoot = process.cwd();
+ const releaseDir = join(packageRoot, "release");
+-const releaseConfig = createDesktopReleaseConfig(
+-  resolveDesktopReleaseChannel(process.env),
+-);
++const releaseConfig = createDesktopForkReleaseConfig();
+ 
+ function createElectronAppEnv(env) {
+   const childEnv = {
+diff --git a/apps/desktop/scripts/smoke-packaged-app.mjs b/apps/desktop/scripts/smoke-packaged-app.mjs
+index 140fd0996..ebfcfd0cb 100644
+--- a/apps/desktop/scripts/smoke-packaged-app.mjs
++++ b/apps/desktop/scripts/smoke-packaged-app.mjs
+@@ -4,17 +4,14 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
+ import { tmpdir } from "node:os";
+ import { dirname, join, resolve } from "node:path";
+ import { fileURLToPath } from "node:url";
+-import {
+-  createDesktopReleaseConfig,
+-  resolveDesktopReleaseChannel,
+-} from "./desktop-release-channel.mjs";
++import { createDesktopForkReleaseConfig } from "./desktop-release-channel.mjs";
+ import { resolvePackagedAppBinary } from "./packaged-app-paths.mjs";
+ 
+ const scriptDirectory = dirname(fileURLToPath(import.meta.url));
+ const desktopPackageRoot = resolve(scriptDirectory, "..");
+ const releaseDir = join(desktopPackageRoot, "release");
+-const releaseChannel = resolveDesktopReleaseChannel(process.env);
+-const releaseConfig = createDesktopReleaseConfig(releaseChannel);
++const releaseChannel = "latest";
++const releaseConfig = createDesktopForkReleaseConfig();
+ const startupTimeoutMs = 20_000;
+ const exitTimeoutMs = 5_000;
+ const postReadySettleMs = 300;
+diff --git a/apps/desktop/src/desktop-auto-update.ts b/apps/desktop/src/desktop-auto-update.ts
+index 1dd05a935..9120726f1 100644
+--- a/apps/desktop/src/desktop-auto-update.ts
++++ b/apps/desktop/src/desktop-auto-update.ts
+@@ -150,6 +150,9 @@ function formatCheckedAt(now: () => number): string {
+ export function shouldEnableDesktopAutoUpdate(
+   args: ShouldEnableDesktopAutoUpdateArgs,
+ ): boolean {
++  if (args.env.BB_DESKTOP_FORK === "1") {
++    return false;
++  }
+   return args.isPackaged || args.env.BB_DESKTOP_AUTO_UPDATE === "1";
+ }
+ 
+diff --git a/apps/desktop/src/desktop-update-provider.ts b/apps/desktop/src/desktop-update-provider.ts
+index d802b4751..7454616cc 100644
+--- a/apps/desktop/src/desktop-update-provider.ts
++++ b/apps/desktop/src/desktop-update-provider.ts
+@@ -6,10 +6,10 @@ import {
+ type DesktopReleaseChannel = "latest" | "nightly";
+ 
+ interface DesktopReleaseInfo {
+-  applicationName: "bb" | "bb Nightly";
++  applicationName: "bb" | "bb Nightly" | "bb PATH Carry";
+   channel: DesktopReleaseChannel;
+   iconFileName: "icon.png" | "icon-nightly.png";
+-  releaseTag: "desktop-latest" | "desktop-nightly";
++  releaseTag: "desktop-latest" | "desktop-nightly" | "desktop-path-carry";
+   updateReleaseBaseUrl: string;
+ }
+ 
+@@ -46,9 +46,14 @@ function resolveBuiltDesktopReleaseChannel(
+ export const DESKTOP_RELEASE_CHANNEL = resolveBuiltDesktopReleaseChannel(
+   process.env.BB_DESKTOP_RELEASE_CHANNEL,
+ );
+-export const DESKTOP_RELEASE_INFO = createDesktopReleaseInfo(
+-  DESKTOP_RELEASE_CHANNEL,
+-);
++export const DESKTOP_RELEASE_INFO: DesktopReleaseInfo = {
++  applicationName: "bb PATH Carry",
++  channel: DESKTOP_RELEASE_CHANNEL,
++  iconFileName: "icon.png",
++  releaseTag: "desktop-path-carry",
++  updateReleaseBaseUrl:
++    "https://github.com/get-bb/bb/releases/download/desktop-path-carry/",
++};
+ const DESKTOP_UPDATE_RELEASE_BASE_URL =
+   DESKTOP_RELEASE_INFO.updateReleaseBaseUrl;
+ 
+@@ -94,6 +99,9 @@ interface ResolveDesktopUpdateSupportArgs {
+ export function resolveDesktopUpdateSupport(
+   args: ResolveDesktopUpdateSupportArgs,
+ ): DesktopUpdateSupport {
++  if (args.env.BB_DESKTOP_FORK === "1") {
++    return { autoUpdate: false, versionCheck: false };
++  }
+   if (args.platform === "macos") {
+     return { autoUpdate: true, versionCheck: true };
+   }
+diff --git a/apps/desktop/src/fork-safety.ts b/apps/desktop/src/fork-safety.ts
+new file mode 100644
+index 000000000..70f8bc334
+--- /dev/null
++++ b/apps/desktop/src/fork-safety.ts
+@@ -0,0 +1,148 @@
++import { homedir } from "node:os";
++import { join, resolve } from "node:path";
++import {
++  BB_PATH_CARRY_HOST_DAEMON_PORT,
++  BB_PATH_CARRY_INSTANCE_ID,
++  BB_PATH_CARRY_PROTOCOL,
++  BB_PATH_CARRY_SERVER_PORT,
++} from "@bb/config/runtime";
++
++export const DESKTOP_FORK_IDENTITY = {
++  appId: "dev.bb.desktop.path-carry",
++  artifactName: "bb-path-carry-${version}-${arch}.${ext}",
++  executableName: "bb-path-carry",
++  productName: "bb PATH Carry",
++} as const;
++
++export const DESKTOP_FORK_USER_DATA_NAME = "bb PATH Carry";
++export const DESKTOP_FORK_SESSION_DATA_NAME = "session";
++
++const FORK_ENV_KEYS_TO_DELETE = [
++  "BB_DESKTOP_APP_URL",
++  "BB_DESKTOP_VERSION_FEED_URL",
++  "BB_HOST_ENROLL_KEY",
++  "BB_HOST_ID",
++  "BB_HOST_TYPE",
++  "BB_SERVER_URL",
++] as const;
++
++interface CreateForkRuntimeEnvArgs {
++  allowCustomRuntime?: boolean;
++  env: NodeJS.ProcessEnv;
++  userDataPath: string;
++}
++
++function requireForkPort(
++  env: NodeJS.ProcessEnv,
++  name: string,
++  expected: number,
++  allowCustomRuntime: boolean,
++): number {
++  const configured = env[name]?.trim();
++  if (configured === undefined || configured.length === 0) {
++    return expected;
++  }
++  const port = Number(configured);
++  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
++    throw new Error(`PATH carry fork refuses invalid ${name}=${configured}.`);
++  }
++  if (port === 38886 || port === 38887) {
++    throw new Error(
++      `PATH carry fork refuses stock ${name}=${configured}; use an isolated port.`,
++    );
++  }
++  if (!allowCustomRuntime && port !== expected) {
++    throw new Error(
++      `PATH carry fork refuses ${name}=${configured}; expected isolated port ${expected}.`,
++    );
++  }
++  return port;
++}
++
++export function resolveForkUserDataPath(appDataPath: string): string {
++  return join(appDataPath, DESKTOP_FORK_USER_DATA_NAME);
++}
++
++export function resolveForkSessionDataPath(userDataPath: string): string {
++  return join(userDataPath, DESKTOP_FORK_SESSION_DATA_NAME);
++}
++
++export function resolveForkDataDir(userDataPath: string): string {
++  return join(userDataPath, "runtime");
++}
++
++export function createForkRuntimeEnv(
++  args: CreateForkRuntimeEnvArgs,
++): NodeJS.ProcessEnv {
++  const dataDir = resolveForkDataDir(args.userDataPath);
++  const allowCustomRuntime = args.allowCustomRuntime === true;
++  const configuredDataDir = args.env.BB_DATA_DIR?.trim();
++  if (
++    configuredDataDir !== undefined &&
++    configuredDataDir.length > 0 &&
++    resolve(configuredDataDir) === resolve(join(homedir(), ".bb"))
++  ) {
++    throw new Error(
++      `PATH carry fork refuses stock BB_DATA_DIR=${configuredDataDir}.`,
++    );
++  }
++  if (
++    configuredDataDir !== undefined &&
++    configuredDataDir.length > 0 &&
++    !allowCustomRuntime &&
++    resolve(configuredDataDir) !== resolve(dataDir)
++  ) {
++    throw new Error(
++      `PATH carry fork refuses BB_DATA_DIR=${configuredDataDir}; expected isolated data ${dataDir}.`,
++    );
++  }
++  const serverPort = requireForkPort(
++    args.env,
++    "BB_SERVER_PORT",
++    BB_PATH_CARRY_SERVER_PORT,
++    allowCustomRuntime,
++  );
++  const daemonPort = requireForkPort(
++    args.env,
++    "BB_HOST_DAEMON_PORT",
++    BB_PATH_CARRY_HOST_DAEMON_PORT,
++    allowCustomRuntime,
++  );
++  if (args.env.BB_HOST_DAEMON_AUTO_UPDATE?.trim() === "1") {
++    throw new Error(
++      "PATH carry fork refuses host-daemon auto-update; the fork must remain disposable.",
++    );
++  }
++
++  const env = { ...args.env };
++  for (const key of FORK_ENV_KEYS_TO_DELETE) {
++    delete env[key];
++  }
++  return {
++    ...env,
++    BB_DATA_DIR:
++      configuredDataDir === undefined || configuredDataDir.length === 0
++        ? dataDir
++        : resolve(configuredDataDir),
++    BB_DESKTOP_FORK: "1",
++    BB_FORK_INSTANCE: BB_PATH_CARRY_INSTANCE_ID,
++    BB_FORK_PROTOCOL: BB_PATH_CARRY_PROTOCOL,
++    BB_HOST_DAEMON_AUTO_UPDATE: "0",
++    BB_HOST_DAEMON_PORT: String(daemonPort),
++    BB_SERVER_PORT: String(serverPort),
++  };
++}
++
++export function applyForkRuntimeEnv(args: CreateForkRuntimeEnvArgs): void {
++  const env = createForkRuntimeEnv(args);
++  for (const key of Object.keys(process.env)) {
++    if (env[key] === undefined) {
++      delete process.env[key];
++    }
++  }
++  Object.assign(process.env, env);
++}
++
++export function forkRefusesExistingServer(): boolean {
++  return true;
++}
+diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
+index 6c65429b8..5e96d50a3 100644
+--- a/apps/desktop/src/main.ts
++++ b/apps/desktop/src/main.ts
+@@ -161,6 +161,13 @@ import { registerDesktopBrowserIpc } from "./desktop-browser-main-ipc.js";
+ import { parseDesktopSystemConfig } from "./desktop-system-config.js";
+ import { ensurePackagedUserShellPath } from "./desktop-shell-path.js";
+ import { resolveDesktopReloadShortcut } from "./desktop-reload-shortcut.js";
++import {
++  applyForkRuntimeEnv,
++  DESKTOP_FORK_IDENTITY,
++  forkRefusesExistingServer,
++  resolveForkSessionDataPath,
++  resolveForkUserDataPath,
++} from "./fork-safety.js";
+ import {
+   createLogTailer,
+   createLogLineBuffer,
+@@ -2013,6 +2020,17 @@ async function initializeRuntime(args: InitializeRuntimeArgs): Promise<void> {
+   });
+ 
+   if (existingProbe.kind === "compatible") {
++    if (app.isPackaged && forkRefusesExistingServer()) {
++      await loadStartupError({
++        details:
++          `PATH carry fork found bb already listening at ${existingProbe.serverUrl}; ` +
++          "it refuses to attach to or stop another runtime.",
++        logs: "",
++        title: "Fork port is occupied",
++      });
++      return;
++    }
++
+     const decision = await decideOnExistingServer(existingProbe);
+     if (decision === "quit") {
+       app.quit();
+@@ -2084,8 +2102,16 @@ async function runDesktopApp(): Promise<void> {
+ 
+   const applicationName = app.isPackaged
+     ? DESKTOP_RELEASE_INFO.applicationName
+-    : "bb-dev";
++    : DESKTOP_FORK_IDENTITY.productName;
+   app.setName(applicationName);
++  const userDataPath = resolveForkUserDataPath(app.getPath("appData"));
++  app.setPath("userData", userDataPath);
++  app.setPath("sessionData", resolveForkSessionDataPath(userDataPath));
++  applyForkRuntimeEnv({
++    allowCustomRuntime: !app.isPackaged,
++    env: process.env,
++    userDataPath,
++  });
+   installAboutPanel(applicationName);
+ 
+   if (!app.requestSingleInstanceLock()) {
+@@ -2183,7 +2209,6 @@ async function runDesktopApp(): Promise<void> {
+     env: process.env,
+     platform: desktopPlatform,
+   });
+-  const userDataPath = app.getPath("userData");
+   desktopUserDataPath = userDataPath;
+ 
+   assertPathExists({ label: "bb-app bridge", path: bridgePath });
+@@ -2351,7 +2376,7 @@ async function runDesktopApp(): Promise<void> {
+     desktopAutoUpdateService.start();
+   } else {
+     logger.info(
+-      "Desktop auto-install is disabled: only the Linux AppImage build can replace itself. Version checks still report new releases.",
++      "PATH carry fork desktop update checks and auto-install are disabled; stock release feeds are never consulted.",
+     );
+   }
+ 
+diff --git a/apps/desktop/src/types.ts b/apps/desktop/src/types.ts
+index 8adbab205..1bf6c0c95 100644
+--- a/apps/desktop/src/types.ts
++++ b/apps/desktop/src/types.ts
+@@ -1,4 +1,6 @@
+-const DEFAULT_BB_SERVER_PORT = 38886;
++import { BB_PATH_CARRY_SERVER_PORT } from "@bb/config/runtime";
++
++const DEFAULT_BB_SERVER_PORT = BB_PATH_CARRY_SERVER_PORT;
+ export const DEFAULT_BB_SERVER_URL = `http://127.0.0.1:${DEFAULT_BB_SERVER_PORT}`;
+ const DEFAULT_WINDOW_HEIGHT = 900;
+ const DEFAULT_WINDOW_WIDTH = 1280;
+diff --git a/apps/desktop/test/desktop-auto-update.test.ts b/apps/desktop/test/desktop-auto-update.test.ts
+index 62edde773..fa43c7280 100644
+--- a/apps/desktop/test/desktop-auto-update.test.ts
++++ b/apps/desktop/test/desktop-auto-update.test.ts
+@@ -400,4 +400,13 @@ describe("desktop auto-update service", () => {
+       }),
+     ).toBe(true);
+   });
++
++  it("rejects every auto-update override for the fork", () => {
++    expect(
++      shouldEnableDesktopAutoUpdate({
++        env: { BB_DESKTOP_AUTO_UPDATE: "1", BB_DESKTOP_FORK: "1" },
++        isPackaged: true,
++      }),
++    ).toBe(false);
++  });
+ });
+diff --git a/apps/desktop/test/desktop-update-provider.test.ts b/apps/desktop/test/desktop-update-provider.test.ts
+index d037a7fc2..89712cd9c 100644
+--- a/apps/desktop/test/desktop-update-provider.test.ts
++++ b/apps/desktop/test/desktop-update-provider.test.ts
+@@ -9,10 +9,10 @@ describe("desktop update feed url", () => {
+     // macOS and Linux assets share the desktop-latest release, so a single
+     // feed name would make the last publish overwrite the other platform.
+     expect(createDesktopUpdateFeedUrl("macos")).toBe(
+-      "https://github.com/get-bb/bb/releases/download/desktop-latest/desktop-version.json",
++      "https://github.com/get-bb/bb/releases/download/desktop-path-carry/desktop-version.json",
+     );
+     expect(createDesktopUpdateFeedUrl("linux")).toBe(
+-      "https://github.com/get-bb/bb/releases/download/desktop-latest/desktop-version-linux.json",
++      "https://github.com/get-bb/bb/releases/download/desktop-path-carry/desktop-version-linux.json",
+     );
+   });
+ });
+@@ -22,6 +22,16 @@ const alwaysReplaceable = () => true;
+ const neverReplaceable = () => false;
+ 
+ describe("desktop update support", () => {
++  it("disables feed checks and self-install for the fork", () => {
++    expect(
++      resolveDesktopUpdateSupport({
++        canReplaceAppImage: alwaysReplaceable,
++        env: { BB_DESKTOP_FORK: "1" },
++        platform: "macos",
++      }),
++    ).toEqual({ autoUpdate: false, versionCheck: false });
++  });
++
+   it("enables both update paths on macOS", () => {
+     expect(
+       resolveDesktopUpdateSupport({
+diff --git a/apps/desktop/test/electron-builder-config.test.ts b/apps/desktop/test/electron-builder-config.test.ts
+index cb724c379..49450d6b6 100644
+--- a/apps/desktop/test/electron-builder-config.test.ts
++++ b/apps/desktop/test/electron-builder-config.test.ts
+@@ -14,10 +14,7 @@ import { tmpdir } from "node:os";
+ import { dirname, resolve } from "node:path";
+ import { z } from "zod";
+ import { describe, expect, it } from "vitest";
+-import {
+-  createDesktopReleaseInfo,
+-  DESKTOP_AUTO_UPDATE_FEED_CONFIG,
+-} from "../src/desktop-update-provider.js";
++import { DESKTOP_AUTO_UPDATE_FEED_CONFIG } from "../src/desktop-update-provider.js";
+ 
+ const desktopPackageRoot = process.cwd();
+ const require = createRequire(resolve(desktopPackageRoot, "package.json"));
+@@ -66,7 +63,7 @@ const macConfigSchema = z
+ const linuxConfigSchema = z
+   .object({
+     category: z.literal("Development"),
+-    executableName: z.enum(["bb", "bb-nightly"]),
++    executableName: z.enum(["bb", "bb-nightly", "bb-path-carry"]),
+     icon: z.string().min(1),
+     target: z.tuple([
+       z
+@@ -513,7 +510,7 @@ describe("electron-builder signing config", () => {
+ 
+     expect(config.linux).toMatchObject({
+       category: "Development",
+-      executableName: "bb",
++      executableName: "bb-path-carry",
+       target: [{ arch: ["x64"], target: "AppImage" }],
+     });
+     await expect(
+@@ -542,7 +539,7 @@ describe("electron-builder signing config", () => {
+     }
+   });
+ 
+-  it("keeps the updater provider pointed at desktop-latest release assets", async () => {
++  it("keeps the fork updater config away from stock release assets", async () => {
+     const configText = await readFile(
+       resolve(desktopPackageRoot, "electron-builder.config.json"),
+       "utf8",
+@@ -551,34 +548,30 @@ describe("electron-builder signing config", () => {
+ 
+     expect(config.publish[0]).toMatchObject(DESKTOP_AUTO_UPDATE_FEED_CONFIG);
+     expect(DESKTOP_AUTO_UPDATE_FEED_CONFIG.url).toBe(
+-      "https://github.com/get-bb/bb/releases/download/desktop-latest/",
++      "https://github.com/get-bb/bb/releases/download/desktop-path-carry/",
+     );
+   });
+ 
+-  it("creates a separate nightly app identity and update feed", async () => {
++  it("creates a separate PATH carry app identity and update feed", async () => {
+     const { config } = await readResolvedConfig({
+       BB_DESKTOP_RELEASE_CHANNEL: "nightly",
+     });
+-    const nightlyRelease = createDesktopReleaseInfo("nightly");
+-
+-    expect(config.appId).toBe("dev.bb.desktop.nightly");
+-    expect(config.productName).toBe("bb Nightly");
+-    expect(config.artifactName).toBe("bb-nightly-${version}-${arch}.${ext}");
+-    expect(config.linux.icon).toBe("assets/icon-nightly.png");
+-    // A shared Linux binary name would let one channel shadow the other on
+-    // PATH, and the two channels are meant to be installed side by side.
+-    expect(config.linux.executableName).toBe("bb-nightly");
+-    expect(config.mac.icon).toBe("assets/icon-nightly.icns");
++    expect(config.appId).toBe("dev.bb.desktop.path-carry");
++    expect(config.productName).toBe("bb PATH Carry");
++    expect(config.artifactName).toBe("bb-path-carry-${version}-${arch}.${ext}");
++    expect(config.linux.icon).toBe("assets/icon.png");
++    expect(config.linux.executableName).toBe("bb-path-carry");
++    expect(config.mac.icon).toBe("assets/icon.icns");
+     await expect(
+       access(resolve(desktopPackageRoot, config.mac.icon)),
+     ).resolves.toBeUndefined();
+     await expect(
+-      access(resolve(desktopPackageRoot, "assets/icon-nightly.png")),
++      access(resolve(desktopPackageRoot, "assets/icon.png")),
+     ).resolves.toBeUndefined();
+     expect(config.publish[0]).toEqual({
+-      channel: "nightly",
++      channel: "latest",
+       provider: "generic",
+-      url: nightlyRelease.updateReleaseBaseUrl,
++      url: "https://github.com/get-bb/bb/releases/download/desktop-path-carry/",
+     });
+   });
+ 
+diff --git a/apps/desktop/test/fork-safety.test.ts b/apps/desktop/test/fork-safety.test.ts
+new file mode 100644
+index 000000000..10025fc22
+--- /dev/null
++++ b/apps/desktop/test/fork-safety.test.ts
+@@ -0,0 +1,61 @@
++import { homedir } from "node:os";
++import { join } from "node:path";
++import { describe, expect, it } from "vitest";
++import {
++  createForkRuntimeEnv,
++  DESKTOP_FORK_IDENTITY,
++  forkRefusesExistingServer,
++  resolveForkDataDir,
++  resolveForkSessionDataPath,
++  resolveForkUserDataPath,
++} from "../src/fork-safety.js";
++
++const userDataPath = "/tmp/bb-path-carry-user-data";
++
++describe("PATH carry fork safety", () => {
++  it("keeps identity, runtime state, and ports outside stock defaults", () => {
++    const env = createForkRuntimeEnv({ env: {}, userDataPath });
++
++    expect(DESKTOP_FORK_IDENTITY.appId).not.toBe("dev.bb.desktop");
++    expect(DESKTOP_FORK_IDENTITY.productName).not.toBe("bb");
++    expect(DESKTOP_FORK_IDENTITY.executableName).not.toBe("bb");
++    expect(resolveForkUserDataPath("/tmp/app-data")).toBe(
++      "/tmp/app-data/bb PATH Carry",
++    );
++    expect(resolveForkSessionDataPath(userDataPath)).toBe(
++      `${userDataPath}/session`,
++    );
++    expect(env.BB_DATA_DIR).toBe(resolveForkDataDir(userDataPath));
++    expect(env.BB_SERVER_PORT).toBe("39886");
++    expect(env.BB_HOST_DAEMON_PORT).toBe("39887");
++    expect(env.BB_HOST_DAEMON_AUTO_UPDATE).toBe("0");
++    expect(env.BB_FORK_INSTANCE).toBe("path-carry-r11");
++    expect(env.BB_FORK_PROTOCOL).toBe("bb-path-carry");
++    expect(env.BB_SERVER_URL).toBeUndefined();
++  });
++
++  it("fails closed when stock data or ports are injected", () => {
++    expect(() =>
++      createForkRuntimeEnv({
++        env: { BB_DATA_DIR: join(homedir(), ".bb") },
++        userDataPath,
++      }),
++    ).toThrow(/stock BB_DATA_DIR/u);
++    expect(() =>
++      createForkRuntimeEnv({
++        env: { BB_SERVER_PORT: "38886" },
++        userDataPath,
++      }),
++    ).toThrow(/refuses stock BB_SERVER_PORT/u);
++    expect(() =>
++      createForkRuntimeEnv({
++        env: { BB_HOST_DAEMON_AUTO_UPDATE: "1" },
++        userDataPath,
++      }),
++    ).toThrow(/auto-update/u);
++  });
++
++  it("never attaches to an occupied runtime", () => {
++    expect(forkRefusesExistingServer()).toBe(true);
++  });
++});
+diff --git a/packages/bb-app/src/launcher.ts b/packages/bb-app/src/launcher.ts
+index c97d8c498..816fc137d 100644
+--- a/packages/bb-app/src/launcher.ts
++++ b/packages/bb-app/src/launcher.ts
+@@ -59,6 +59,8 @@ import { validateOptionalUrl } from "@bb/config/public-url";
+ import { parseServerBindHost, type ServerBindHost } from "@bb/config/server";
+ import { toOptionalString } from "@bb/config/strings";
+ import {
++  BB_PATH_CARRY_INSTANCE_ID,
++  BB_PATH_CARRY_PROTOCOL,
+   BB_PROD_HOST_DAEMON_PORT,
+   BB_LOOPBACK_HOST,
+   BB_PROD_SERVER_PORT,
+@@ -95,6 +97,27 @@ const REMOVE_COMMAND = "remove";
+ const CONFIG_UNSET_COMMAND = "unset";
+ const CONFIG_LIST_COMMAND = "list";
+ const CONFIG_REFRESH_COMMAND = "refresh";
++const PATH_CARRY_FORK_ENV = "BB_FORK_INSTANCE";
++
++function enforceForkSafetyEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
++  if (env[PATH_CARRY_FORK_ENV] === undefined) {
++    return env;
++  }
++  if (env[PATH_CARRY_FORK_ENV] !== BB_PATH_CARRY_INSTANCE_ID) {
++    throw new Error("Unknown BB fork instance; refusing runtime startup.");
++  }
++  if (env.BB_FORK_PROTOCOL !== BB_PATH_CARRY_PROTOCOL) {
++    throw new Error("PATH carry fork protocol marker is missing or invalid.");
++  }
++  if (env.BB_HOST_DAEMON_AUTO_UPDATE === "1") {
++    throw new Error("PATH carry fork refuses BB_HOST_DAEMON_AUTO_UPDATE=1.");
++  }
++  return {
++    ...env,
++    BB_DESKTOP_FORK: "1",
++    BB_HOST_DAEMON_AUTO_UPDATE: "0",
++  };
++}
+ 
+ type ManagedConfigValueKey = BbAppManagedConfigKey;
+ type ManagedConfigKey = "BB_SERVER_URL" | "serverUrl" | ManagedConfigValueKey;
+@@ -886,6 +909,11 @@ function createEnvFromOptions(
+     env.BB_DATA_DIR = args.options.dataDir;
+   }
+   if (args.options.autoUpdate === true) {
++    if (args.env[PATH_CARRY_FORK_ENV] === BB_PATH_CARRY_INSTANCE_ID) {
++      throw new Error(
++        "PATH carry fork rejects the --auto-update host-daemon option.",
++      );
++    }
+     env.BB_HOST_DAEMON_AUTO_UPDATE = "1";
+   }
+   if (args.options.hostDaemonPort !== undefined) {
+@@ -2575,7 +2603,7 @@ function resolveServerAppSurface(env: NodeJS.ProcessEnv): AppSurface {
+ }
+ 
+ export function createServerEnv(args: CreateServerEnvArgs): NodeJS.ProcessEnv {
+-  return {
++  return enforceForkSafetyEnv({
+     ...args.env,
+     BB_APP_VERSION: args.context.appVersion,
+     [APP_SURFACE_ENV_NAME]: resolveServerAppSurface(args.env),
+@@ -2595,14 +2623,14 @@ export function createServerEnv(args: CreateServerEnvArgs): NodeJS.ProcessEnv {
+     BB_HOST_DAEMON_PORT: String(args.context.daemonPort),
+     BB_SERVER_PORT: String(args.context.serverPort),
+     NODE_ENV: "production",
+-  };
++  });
+ }
+ 
+ export function createDaemonEnv(
+   context: BbAppStartContext,
+   autoJoinEnv: NodeJS.ProcessEnv,
+ ): NodeJS.ProcessEnv {
+-  return {
++  return enforceForkSafetyEnv({
+     ...stripThreadContextEnv(autoJoinEnv),
+     BB_APP_VERSION: context.appVersion,
+     BB_BRIDGE_DIR: context.daemonBundleDir,
+@@ -2611,7 +2639,7 @@ export function createDaemonEnv(
+     BB_HOST_DAEMON_PORT: String(context.daemonPort),
+     BB_SERVER_URL: context.serverUrl,
+     NODE_ENV: "production",
+-  };
++  });
+ }
+ 
+ function createCliEnv(args: CreateCliEnvArgs): NodeJS.ProcessEnv {
+@@ -2638,7 +2666,7 @@ function resolveHostDaemonServerUrl(
+ function createHostDaemonOnlyEnv(
+   args: CreateHostDaemonOnlyEnvArgs,
+ ): NodeJS.ProcessEnv {
+-  return {
++  return enforceForkSafetyEnv({
+     ...stripThreadContextEnv(args.env),
+     BB_APP_VERSION: args.context.appVersion,
+     BB_BRIDGE_DIR: args.context.daemonBundleDir,
+@@ -2647,7 +2675,7 @@ function createHostDaemonOnlyEnv(
+     BB_HOST_DAEMON_PORT: String(args.context.daemonPort),
+     BB_SERVER_URL: args.serverUrl,
+     NODE_ENV: "production",
+-  };
++  });
+ }
+ 
+ function resolveEnrollmentRequirements(
+diff --git a/packages/bb-app/test/index.test.ts b/packages/bb-app/test/index.test.ts
+index a3ffe16d6..17cb48832 100644
+--- a/packages/bb-app/test/index.test.ts
++++ b/packages/bb-app/test/index.test.ts
+@@ -2156,4 +2156,23 @@ describe("bb-app launcher", () => {
+     expect(webServerEnv.BB_APP_SURFACE).toBe("web");
+     expect(invalidSurfaceServerEnv.BB_APP_SURFACE).toBe("web");
+   });
++
++  it("forces host-daemon updates off in the PATH carry fork", () => {
++    const context = createTestStartContext();
++    const forkEnv = {
++      BB_FORK_INSTANCE: "path-carry-r11",
++      BB_FORK_PROTOCOL: "bb-path-carry",
++      BB_HOST_DAEMON_AUTO_UPDATE: "0",
++    };
++
++    expect(createDaemonEnv(context, forkEnv).BB_HOST_DAEMON_AUTO_UPDATE).toBe(
++      "0",
++    );
++    expect(() =>
++      createDaemonEnv(context, {
++        ...forkEnv,
++        BB_HOST_DAEMON_AUTO_UPDATE: "1",
++      }),
++    ).toThrow(/AUTO_UPDATE/u);
++  });
+ });
+diff --git a/packages/config/src/runtime.ts b/packages/config/src/runtime.ts
+index ff1b7bf88..2ccc04ced 100644
+--- a/packages/config/src/runtime.ts
++++ b/packages/config/src/runtime.ts
+@@ -82,6 +82,10 @@ const BB_PROD_DATA_DIR_NAME = ".bb";
+ const BB_DEV_DATA_ROOT_DIR = ".bb-dev";
+ export const BB_PROD_SERVER_PORT = 38886;
+ export const BB_PROD_HOST_DAEMON_PORT = 38887;
++export const BB_PATH_CARRY_INSTANCE_ID = "path-carry-r11";
++export const BB_PATH_CARRY_PROTOCOL = "bb-path-carry";
++export const BB_PATH_CARRY_SERVER_PORT = 39886;
++export const BB_PATH_CARRY_HOST_DAEMON_PORT = 39887;
+ export const BB_LOOPBACK_HOST = "127.0.0.1";
+ const BB_SQLITE_DATABASE_FILE_NAME = "bb.db";
+ 
+-- 
+2.52.0
+
