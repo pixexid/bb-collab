@@ -17198,6 +17198,42 @@ var historicalCorrectionSchema = external_exports.object({
     eventSeq: external_exports.number().int().positive()
   }).strict()).min(2).max(16)
 }).strict();
+var threadlessPreparedClosureSchema = external_exports.object({
+  correctionId: id,
+  dispatchMarker: id,
+  evidence: external_exports.tuple([
+    external_exports.object({
+      kind: external_exports.literal("preparation"),
+      eventSequence: external_exports.number().int().positive(),
+      reference: id,
+      digest: digestSchema
+    }).strict(),
+    external_exports.object({
+      kind: external_exports.literal("dispatch_refusal"),
+      reference: id,
+      digest: digestSchema
+    }).strict(),
+    external_exports.object({
+      kind: external_exports.literal("replay_conflict"),
+      reference: id,
+      requestDigest: digestSchema,
+      digest: digestSchema
+    }).strict(),
+    external_exports.object({
+      kind: external_exports.literal("terminalization_refusal"),
+      reference: id,
+      digest: digestSchema
+    }).strict(),
+    external_exports.object({
+      kind: external_exports.literal("zero_thread"),
+      reference: id,
+      activeCount: external_exports.number().int().nonnegative(),
+      archivedCount: external_exports.number().int().nonnegative(),
+      matchingCount: external_exports.literal(0),
+      digest: digestSchema
+    }).strict()
+  ])
+}).strict();
 var applyRequestSchema = external_exports.object({
   projectId: id,
   operationClass: external_exports.enum(CANONICAL_MUTATION_CLASSES),
@@ -17256,6 +17292,7 @@ var applyRequestSchema = external_exports.object({
   terminalReport: terminalReportSchema.optional(),
   interruption: interruptionEvidenceSchema.optional(),
   historicalCorrection: historicalCorrectionSchema.optional(),
+  threadlessPreparedClosure: threadlessPreparedClosureSchema.optional(),
   migration: migrationPrepareSchema.optional(),
   migrationStep: migrationStepSchema.optional()
 }).strict();
@@ -18029,7 +18066,8 @@ function normalizeRequest(request) {
     frozenBriefContent: request.frozenBriefContent ?? void 0,
     terminalReport: request.terminalReport ?? void 0,
     interruption: request.interruption ?? void 0,
-    historicalCorrection: request.historicalCorrection ?? void 0
+    historicalCorrection: request.historicalCorrection ?? void 0,
+    threadlessPreparedClosure: request.threadlessPreparedClosure ?? void 0
   };
 }
 function parseApplyRequest(input) {
@@ -21171,6 +21209,165 @@ function requireWorkItem(db, request, configRevision, expectedRevision = request
   }
   return row;
 }
+function applyThreadlessPreparedClosure(db, request, digest2) {
+  const closure = request.threadlessPreparedClosure;
+  if (!closure || request.lifecycleState !== "failed" || !request.executionAttemptId || request.workAttempt !== void 0 || request.workItemWait !== void 0 || request.workItemUnblock !== void 0 || request.workItemExternalEvent !== void 0) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure requires a failed lifecycle transition without a work attempt or wait");
+  }
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request, false);
+  const workItem = requireWorkItem(db, request, configRevision);
+  if (workItem.lifecycle_state !== "in_progress") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure requires an in-progress work item");
+  }
+  const attempt = requireAttemptForMutation(db, request, request.executionAttemptId);
+  if (attempt.work_item_id !== workItem.work_item_id || attempt.repo_target_id !== workItem.repo_target_id || attempt.config_revision !== configRevision || attempt.assignment_kind !== "write" || attempt.assignment_id !== null || attempt.assignment_digest !== null || attempt.dispatch_kind !== null || attempt.state !== "prepared" || attempt.thread_id !== null || attempt.reason_code !== closure.dispatchMarker) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure does not match the exact prepared writing attempt");
+  }
+  const nativeEvidence = [
+    "thread_id",
+    "provider_thread_id",
+    "native_request_id",
+    "request_event_id",
+    "request_event_seq",
+    "accepted_event_id",
+    "accepted_event_seq",
+    "first_action_event_id",
+    "first_action_event_seq",
+    "content_event_id",
+    "content_event_seq",
+    "completion_event_id",
+    "completion_event_seq",
+    "content_receipt_digest",
+    "native_receipt_digest",
+    "last_event_seq",
+    "terminal_event_id",
+    "terminal_event_seq",
+    "terminal_result",
+    "reported_outcome",
+    "terminal_report_digest",
+    "terminalization_class",
+    "terminal_report_json",
+    "terminal_actual_profile_digest",
+    "interruption_reason",
+    "interruption_event_id",
+    "interruption_event_seq",
+    "interruption_turn_id",
+    "interruption_evidence_digest",
+    "conflicting_terminal_digest",
+    "completed_at_ms"
+  ];
+  if (nativeEvidence.some((column) => attempt[column] !== null)) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure requires zero native request, content, and terminal evidence");
+  }
+  const [preparation, dispatchRefusal, replayConflict, terminalizationRefusal, zeroThread] = closure.evidence;
+  if (preparation.reference !== `state-event:${preparation.eventSequence}`) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure preparation evidence reference is not exact");
+  }
+  const preparationEvent = asRow(db.prepare(
+    `SELECT event_type, event_json, idempotency_key FROM state_events
+     WHERE project_id = ? AND event_sequence = ? AND aggregate_type = 'work_item' AND aggregate_id = ?`
+  ).get(request.projectId, preparation.eventSequence, workItem.work_item_id));
+  if (!preparationEvent || preparationEvent.event_type !== "work_item_transitioned" || sha256(preparationEvent.event_json) !== preparation.digest) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure preparation evidence is not the exact durable registration event");
+  }
+  let preparationPayload;
+  try {
+    preparationPayload = JSON.parse(preparationEvent.event_json);
+  } catch {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure preparation event is malformed");
+  }
+  if (preparationPayload.workItemId !== workItem.work_item_id || preparationPayload.executionAttemptId !== attempt.execution_attempt_id) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure preparation event binds another work item or attempt");
+  }
+  const originalReceipt = asRow(db.prepare(
+    "SELECT request_digest, committed_event_sequence, operation_class FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?"
+  ).get(request.projectId, preparationEvent.idempotency_key));
+  if (dispatchRefusal.reference !== `mutation:${preparationEvent.idempotency_key}` || !originalReceipt || originalReceipt.operation_class !== "work_item_transition" || originalReceipt.committed_event_sequence !== preparation.eventSequence) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure dispatch-refusal evidence is not the exact durable intent receipt");
+  }
+  const expectedDispatchRefusal = sha256(canonicalJson({
+    kind: "dispatch_refusal",
+    projectId: request.projectId,
+    workItemId: workItem.work_item_id,
+    executionAttemptId: attempt.execution_attempt_id,
+    idempotencyKey: preparationEvent.idempotency_key,
+    reasonCode: attempt.reason_code
+  }));
+  if (dispatchRefusal.digest !== expectedDispatchRefusal) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure dispatch-refusal evidence is not exact");
+  }
+  if (replayConflict.reference !== `replay:${preparationEvent.idempotency_key}` || replayConflict.requestDigest === originalReceipt.request_digest || replayConflict.digest !== sha256(canonicalJson({
+    kind: "replay_conflict",
+    projectId: request.projectId,
+    workItemId: workItem.work_item_id,
+    executionAttemptId: attempt.execution_attempt_id,
+    idempotencyKey: preparationEvent.idempotency_key,
+    requestDigest: replayConflict.requestDigest
+  }))) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure replay-conflict evidence is not exact");
+  }
+  if (terminalizationRefusal.reference !== "terminalization-refusal" || terminalizationRefusal.digest !== sha256(canonicalJson({
+    kind: "terminalization_refusal",
+    projectId: request.projectId,
+    workItemId: workItem.work_item_id,
+    executionAttemptId: attempt.execution_attempt_id,
+    message: "writing attempt terminalization requires a bound lane with native stop evidence"
+  }))) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure terminalization-refusal evidence is not exact");
+  }
+  if (zeroThread.reference !== "native-thread-inventory" || zeroThread.matchingCount !== 0) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure requires complete zero-thread inventory evidence");
+  }
+  const nextRevision = workItem.resource_revision + 1;
+  const completedAtMs = now();
+  const attemptUpdated = db.prepare(
+    `UPDATE execution_attempts
+     SET state = 'failed', observed_at_ms = ?, completed_at_ms = ?, lease_owner_thread_id = NULL,
+         progress_json = '{}', terminalization_class = 'threadless-prepared-closure',
+         reason_code = ?
+     WHERE project_id = ? AND execution_attempt_id = ? AND state = 'prepared' AND thread_id IS NULL AND assignment_id IS NULL`
+  ).run(completedAtMs, completedAtMs, `threadless-prepared-closure:${closure.correctionId}`, request.projectId, attempt.execution_attempt_id);
+  if (attemptUpdated.changes !== 1) throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared attempt changed before closure");
+  const workItemUpdated = db.prepare(
+    `UPDATE work_items SET lifecycle_state = 'failed', resource_revision = ?, updated_at_ms = ?
+     WHERE project_id = ? AND work_item_id = ? AND lifecycle_state = 'in_progress' AND resource_revision = ?`
+  ).run(nextRevision, completedAtMs, request.projectId, workItem.work_item_id, workItem.resource_revision);
+  if (workItemUpdated.changes !== 1) throw refusal("WORK_ITEM_REVISION_STALE", "work item compare-and-swap failed during thread-less closure", {
+    currentResourceRevision: workItem.resource_revision,
+    expectedResourceRevision: request.expectedResourceRevision ?? void 0
+  });
+  const evidence = closure.evidence;
+  return commitMutation(
+    db,
+    request,
+    digest2,
+    actorReceiptId,
+    {
+      aggregateType: "work_item",
+      aggregateId: workItem.work_item_id,
+      aggregateRevision: nextRevision,
+      eventType: "work_item_threadless_prepared_closure",
+      event: {
+        workItemId: workItem.work_item_id,
+        executionAttemptId: attempt.execution_attempt_id,
+        from: "in_progress",
+        to: "failed",
+        correction: { ...closure, evidence }
+      }
+    },
+    { expected: 1, attempted: 1, verified: 1 },
+    {
+      currentConfigRevision: configRevision,
+      currentGovernanceEpoch: governor.governance_epoch,
+      currentResourceRevision: nextRevision,
+      expectedResourceRevision: request.expectedResourceRevision ?? void 0,
+      evidence: { workItemId: workItem.work_item_id, executionAttemptId: attempt.execution_attempt_id, correction: closure }
+    }
+  );
+}
 function applyWorkItemCreate(db, request, digest2) {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
@@ -21368,6 +21565,7 @@ function recordedGithubCloseObservation(db, projectId, workItemId, resourceRevis
   return parsed.data.externalEvent;
 }
 function applyWorkItemTransition(db, request, digest2, githubObservation) {
+  if (request.threadlessPreparedClosure !== void 0) return applyThreadlessPreparedClosure(db, request, digest2);
   const committedDispatchIntent = request.reasonCode === "dispatch_intent_finalize" && request.lifecycleState === void 0 && request.workAttempt?.threadId !== void 0;
   let configRevision;
   if (committedDispatchIntent) {
@@ -25371,6 +25569,13 @@ var dispatchLaneInputSchema = external_exports.object({
   request: applyRequestSchema,
   spawn: external_exports.record(external_exports.string(), external_exports.unknown())
 }).strict();
+var threadlessPreparedClosureInputSchema = external_exports.object({
+  request: applyRequestSchema,
+  correctionId: external_exports.string().trim().min(1).max(256),
+  dispatchMarker: external_exports.string().trim().min(1).max(256),
+  dispatchIntentIdempotencyKey: external_exports.string().trim().min(1).max(256),
+  replayRequestDigest: external_exports.string().regex(/^[0-9a-f]{64}$/u)
+}).strict();
 var dispatchEnvironmentSchema = external_exports.union([
   external_exports.object({ type: external_exports.literal("project-default") }).strict(),
   external_exports.object({ type: external_exports.literal("reuse"), environmentId: external_exports.string().trim().min(1) }).strict(),
@@ -25469,6 +25674,10 @@ var rpcContract = defineRpcContract({
   },
   dispatchLane: {
     input: dispatchLaneInputSchema,
+    output: foundationResultSchema
+  },
+  closeThreadlessPreparedAttempt: {
+    input: threadlessPreparedClosureInputSchema,
     output: foundationResultSchema
   },
   cachedConsumerRollout: {
@@ -25899,6 +26108,117 @@ async function dispatchThreadInventory(bb, projectId) {
     ids.add(thread.id);
   }
   return threads;
+}
+async function closeThreadlessPreparedAttempt(bb, db, input) {
+  const parsed = threadlessPreparedClosureInputSchema.safeParse(input);
+  if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "threadless-prepared-closure", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
+  const { request, correctionId, dispatchMarker, dispatchIntentIdempotencyKey, replayRequestDigest } = parsed.data;
+  if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
+  const existing = db.prepare(
+    "SELECT request_digest, outcome_json, committed_event_sequence, operation_class FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?"
+  ).get(request.projectId, request.idempotencyKey);
+  if (existing?.operation_class === "work_item_transition") {
+    const event = db.prepare(
+      "SELECT event_type, event_json FROM state_events WHERE project_id = ? AND event_sequence = ?"
+    ).get(request.projectId, existing.committed_event_sequence);
+    try {
+      const payload = event ? JSON.parse(event.event_json) : null;
+      const replayRequest = parseApplyRequest({
+        ...request,
+        lifecycleState: "failed",
+        reasonCode: "threadless-prepared-closure",
+        threadlessPreparedClosure: payload?.correction
+      });
+      if (event?.event_type === "work_item_threadless_prepared_closure" && mutationRequestDigest(replayRequest) === existing.request_digest) {
+        const replay = JSON.parse(existing.outcome_json);
+        Object.defineProperty(replay, "replay", { value: true });
+        return replay;
+      }
+    } catch {
+    }
+  }
+  if (request.operationClass !== "work_item_transition" || request.lifecycleState !== void 0 || request.threadlessPreparedClosure !== void 0 || request.workAttempt !== void 0 || request.workItemWait !== void 0 || request.workItemUnblock !== void 0 || request.workItemExternalEvent !== void 0 || !request.workItemId || !request.executionAttemptId) {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less prepared closure requires one exact work item and execution attempt without ordinary transition fields" };
+  }
+  const attempt = db.prepare(
+    "SELECT reason_code FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ? AND work_item_id = ?"
+  ).get(request.projectId, request.executionAttemptId, request.workItemId);
+  if (!attempt || attempt.reason_code !== dispatchMarker) {
+    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure marker does not match the exact canonical attempt" };
+  }
+  const preparationRows = db.prepare(
+    `SELECT event_sequence, event_json, idempotency_key
+     FROM state_events
+     WHERE project_id = ? AND aggregate_type = 'work_item' AND aggregate_id = ?
+       AND event_type = 'work_item_transitioned'
+       AND json_extract(event_json, '$.executionAttemptId') = ?
+     ORDER BY event_sequence`
+  ).all(request.projectId, request.workItemId, request.executionAttemptId);
+  if (preparationRows.length !== 1 || preparationRows[0].idempotency_key !== dispatchIntentIdempotencyKey) {
+    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure requires one exact durable dispatch preparation and intent receipt" };
+  }
+  const preparation = preparationRows[0];
+  const originalReceipt = db.prepare(
+    "SELECT request_digest, committed_event_sequence FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?"
+  ).get(request.projectId, dispatchIntentIdempotencyKey);
+  if (!originalReceipt || originalReceipt.committed_event_sequence !== preparation.event_sequence || originalReceipt.request_digest === replayRequestDigest) {
+    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure requires a distinct recorded replay-conflict digest" };
+  }
+  let threads;
+  try {
+    threads = await dispatchThreadInventory(bb, request.projectId);
+  } catch (error48) {
+    return dispatchRecoveryRefusal(request.projectId, `complete active and archived native inventory is unavailable: ${String(error48)}`);
+  }
+  const matching = threads.filter((thread) => thread.title?.includes(dispatchMarker) === true);
+  if (matching.length !== 0) {
+    return dispatchRecoveryRefusal(request.projectId, "native inventory contains a possible child for the recorded dispatch marker", {
+      matches: matching.map((thread) => ({ id: thread.id, projectId: thread.projectId, parentThreadId: thread.parentThreadId, title: thread.title, archivedAt: thread.archivedAt, deletedAt: thread.deletedAt }))
+    });
+  }
+  const active = threads.filter((thread) => thread.archivedAt === null).map((thread) => ({ id: thread.id, projectId: thread.projectId, parentThreadId: thread.parentThreadId, title: thread.title, status: thread.status, archivedAt: thread.archivedAt, deletedAt: thread.deletedAt }));
+  const archived = threads.filter((thread) => thread.archivedAt !== null).map((thread) => ({ id: thread.id, projectId: thread.projectId, parentThreadId: thread.parentThreadId, title: thread.title, status: thread.status, archivedAt: thread.archivedAt, deletedAt: thread.deletedAt }));
+  const inventoryDigest = sha256(canonicalJson({ projectId: request.projectId, executionAttemptId: request.executionAttemptId, dispatchMarker, active, archived }));
+  const dispatchEvidence = {
+    kind: "dispatch_refusal",
+    projectId: request.projectId,
+    workItemId: request.workItemId,
+    executionAttemptId: request.executionAttemptId,
+    idempotencyKey: dispatchIntentIdempotencyKey,
+    reasonCode: dispatchMarker
+  };
+  const replayEvidence = {
+    kind: "replay_conflict",
+    projectId: request.projectId,
+    workItemId: request.workItemId,
+    executionAttemptId: request.executionAttemptId,
+    idempotencyKey: dispatchIntentIdempotencyKey,
+    requestDigest: replayRequestDigest
+  };
+  const terminalizationEvidence = {
+    kind: "terminalization_refusal",
+    projectId: request.projectId,
+    workItemId: request.workItemId,
+    executionAttemptId: request.executionAttemptId,
+    message: "writing attempt terminalization requires a bound lane with native stop evidence"
+  };
+  const closureRequest = {
+    ...request,
+    lifecycleState: "failed",
+    reasonCode: "threadless-prepared-closure",
+    threadlessPreparedClosure: {
+      correctionId,
+      dispatchMarker,
+      evidence: [
+        { kind: "preparation", eventSequence: preparation.event_sequence, reference: `state-event:${preparation.event_sequence}`, digest: sha256(preparation.event_json) },
+        { kind: "dispatch_refusal", reference: `mutation:${dispatchIntentIdempotencyKey}`, digest: sha256(canonicalJson(dispatchEvidence)) },
+        { kind: "replay_conflict", reference: `replay:${dispatchIntentIdempotencyKey}`, requestDigest: replayRequestDigest, digest: sha256(canonicalJson(replayEvidence)) },
+        { kind: "terminalization_refusal", reference: "terminalization-refusal", digest: sha256(canonicalJson(terminalizationEvidence)) },
+        { kind: "zero_thread", reference: "native-thread-inventory", activeCount: active.length, archivedCount: archived.length, matchingCount: 0, digest: inventoryDigest }
+      ]
+    }
+  };
+  return applyLiveAuthorizedMutation(bb, db, closureRequest);
 }
 function dispatchRecoveryRefusal(projectId, message, evidence) {
   return {
@@ -26341,7 +26661,7 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
     const authorized = applyAuthorizedMutation(db, input, githubAdapter, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, null, true);
     if (authorized.outcome !== "OK" || authorized.replay) return authorized;
   }
-  if (parsed.success) {
+  if (parsed.success && parsed.data.threadlessPreparedClosure === void 0) {
     const laneGuard = await prepareWorkItemAttemptTerminalization(bb, db, parsed.data, terminalizationPolicy);
     if (laneGuard) return laneGuard;
   }
@@ -26377,7 +26697,7 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
 }
 async function applyLiveAuthorizedMutationAsync(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = readGithubIssueForBackfill, githubAdapter = null) {
   const parsed = applyRequestSchema.safeParse(input);
-  if (parsed.success) {
+  if (parsed.success && parsed.data.threadlessPreparedClosure === void 0) {
     const laneGuard = await prepareWorkItemAttemptTerminalization(bb, db, parsed.data, terminalizationPolicy);
     if (laneGuard) return laneGuard;
   }
@@ -29510,6 +29830,9 @@ ${thread.titleFallback ?? ""}`);
     async dispatchLane(input) {
       return dispatchLane(bb, db, input);
     },
+    async closeThreadlessPreparedAttempt(input) {
+      return closeThreadlessPreparedAttempt(bb, db, input);
+    },
     async cachedConsumerRollout(input) {
       return applyLiveCachedConsumerRollout(bb, db, input, cliDeps);
     },
@@ -29540,6 +29863,16 @@ ${thread.titleFallback ?? ""}`);
     }
   });
   bb.agents.registerTool({
+    name: "close_threadless_prepared_attempt",
+    description: "Close one exact prepared writing attempt only after complete zero-thread evidence.",
+    instructions: "Use only for a prepared work-item writing attempt with no native thread or native evidence. This path never spawns or retries.",
+    parameters: threadlessPreparedClosureInputSchema,
+    async execute(input, context) {
+      if (input.request.projectId !== context.projectId) throw new Error("request projectId must exactly match the current thread project");
+      return JSON.stringify(await closeThreadlessPreparedAttempt(bb, db, input));
+    }
+  });
+  bb.agents.registerTool({
     name: "send_to_operator",
     description: "Send a durable project-scoped message to the operator or supervisor without a model relay.",
     instructions: "Use this for actionable content directed to an external non-bb party. project_id must be the current thread's exact registered project.",
@@ -29549,7 +29882,7 @@ ${thread.titleFallback ?? ""}`);
       return JSON.stringify(await sendOperatorMessage(db, bb, input, context.threadId, notifyUrgent));
     }
   });
-  bb.agents.configure(() => ({ tools: ["dispatch_lane", "send_to_operator"], skills: [] }));
+  bb.agents.configure(() => ({ tools: ["dispatch_lane", "close_threadless_prepared_attempt", "send_to_operator"], skills: [] }));
   bb.cli.register({
     name: "collab",
     summary: "Inspect the bb-collab foundation and guarded conformance boundary",

@@ -954,6 +954,13 @@ const dispatchLaneInputSchema = z.object({
   request: applyRequestSchema,
   spawn: z.record(z.string(), z.unknown()),
 }).strict();
+const threadlessPreparedClosureInputSchema = z.object({
+  request: applyRequestSchema,
+  correctionId: z.string().trim().min(1).max(256),
+  dispatchMarker: z.string().trim().min(1).max(256),
+  dispatchIntentIdempotencyKey: z.string().trim().min(1).max(256),
+  replayRequestDigest: z.string().regex(/^[0-9a-f]{64}$/u),
+}).strict();
 const dispatchEnvironmentSchema = z.union([
   z.object({ type: z.literal("project-default") }).strict(),
   z.object({ type: z.literal("reuse"), environmentId: z.string().trim().min(1) }).strict(),
@@ -1053,6 +1060,10 @@ export const rpcContract = defineRpcContract({
   },
   dispatchLane: {
     input: dispatchLaneInputSchema,
+    output: foundationResultSchema,
+  },
+  closeThreadlessPreparedAttempt: {
+    input: threadlessPreparedClosureInputSchema,
     output: foundationResultSchema,
   },
   cachedConsumerRollout: {
@@ -1547,6 +1558,133 @@ async function dispatchThreadInventory(bb: BbPluginApi, projectId: string): Prom
     ids.add(thread.id);
   }
   return threads;
+}
+
+async function closeThreadlessPreparedAttempt(
+  bb: BbPluginApi,
+  db: SqliteDatabase | null,
+  input: unknown,
+): Promise<FoundationResult> {
+  const parsed = threadlessPreparedClosureInputSchema.safeParse(input);
+  if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "threadless-prepared-closure", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
+  const { request, correctionId, dispatchMarker, dispatchIntentIdempotencyKey, replayRequestDigest } = parsed.data;
+  if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
+  const existing = db.prepare(
+    "SELECT request_digest, outcome_json, committed_event_sequence, operation_class FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?",
+  ).get(request.projectId, request.idempotencyKey) as { request_digest: string; outcome_json: string; committed_event_sequence: number; operation_class: string } | undefined;
+  if (existing?.operation_class === "work_item_transition") {
+    const event = db.prepare(
+      "SELECT event_type, event_json FROM state_events WHERE project_id = ? AND event_sequence = ?",
+    ).get(request.projectId, existing.committed_event_sequence) as { event_type: string; event_json: string } | undefined;
+    try {
+      const payload = event ? JSON.parse(event.event_json) as { correction?: unknown } : null;
+      const replayRequest = parseApplyRequest({
+        ...request,
+        lifecycleState: "failed",
+        reasonCode: "threadless-prepared-closure",
+        threadlessPreparedClosure: payload?.correction,
+      });
+      if (event?.event_type === "work_item_threadless_prepared_closure" && mutationRequestDigest(replayRequest) === existing.request_digest) {
+        const replay = JSON.parse(existing.outcome_json) as FoundationResult;
+        Object.defineProperty(replay, "replay", { value: true });
+        return replay;
+      }
+    } catch {
+      // Fall through to the normal exact-identity refusal.
+    }
+  }
+  if (
+    request.operationClass !== "work_item_transition" ||
+    request.lifecycleState !== undefined ||
+    request.threadlessPreparedClosure !== undefined ||
+    request.workAttempt !== undefined ||
+    request.workItemWait !== undefined ||
+    request.workItemUnblock !== undefined ||
+    request.workItemExternalEvent !== undefined ||
+    !request.workItemId ||
+    !request.executionAttemptId
+  ) {
+    return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less prepared closure requires one exact work item and execution attempt without ordinary transition fields" };
+  }
+  const attempt = db.prepare(
+    "SELECT reason_code FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ? AND work_item_id = ?",
+  ).get(request.projectId, request.executionAttemptId, request.workItemId) as { reason_code: string | null } | undefined;
+  if (!attempt || attempt.reason_code !== dispatchMarker) {
+    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure marker does not match the exact canonical attempt" };
+  }
+  const preparationRows = db.prepare(
+    `SELECT event_sequence, event_json, idempotency_key
+     FROM state_events
+     WHERE project_id = ? AND aggregate_type = 'work_item' AND aggregate_id = ?
+       AND event_type = 'work_item_transitioned'
+       AND json_extract(event_json, '$.executionAttemptId') = ?
+     ORDER BY event_sequence`,
+  ).all(request.projectId, request.workItemId, request.executionAttemptId) as Array<{ event_sequence: number; event_json: string; idempotency_key: string }>;
+  if (preparationRows.length !== 1 || preparationRows[0]!.idempotency_key !== dispatchIntentIdempotencyKey) {
+    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure requires one exact durable dispatch preparation and intent receipt" };
+  }
+  const preparation = preparationRows[0]!;
+  const originalReceipt = db.prepare(
+    "SELECT request_digest, committed_event_sequence FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?",
+  ).get(request.projectId, dispatchIntentIdempotencyKey) as { request_digest: string; committed_event_sequence: number } | undefined;
+  if (!originalReceipt || originalReceipt.committed_event_sequence !== preparation.event_sequence || originalReceipt.request_digest === replayRequestDigest) {
+    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure requires a distinct recorded replay-conflict digest" };
+  }
+  let threads: DispatchThread[];
+  try {
+    threads = await dispatchThreadInventory(bb, request.projectId);
+  } catch (error) {
+    return dispatchRecoveryRefusal(request.projectId, `complete active and archived native inventory is unavailable: ${String(error)}`);
+  }
+  const matching = threads.filter((thread) => thread.title?.includes(dispatchMarker) === true);
+  if (matching.length !== 0) {
+    return dispatchRecoveryRefusal(request.projectId, "native inventory contains a possible child for the recorded dispatch marker", {
+      matches: matching.map((thread) => ({ id: thread.id, projectId: thread.projectId, parentThreadId: thread.parentThreadId, title: thread.title, archivedAt: thread.archivedAt, deletedAt: thread.deletedAt })),
+    });
+  }
+  const active = threads.filter((thread) => thread.archivedAt === null).map((thread) => ({ id: thread.id, projectId: thread.projectId, parentThreadId: thread.parentThreadId, title: thread.title, status: thread.status, archivedAt: thread.archivedAt, deletedAt: thread.deletedAt }));
+  const archived = threads.filter((thread) => thread.archivedAt !== null).map((thread) => ({ id: thread.id, projectId: thread.projectId, parentThreadId: thread.parentThreadId, title: thread.title, status: thread.status, archivedAt: thread.archivedAt, deletedAt: thread.deletedAt }));
+  const inventoryDigest = sha256(canonicalJson({ projectId: request.projectId, executionAttemptId: request.executionAttemptId, dispatchMarker, active, archived }));
+  const dispatchEvidence = {
+    kind: "dispatch_refusal" as const,
+    projectId: request.projectId,
+    workItemId: request.workItemId,
+    executionAttemptId: request.executionAttemptId,
+    idempotencyKey: dispatchIntentIdempotencyKey,
+    reasonCode: dispatchMarker,
+  };
+  const replayEvidence = {
+    kind: "replay_conflict" as const,
+    projectId: request.projectId,
+    workItemId: request.workItemId,
+    executionAttemptId: request.executionAttemptId,
+    idempotencyKey: dispatchIntentIdempotencyKey,
+    requestDigest: replayRequestDigest,
+  };
+  const terminalizationEvidence = {
+    kind: "terminalization_refusal" as const,
+    projectId: request.projectId,
+    workItemId: request.workItemId,
+    executionAttemptId: request.executionAttemptId,
+    message: "writing attempt terminalization requires a bound lane with native stop evidence",
+  };
+  const closureRequest: ApplyRequest = {
+    ...request,
+    lifecycleState: "failed",
+    reasonCode: "threadless-prepared-closure",
+    threadlessPreparedClosure: {
+      correctionId,
+      dispatchMarker,
+      evidence: [
+        { kind: "preparation", eventSequence: preparation.event_sequence, reference: `state-event:${preparation.event_sequence}`, digest: sha256(preparation.event_json) },
+        { kind: "dispatch_refusal", reference: `mutation:${dispatchIntentIdempotencyKey}`, digest: sha256(canonicalJson(dispatchEvidence)) },
+        { kind: "replay_conflict", reference: `replay:${dispatchIntentIdempotencyKey}`, requestDigest: replayRequestDigest, digest: sha256(canonicalJson(replayEvidence)) },
+        { kind: "terminalization_refusal", reference: "terminalization-refusal", digest: sha256(canonicalJson(terminalizationEvidence)) },
+        { kind: "zero_thread", reference: "native-thread-inventory", activeCount: active.length, archivedCount: archived.length, matchingCount: 0, digest: inventoryDigest },
+      ],
+    },
+  };
+  return applyLiveAuthorizedMutation(bb, db, closureRequest);
 }
 
 function dispatchRecoveryRefusal(projectId: string, message: string, evidence?: unknown): FoundationResult {
@@ -2093,7 +2231,7 @@ async function applyLiveAuthorizedMutation(
     const authorized = applyAuthorizedMutation(db, input, githubAdapter, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, null, true);
     if (authorized.outcome !== "OK" || authorized.replay) return authorized;
   }
-  if (parsed.success) {
+  if (parsed.success && parsed.data.threadlessPreparedClosure === undefined) {
     const laneGuard = await prepareWorkItemAttemptTerminalization(bb, db, parsed.data, terminalizationPolicy);
     if (laneGuard) return laneGuard;
   }
@@ -2139,7 +2277,7 @@ async function applyLiveAuthorizedMutationAsync(
   githubAdapter: GitHubIssueAdapter | null = null,
 ): Promise<FoundationResult> {
   const parsed = applyRequestSchema.safeParse(input);
-  if (parsed.success) {
+  if (parsed.success && parsed.data.threadlessPreparedClosure === undefined) {
     const laneGuard = await prepareWorkItemAttemptTerminalization(bb, db, parsed.data, terminalizationPolicy);
     if (laneGuard) return laneGuard;
   }
@@ -5646,6 +5784,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     async dispatchLane(input) {
       return dispatchLane(bb, db, input);
     },
+    async closeThreadlessPreparedAttempt(input) {
+      return closeThreadlessPreparedAttempt(bb, db, input);
+    },
     async cachedConsumerRollout(input) {
       return applyLiveCachedConsumerRollout(bb, db, input, cliDeps);
     },
@@ -5677,6 +5818,16 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     },
   });
   bb.agents.registerTool({
+    name: "close_threadless_prepared_attempt",
+    description: "Close one exact prepared writing attempt only after complete zero-thread evidence.",
+    instructions: "Use only for a prepared work-item writing attempt with no native thread or native evidence. This path never spawns or retries.",
+    parameters: threadlessPreparedClosureInputSchema,
+    async execute(input, context) {
+      if (input.request.projectId !== context.projectId) throw new Error("request projectId must exactly match the current thread project");
+      return JSON.stringify(await closeThreadlessPreparedAttempt(bb, db, input));
+    },
+  });
+  bb.agents.registerTool({
     name: "send_to_operator",
     description: "Send a durable project-scoped message to the operator or supervisor without a model relay.",
     instructions: "Use this for actionable content directed to an external non-bb party. project_id must be the current thread's exact registered project.",
@@ -5686,7 +5837,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return JSON.stringify(await sendOperatorMessage(db, bb, input, context.threadId, notifyUrgent));
     },
   });
-  bb.agents.configure(() => ({ tools: ["dispatch_lane", "send_to_operator"], skills: [] }));
+  bb.agents.configure(() => ({ tools: ["dispatch_lane", "close_threadless_prepared_attempt", "send_to_operator"], skills: [] }));
 
   bb.cli.register({
     name: "collab",
