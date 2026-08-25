@@ -957,7 +957,6 @@ const dispatchLaneInputSchema = z.object({
 const threadlessPreparedClosureInputSchema = z.object({
   request: applyRequestSchema,
   correctionId: z.string().trim().min(1).max(256),
-  dispatchMarker: z.string().trim().min(1).max(256),
   dispatchIntentIdempotencyKey: z.string().trim().min(1).max(256),
   replayRequestDigest: z.string().regex(/^[0-9a-f]{64}$/u),
 }).strict();
@@ -1560,6 +1559,33 @@ async function dispatchThreadInventory(bb: BbPluginApi, projectId: string): Prom
   return threads;
 }
 
+function hasExactDispatchMarker(title: string | null, marker: string): boolean {
+  if (title === null) return false;
+  for (let index = title.indexOf(marker); index >= 0; index = title.indexOf(marker, index + 1)) {
+    const before = index === 0 ? " " : title[index - 1];
+    const afterIndex = index + marker.length;
+    const after = afterIndex === title.length ? " " : title[afterIndex];
+    if (before === " " && after === " ") return true;
+  }
+  return false;
+}
+
+function dispatchInventoryEvidence(
+  threads: DispatchThread[],
+  projectId: string,
+  executionAttemptId: string,
+  dispatchMarker: string,
+) {
+  const active = threads.filter((thread) => thread.archivedAt === null).map((thread) => ({ id: thread.id, projectId: thread.projectId, parentThreadId: thread.parentThreadId, title: thread.title, status: thread.status, archivedAt: thread.archivedAt, deletedAt: thread.deletedAt }));
+  const archived = threads.filter((thread) => thread.archivedAt !== null).map((thread) => ({ id: thread.id, projectId: thread.projectId, parentThreadId: thread.parentThreadId, title: thread.title, status: thread.status, archivedAt: thread.archivedAt, deletedAt: thread.deletedAt }));
+  return {
+    active,
+    archived,
+    matching: threads.filter((thread) => hasExactDispatchMarker(thread.title, dispatchMarker)),
+    digest: sha256(canonicalJson({ projectId, executionAttemptId, dispatchMarker, active, archived })),
+  };
+}
+
 async function closeThreadlessPreparedAttempt(
   bb: BbPluginApi,
   db: SqliteDatabase | null,
@@ -1567,7 +1593,7 @@ async function closeThreadlessPreparedAttempt(
 ): Promise<FoundationResult> {
   const parsed = threadlessPreparedClosureInputSchema.safeParse(input);
   if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "threadless-prepared-closure", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
-  const { request, correctionId, dispatchMarker, dispatchIntentIdempotencyKey, replayRequestDigest } = parsed.data;
+  const { request, correctionId, dispatchIntentIdempotencyKey, replayRequestDigest } = parsed.data;
   if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
   const existing = db.prepare(
     "SELECT request_digest, outcome_json, committed_event_sequence, operation_class FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?",
@@ -1609,9 +1635,11 @@ async function closeThreadlessPreparedAttempt(
   const attempt = db.prepare(
     "SELECT reason_code FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ? AND work_item_id = ?",
   ).get(request.projectId, request.executionAttemptId, request.workItemId) as { reason_code: string | null } | undefined;
-  if (!attempt || attempt.reason_code !== dispatchMarker) {
+  const dispatchIntent = parseWorkItemDispatchIntent(attempt?.reason_code ?? null);
+  if (!dispatchIntent || dispatchIntent.idempotencyKey !== dispatchIntentIdempotencyKey) {
     return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure marker does not match the exact canonical attempt" };
   }
+  const dispatchMarker = `[dispatch:${dispatchIntent.idempotencyKey}]`;
   const preparationRows = db.prepare(
     `SELECT event_sequence, event_json, idempotency_key
      FROM state_events
@@ -1630,61 +1658,74 @@ async function closeThreadlessPreparedAttempt(
   if (!originalReceipt || originalReceipt.committed_event_sequence !== preparation.event_sequence || originalReceipt.request_digest === replayRequestDigest) {
     return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure requires a distinct recorded replay-conflict digest" };
   }
-  let threads: DispatchThread[];
-  try {
-    threads = await dispatchThreadInventory(bb, request.projectId);
-  } catch (error) {
-    return dispatchRecoveryRefusal(request.projectId, `complete active and archived native inventory is unavailable: ${String(error)}`);
-  }
-  const matching = threads.filter((thread) => thread.title?.includes(dispatchMarker) === true);
-  if (matching.length !== 0) {
-    return dispatchRecoveryRefusal(request.projectId, "native inventory contains a possible child for the recorded dispatch marker", {
-      matches: matching.map((thread) => ({ id: thread.id, projectId: thread.projectId, parentThreadId: thread.parentThreadId, title: thread.title, archivedAt: thread.archivedAt, deletedAt: thread.deletedAt })),
-    });
-  }
-  const active = threads.filter((thread) => thread.archivedAt === null).map((thread) => ({ id: thread.id, projectId: thread.projectId, parentThreadId: thread.parentThreadId, title: thread.title, status: thread.status, archivedAt: thread.archivedAt, deletedAt: thread.deletedAt }));
-  const archived = threads.filter((thread) => thread.archivedAt !== null).map((thread) => ({ id: thread.id, projectId: thread.projectId, parentThreadId: thread.parentThreadId, title: thread.title, status: thread.status, archivedAt: thread.archivedAt, deletedAt: thread.deletedAt }));
-  const inventoryDigest = sha256(canonicalJson({ projectId: request.projectId, executionAttemptId: request.executionAttemptId, dispatchMarker, active, archived }));
-  const dispatchEvidence = {
-    kind: "dispatch_refusal" as const,
-    projectId: request.projectId,
-    workItemId: request.workItemId,
-    executionAttemptId: request.executionAttemptId,
-    idempotencyKey: dispatchIntentIdempotencyKey,
-    reasonCode: dispatchMarker,
-  };
-  const replayEvidence = {
-    kind: "replay_conflict" as const,
-    projectId: request.projectId,
-    workItemId: request.workItemId,
-    executionAttemptId: request.executionAttemptId,
-    idempotencyKey: dispatchIntentIdempotencyKey,
-    requestDigest: replayRequestDigest,
-  };
-  const terminalizationEvidence = {
-    kind: "terminalization_refusal" as const,
-    projectId: request.projectId,
-    workItemId: request.workItemId,
-    executionAttemptId: request.executionAttemptId,
-    message: "writing attempt terminalization requires a bound lane with native stop evidence",
-  };
-  const closureRequest: ApplyRequest = {
-    ...request,
-    lifecycleState: "failed",
-    reasonCode: "threadless-prepared-closure",
-    threadlessPreparedClosure: {
-      correctionId,
-      dispatchMarker,
-      evidence: [
-        { kind: "preparation", eventSequence: preparation.event_sequence, reference: `state-event:${preparation.event_sequence}`, digest: sha256(preparation.event_json) },
-        { kind: "dispatch_refusal", reference: `mutation:${dispatchIntentIdempotencyKey}`, digest: sha256(canonicalJson(dispatchEvidence)) },
-        { kind: "replay_conflict", reference: `replay:${dispatchIntentIdempotencyKey}`, requestDigest: replayRequestDigest, digest: sha256(canonicalJson(replayEvidence)) },
-        { kind: "terminalization_refusal", reference: "terminalization-refusal", digest: sha256(canonicalJson(terminalizationEvidence)) },
-        { kind: "zero_thread", reference: "native-thread-inventory", activeCount: active.length, archivedCount: archived.length, matchingCount: 0, digest: inventoryDigest },
-      ],
-    },
-  };
-  return applyLiveAuthorizedMutation(bb, db, closureRequest);
+  return serializeDispatchRecovery(request, async () => {
+    let threads: DispatchThread[];
+    try {
+      threads = await dispatchThreadInventory(bb, request.projectId);
+    } catch (error) {
+      return dispatchRecoveryRefusal(request.projectId, `complete active and archived native inventory is unavailable: ${String(error)}`);
+    }
+    const inventory = dispatchInventoryEvidence(threads, request.projectId, request.executionAttemptId!, dispatchMarker);
+    if (inventory.matching.length !== 0) {
+      return dispatchRecoveryRefusal(request.projectId, "native inventory contains a possible child for the recorded dispatch marker", {
+        matches: inventory.matching.map((thread) => ({ id: thread.id, projectId: thread.projectId, parentThreadId: thread.parentThreadId, title: thread.title, archivedAt: thread.archivedAt, deletedAt: thread.deletedAt })),
+      });
+    }
+    const preMutationGuard: PreMutationGuard = async () => {
+      try {
+        const reread = dispatchInventoryEvidence(await dispatchThreadInventory(bb, request.projectId), request.projectId, request.executionAttemptId!, dispatchMarker);
+        if (reread.digest === inventory.digest && reread.matching.length === 0) return null;
+        return dispatchRecoveryRefusal(request.projectId, "native dispatch inventory changed before thread-less closure mutation", {
+          initialDigest: inventory.digest,
+          rereadDigest: reread.digest,
+          matching: reread.matching.map((thread) => ({ id: thread.id, projectId: thread.projectId, parentThreadId: thread.parentThreadId, title: thread.title, archivedAt: thread.archivedAt, deletedAt: thread.deletedAt })),
+        });
+      } catch (error) {
+        return dispatchRecoveryRefusal(request.projectId, `complete active and archived native inventory reread is unavailable: ${String(error)}`);
+      }
+    };
+    const inventoryDigest = inventory.digest;
+    const dispatchEvidence = {
+      kind: "dispatch_refusal" as const,
+      projectId: request.projectId,
+      workItemId: request.workItemId,
+      executionAttemptId: request.executionAttemptId,
+      idempotencyKey: dispatchIntentIdempotencyKey,
+      reasonCode: attempt.reason_code,
+    };
+    const replayEvidence = {
+      kind: "replay_conflict" as const,
+      projectId: request.projectId,
+      workItemId: request.workItemId,
+      executionAttemptId: request.executionAttemptId,
+      idempotencyKey: dispatchIntentIdempotencyKey,
+      requestDigest: replayRequestDigest,
+    };
+    const terminalizationEvidence = {
+      kind: "terminalization_refusal" as const,
+      projectId: request.projectId,
+      workItemId: request.workItemId,
+      executionAttemptId: request.executionAttemptId,
+      message: "writing attempt terminalization requires a bound lane with native stop evidence",
+    };
+    const closureRequest: ApplyRequest = {
+      ...request,
+      lifecycleState: "failed",
+      reasonCode: "threadless-prepared-closure",
+      threadlessPreparedClosure: {
+        correctionId,
+        dispatchMarker,
+        evidence: [
+          { kind: "preparation", eventSequence: preparation.event_sequence, reference: `state-event:${preparation.event_sequence}`, digest: sha256(preparation.event_json) },
+          { kind: "dispatch_refusal", reference: `mutation:${dispatchIntentIdempotencyKey}`, digest: sha256(canonicalJson(dispatchEvidence)) },
+          { kind: "replay_conflict", reference: `replay:${dispatchIntentIdempotencyKey}`, requestDigest: replayRequestDigest, digest: sha256(canonicalJson(replayEvidence)) },
+          { kind: "terminalization_refusal", reference: "terminalization-refusal", digest: sha256(canonicalJson(terminalizationEvidence)) },
+          { kind: "zero_thread", reference: "native-thread-inventory", activeCount: inventory.active.length, archivedCount: inventory.archived.length, matchingCount: 0, digest: inventoryDigest },
+        ],
+      },
+    };
+    return applyLiveAuthorizedMutation(bb, db, closureRequest, false, "refuse-active", readGithubIssueForBackfill, null, preMutationGuard, true);
+  });
 }
 
 function dispatchRecoveryRefusal(projectId: string, message: string, evidence?: unknown): FoundationResult {
@@ -1885,7 +1926,7 @@ async function serializeDispatchRecovery(
   request: ApplyRequest,
   recover: () => Promise<FoundationResult>,
 ): Promise<FoundationResult> {
-  const key = `${request.projectId}\u0000${request.idempotencyKey}`;
+  const key = request.projectId;
   const previous = dispatchRecoveryQueues.get(key) ?? Promise.resolve();
   const current = previous.catch(() => undefined).then(recover);
   dispatchRecoveryQueues.set(key, current);
@@ -2225,8 +2266,12 @@ async function applyLiveAuthorizedMutation(
   githubIssueReader: (owner: string, repo: string, issueNumber: number) => GitHubIssueSnapshot | null = readGithubIssueForBackfill,
   githubAdapter: GitHubIssueAdapter | null = null,
   preMutationGuard?: PreMutationGuard,
+  allowThreadlessPreparedClosure = false,
 ): Promise<FoundationResult> {
   const parsed = applyRequestSchema.safeParse(input);
+  if (parsed.success && parsed.data.threadlessPreparedClosure !== undefined && !allowThreadlessPreparedClosure) {
+    return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less prepared closure is accepted only through the governed live inventory seam" };
+  }
   if (parsed.success && terminalizationPolicy === "stop-active") {
     const authorized = applyAuthorizedMutation(db, input, githubAdapter, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, null, true);
     if (authorized.outcome !== "OK" || authorized.replay) return authorized;
@@ -2277,6 +2322,9 @@ async function applyLiveAuthorizedMutationAsync(
   githubAdapter: GitHubIssueAdapter | null = null,
 ): Promise<FoundationResult> {
   const parsed = applyRequestSchema.safeParse(input);
+  if (parsed.success && parsed.data.threadlessPreparedClosure !== undefined) {
+    return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less prepared closure is accepted only through the governed live inventory seam" };
+  }
   if (parsed.success && parsed.data.threadlessPreparedClosure === undefined) {
     const laneGuard = await prepareWorkItemAttemptTerminalization(bb, db, parsed.data, terminalizationPolicy);
     if (laneGuard) return laneGuard;

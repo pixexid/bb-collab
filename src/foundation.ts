@@ -8018,6 +8018,8 @@ function applyThreadlessPreparedClosure(
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure requires an in-progress work item");
   }
   const attempt = requireAttemptForMutation(db, request, request.executionAttemptId);
+  const dispatchIntent = parseWorkItemDispatchIntent(attempt.reason_code);
+  const expectedDispatchMarker = dispatchIntent === null ? null : `[dispatch:${dispatchIntent.idempotencyKey}]`;
   if (
     attempt.work_item_id !== workItem.work_item_id ||
     attempt.repo_target_id !== workItem.repo_target_id ||
@@ -8028,7 +8030,8 @@ function applyThreadlessPreparedClosure(
     attempt.dispatch_kind !== null ||
     attempt.state !== "prepared" ||
     attempt.thread_id !== null ||
-    attempt.reason_code !== closure.dispatchMarker
+    expectedDispatchMarker === null ||
+    closure.dispatchMarker !== expectedDispatchMarker
   ) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure does not match the exact prepared writing attempt");
   }
