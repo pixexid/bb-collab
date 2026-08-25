@@ -667,6 +667,33 @@ describe("Operator Inbox app", () => {
     expect(rendered.queryByText("message 257")).toBeNull();
   });
 
+  it("renders durable message numbers in active, replied, and archived rows and detail", async () => {
+    window.localStorage.setItem("bb-collab.inbox-filters", JSON.stringify({ projectId: "", showArchived: true }));
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const messages = [
+      { messageId: 50, projectId: "project-a", recipient: "operator" as const, senderThreadId: "sender-a", senderLaneId: null, senderTitle: "A sender with a deliberately long title that must not displace its number", severity: "routine" as const, text: "An active message with a long body that remains secondary to the durable number.", createdAtMs: 3, readAtMs: null, archivedAtMs: null, replyText: null, replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null },
+      { messageId: 51, projectId: "project-a", recipient: "operator" as const, senderThreadId: "sender-b", senderLaneId: null, senderTitle: "Replied sender", severity: "needs-decision" as const, text: "A replied message", createdAtMs: 2, readAtMs: 4, archivedAtMs: null, repliedAtMs: 5, replyText: "Reply delivered", replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null },
+      { messageId: 52, projectId: "project-a", recipient: "operator" as const, senderThreadId: "sender-c", senderLaneId: null, senderTitle: "Archived sender", severity: "routine" as const, text: "An archived message", createdAtMs: 1, readAtMs: 6, archivedAtMs: 7, repliedAtMs: null, replyText: null, replyDeliveryError: null, replyInProgress: false, notificationStatus: "not-requested" as const, notificationError: null },
+    ];
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(async () => messages) } as never,
+    });
+
+    await waitFor(() => expect(rendered.getAllByRole("listitem")).toHaveLength(3));
+    const rows = rendered.getAllByRole("listitem");
+    for (const [index, messageId] of [50, 51, 52].entries()) {
+      expect(rows[index]!.textContent).toContain(`#${messageId}`);
+      expect(rows[index]!.querySelector("button")?.getAttribute("aria-label")).toContain(`#${messageId}`);
+    }
+    expect(rendered.getByRole("heading", { name: "Message #50" })).toBeTruthy();
+    fireEvent.click(rows[1]!.querySelector("button")!);
+    expect(rendered.getByRole("heading", { name: "Message #51" })).toBeTruthy();
+    fireEvent.click(rows[2]!.querySelector("button")!);
+    expect(rendered.getByRole("heading", { name: "Message #52" })).toBeTruthy();
+  });
+
   it("keeps the selected message preview and detail pane truthful", async () => {
     const app = await loadedApp();
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;

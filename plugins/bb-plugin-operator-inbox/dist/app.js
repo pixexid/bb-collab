@@ -456,6 +456,9 @@ function severityLabel(severity) {
 function senderLabel(message) {
   return asText(message.senderTitle) ?? "Sender unavailable";
 }
+function messageNumberLabel(message) {
+  return `#${message.messageId}`;
+}
 function deliveryLabel(message) {
   if (message.repliedAtMs != null) return "Delivered";
   if (message.replyInProgress) return "Delivery pending";
@@ -649,9 +652,10 @@ function InboxPanel(_props) {
           const sender = senderLabel(message);
           const delivery = deliveryLabel(message);
           return /* @__PURE__ */ jsxs("article", { role: "listitem", className: `border-b border-border last:border-b-0 ${selected ? "bg-primary/5 ring-2 ring-inset ring-primary" : message.readAtMs === null ? "bg-primary/10" : "bg-transparent"}`, children: [
-            /* @__PURE__ */ jsxs("button", { type: "button", "aria-pressed": selected, "aria-label": `${selected ? "Selected. " : "Select "}message from ${sender}. ${projectNames.get(message.projectId) ?? message.projectId}. ${severityLabel(message.severity)}. ${stateLabel(message)}. ${formatExactTime(message.createdAtMs)}`, style: { textAlign: "left", width: "100%" }, onClick: () => setSelectedMessageKey(key), className: "grid min-w-0 gap-2 px-3 py-3 transition-colors duration-150 hover:bg-muted/60 active:bg-muted/80 focus-visible:z-10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none", children: [
+            /* @__PURE__ */ jsxs("button", { type: "button", "aria-pressed": selected, "aria-label": `${selected ? "Selected. " : "Select "}message ${messageNumberLabel(message)} from ${sender}. ${projectNames.get(message.projectId) ?? message.projectId}. ${severityLabel(message.severity)}. ${stateLabel(message)}. ${formatExactTime(message.createdAtMs)}`, style: { textAlign: "left", width: "100%" }, onClick: () => setSelectedMessageKey(key), className: "grid min-w-0 gap-2 px-3 py-3 transition-colors duration-150 hover:bg-muted/60 active:bg-muted/80 focus-visible:z-10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary motion-reduce:transition-none", children: [
               /* @__PURE__ */ jsx("span", { className: "sr-only", children: message.readAtMs === null ? "Unread message. " : "" }),
               /* @__PURE__ */ jsxs("span", { className: "flex min-w-0 items-center gap-2", children: [
+                /* @__PURE__ */ jsx("span", { className: "shrink-0 font-mono text-xs font-semibold text-foreground", "aria-label": `Message ${messageNumberLabel(message)}`, children: messageNumberLabel(message) }),
                 /* @__PURE__ */ jsx("span", { className: `min-w-0 flex-1 truncate text-sm ${message.readAtMs === null ? "font-semibold" : "font-medium"}`, title: sender, children: sender }),
                 /* @__PURE__ */ jsx("time", { className: "shrink-0 text-xs text-muted-foreground", dateTime: new Date(message.createdAtMs).toISOString(), title: formatExactTime(message.createdAtMs), "aria-label": `Received ${formatExactTime(message.createdAtMs)}`, children: formatRelativeTime(message.createdAtMs) })
               ] }),
@@ -682,7 +686,10 @@ function InboxPanel(_props) {
         /* @__PURE__ */ jsx("header", { className: "grid gap-3 border-b border-border bg-muted/10 p-4", children: /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap items-start justify-between gap-3", children: [
           /* @__PURE__ */ jsxs("div", { className: "min-w-0", children: [
             /* @__PURE__ */ jsx("p", { className: "text-xs font-medium uppercase tracking-wide text-muted-foreground", children: "Selected message" }),
-            /* @__PURE__ */ jsx("h2", { id: "selected-message-heading", className: "mt-1 text-lg font-semibold", children: "Message" }),
+            /* @__PURE__ */ jsxs("h2", { id: "selected-message-heading", className: "mt-1 text-lg font-semibold", children: [
+              "Message ",
+              messageNumberLabel(selectedMessage)
+            ] }),
             /* @__PURE__ */ jsxs("p", { className: "mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground", children: [
               /* @__PURE__ */ jsx("span", { children: "From" }),
               selectedSenderId && asText(selectedMessage.senderTitle) ? /* @__PURE__ */ jsx("a", { href: "#", className: "min-w-0 break-words font-medium text-foreground underline decoration-muted-foreground/50 underline-offset-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary", "aria-label": `Open sender session ${selectedMessage.senderTitle}`, onClick: (event) => {
