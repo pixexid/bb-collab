@@ -6672,6 +6672,38 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
   });
 
   it.each([
+    ["head", 2],
+    ["bound", 1],
+  ] as const)("closes a stale-config prepared attempt when the caller names the %s revision", async (_name, expectedConfigRevision) => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const { threadId: _threadId, ...preparedAttempt } = request.workAttempt!;
+    const legacyRequest = { ...request, workAttempt: preparedAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+    expect(applyWithFixtureReceipt(fixture.db, legacyRequest)).toMatchObject({ outcome: "OK" });
+    const attempt = fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string };
+    expect(applyWithFixtureReceipt(fixture.db, {
+      ...bootstrapRequest(),
+      operationClass: "config_revision",
+      idempotencyKey: `gh675-config-${expectedConfigRevision}`,
+      expectedConfigRevision: 1,
+      configRevision: 2,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fixture.fenceToken,
+      config: { ...(bootstrapRequest().config as Record<string, unknown>), permissionMode: "auto", visibility: "visible" },
+      targets: [{ ...bootstrapRequest().targets![0]!, defaultBranch: "develop" }],
+    })).toMatchObject({ outcome: "OK", currentConfigRevision: 2 });
+    fixture.host.harness.sdk.stub("threads.list", (async () => []) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("close_threadless_prepared_attempt", {
+      request: { ...request, idempotencyKey: `gh675-close-${expectedConfigRevision}`, expectedConfigRevision, lifecycleState: undefined, workAttempt: undefined, reasonCode: undefined, executionAttemptId: attempt.execution_attempt_id, expectedResourceRevision: 3 },
+      correctionId: `gh675-correction-${expectedConfigRevision}`,
+      dispatchIntentIdempotencyKey: legacyRequest.idempotencyKey,
+      replayRequestDigest: mutationRequestDigest(parseApplyRequest({ ...legacyRequest, reasonCode: `${legacyRequest.reasonCode}:title=changed` })),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+  });
+
+  it.each([
     ["live", "thr_live", 4_000_000_000_000],
     ["expired", "thr_expired", 0],
   ] as const)("refuses thread-less closure for a %s lease without clearing it", async (_name, leaseOwner, leaseExpiresAtMs) => {
@@ -12941,12 +12973,13 @@ else printf '%s\\n' '[]'; fi
     expect(measure()).toEqual({ total: 2, with_model: 2, with_thread: 2, with_digest: 2 });
   });
 
-  it("keeps stale wait declarations, attempt-only replacements, and projections config-guarded", async () => {
-    const host = await loadedHost();
-    const { db, fenceToken } = seedAndBootstrap(host);
-    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+  it("keeps stale wait declarations and attempt-only replacements guarded while projections re-project", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    const { db, fenceToken } = fixture;
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1))).toMatchObject({ outcome: "OK", currentResourceRevision: 2 });
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+    const adapter = new DeterministicGitHubIssueAdapter();
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 3), adapter)).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
     expect(applyWithFixtureReceipt(db, {
       ...bootstrapRequest(),
       operationClass: "config_revision",
@@ -12955,7 +12988,7 @@ else printf '%s\\n' '[]'; fi
       configRevision: 2,
       expectedGovernanceEpoch: 1,
       expectedFenceToken: fenceToken,
-      config: { permissionMode: "auto", visibility: "visible", repositoryTargets: [TARGET_ID] },
+      config: { ...(bootstrapRequest().config as Record<string, unknown>), permissionMode: "auto", visibility: "visible" },
       targets: [{ ...bootstrapRequest().targets![0]!, defaultBranch: "develop" }],
     })).toMatchObject({ outcome: "OK", currentConfigRevision: 2 });
 
@@ -12971,8 +13004,9 @@ else printf '%s\\n' '[]'; fi
     expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 3, {
       idempotencyKey: "stale-projection",
       expectedConfigRevision: 2,
-    }), new DeterministicGitHubIssueAdapter())).toMatchObject({ outcome: "PROJECT_CONFIG_STALE", attempted: 0 });
-    expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+    }), adapter)).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+    expect(db.prepare("SELECT projection_state, projected_resource_revision FROM external_work_refs WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ projection_state: "current", projected_resource_revision: 3 });
+    expect(exportFoundation(db, PROJECT_ID)).not.toEqual(before);
   });
 
   it("refuses terminalizing a stale WorkItem with an open wait, then clears and retires it", async () => {

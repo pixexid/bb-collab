@@ -4337,10 +4337,10 @@ function currentConfig(db: SqliteDatabase, projectId: string): { config_revision
   return asRow(db.prepare("SELECT config_revision FROM project_config_heads WHERE project_id = ?").get(projectId));
 }
 
-function requireConfig(db: SqliteDatabase, request: ApplyRequest): number {
+function requireConfig(db: SqliteDatabase, request: ApplyRequest, boundWorkItemConfigRevision?: number): number {
   const head = currentConfig(db, request.projectId);
   if (!head) throw refusal("PROJECT_CONFIG_REQUIRED", "project has no stored config revision");
-  if (request.expectedConfigRevision !== head.config_revision) {
+  if (request.expectedConfigRevision !== head.config_revision && request.expectedConfigRevision !== boundWorkItemConfigRevision) {
     throw refusal("PROJECT_CONFIG_STALE", "expected config revision does not match the current head", {
       currentConfigRevision: head.config_revision,
       expectedConfigRevision: request.expectedConfigRevision ?? undefined,
@@ -7589,7 +7589,7 @@ function applyExecutionAttemptTerminalReport(
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report and request do not identify the exact work item");
   }
   if (!evidenceReader) throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report requires authoritative native evidence");
-  const workItem = requireWorkItem(db, request, configRevision);
+  const workItem = requireWorkItem(db, request, configRevision, undefined, true);
   const attempt = requireAttemptForMutation(db, request, report.executionAttemptId);
   const exact: Array<[string, unknown, unknown]> = [
     ["work item", attempt.work_item_id, report.workItemId],
@@ -7709,7 +7709,7 @@ function applyExecutionAttemptInterruption(
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", "interruption evidence and request do not identify the exact project, work item, and attempt");
   }
   const attempt = requireAttemptForMutation(db, request, evidence.executionAttemptId);
-  const workItem = requireWorkItem(db, request, configRevision);
+  const workItem = requireWorkItem(db, request, configRevision, undefined, true);
   if (attempt.work_item_id !== evidence.workItemId || attempt.thread_id !== evidence.threadId) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", "interruption evidence does not match the canonical work item thread");
   }
@@ -8070,11 +8070,16 @@ function applyThreadlessPreparedClosure(
   if (!closure || request.lifecycleState !== "failed" || !request.executionAttemptId || request.workAttempt !== undefined || request.workItemWait !== undefined || request.workItemUnblock !== undefined || request.workItemExternalEvent !== undefined) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure requires a failed lifecycle transition without a work attempt or wait");
   }
-  const configRevision = requireConfig(db, request);
+  const workItemConfigRevision = request.workItemId === undefined
+    ? undefined
+    : asRow<{ config_revision: number }>(db.prepare(
+      "SELECT config_revision FROM work_items WHERE project_id = ? AND work_item_id = ?",
+    ).get(request.projectId, request.workItemId))?.config_revision;
+  const configRevision = requireConfig(db, request, workItemConfigRevision);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
   requireRoleActorBinding(db, request, false);
-  const workItem = requireWorkItem(db, request, configRevision);
+  const workItem = requireWorkItem(db, request, configRevision, undefined, true);
   if (workItem.lifecycle_state !== "in_progress") {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure requires an in-progress work item");
   }
@@ -8084,7 +8089,7 @@ function applyThreadlessPreparedClosure(
   if (
     attempt.work_item_id !== workItem.work_item_id ||
     attempt.repo_target_id !== workItem.repo_target_id ||
-    attempt.config_revision !== configRevision ||
+    attempt.config_revision !== workItem.config_revision ||
     attempt.assignment_kind !== "write" ||
     attempt.assignment_id !== null ||
     attempt.assignment_digest !== null ||
@@ -9520,7 +9525,7 @@ function revalidateProjectionContext(db: SqliteDatabase, request: ApplyRequest, 
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
-  const workItem = requireWorkItem(db, request, configRevision);
+  const workItem = requireWorkItem(db, request, configRevision, undefined, true);
   const { mapping } = requireGithubMapping(db, request.projectId, configRevision, workItem.repo_target_id);
   if (
     configRevision !== context.configRevision ||
@@ -9551,7 +9556,7 @@ function prepareProjection(
     const configRevision = requireConfig(db, request);
     const governor = requireGovernor(db, request);
     const actorReceiptId = requireActor(db, request);
-    const workItem = requireWorkItem(db, request, configRevision);
+    const workItem = requireWorkItem(db, request, configRevision, undefined, true);
     const { github, mapping } = requireGithubMapping(db, request.projectId, configRevision, workItem.repo_target_id);
     if (adapter.connectorHost !== mapping.connectorHost) throw refusal("EXTERNAL_TARGET_MISMATCH", "GitHub connector host does not match the exact mapping");
     const wait = asRow<WorkItemWaitRow>(db.prepare(
