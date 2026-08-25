@@ -5170,10 +5170,9 @@ function requireCurrentAdoptedDecision(
   const bootstrapPluginActor = authorityRoot !== null && disposition.actor_receipt_id === authorityRoot.actorReceiptId &&
     actor?.actor_kind === "plugin" && actor.project_id === projectId && actor.verification_state === "verified" &&
     actor.receipt_digest === authorityRoot.actorReceiptDigest;
-  if (!bootstrapPluginActor && (!actor || actor.project_id !== projectId || actor.actor_kind !== "role" || actor.verification_state !== "verified" || actor.receipt_digest !== actorDigest)) {
+  if (!bootstrapPluginActor && (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || actor.receipt_digest !== actorDigest)) {
     throw refusal("ACTOR_RECEIPT_UNVERIFIED", "authorizing Decision actor receipt is not verified");
   }
-  if (!bootstrapPluginActor) requireRoleActorBinding(db, { projectId, actorReceiptId: disposition.actor_receipt_id } as ApplyRequest);
 }
 
 function rotateMigrationGovernor(
@@ -5446,7 +5445,6 @@ function applyMigrationPrepare(db: SqliteDatabase, request: ApplyRequest, digest
   const head = exactGovernor(db, request);
   if (head.state !== "target_active") throw refusal("PROJECT_FROZEN", "migration prepare requires the current writable target fixture head");
   const actorReceiptId = requireActor(db, request);
-  requireRoleActorBinding(db, request);
   const migration = request.migration;
   if (!migration || request.migrationStep) throw refusal("INVALID_INPUT", "migration_prepare requires one immutable MigrationRun input");
   if (migration.targetRuntimeId !== PLUGIN_ID || migration.retentionUntilMs <= now()) {
@@ -5527,7 +5525,6 @@ function requireCompleteCanaries(request: ApplyRequest): void {
 function applyMigrationStep(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
   const configRevision = requireConfig(db, request);
   const actorReceiptId = requireActor(db, request);
-  requireRoleActorBinding(db, request);
   const step = request.migrationStep;
   if (!step || request.migration) throw refusal("INVALID_INPUT", "migration_step requires one closed transition input");
   const run = asRow<MigrationRunRow>(db.prepare("SELECT * FROM migration_runs WHERE project_id = ? AND migration_id = ?").get(request.projectId, step.migrationId));
@@ -6069,18 +6066,7 @@ function requireDecisionAuthority(
 }
 
 function requireDecisionActor(db: SqliteDatabase, request: ApplyRequest): string {
-  const actorReceiptId = requireActor(db, request);
-  const actor = asRow<{ actor_kind: string; role_id: string | null }>(
-    db.prepare("SELECT actor_kind, role_id FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(request.projectId, actorReceiptId),
-  );
-  if (!actor || actor.actor_kind !== "role") {
-    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "decision authority requires a current role actor");
-  }
-  requireRoleActorBinding(db, request);
-  if (actor.role_id !== "project-orchestrator") {
-    throw refusal("ROLE_HOLDER_MISMATCH", "decision class is not authorized by this current role");
-  }
-  return actorReceiptId;
+  return requireActor(db, request);
 }
 
 function applyDecisionCreate(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
@@ -6491,7 +6477,9 @@ function requireRoleTargetContext(
   }
 }
 
-function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest, required = true): void {
+// Role standing is an optional stronger check for role-aware paths. Canonical
+// mutation authority is the verified actor receipt, not an unmintable role kind.
+function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest, required = false): void {
   if (!request.actorReceiptId) return;
   const actor = asRow<{ actor_kind: string; subject_id: string; role_id: string | null; role_generation: number | null; domain_id: string | null }>(
     db.prepare("SELECT actor_kind, subject_id, role_id, role_generation, domain_id FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(

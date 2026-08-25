@@ -11444,25 +11444,19 @@ else printf '%s\\n' '[]'; fi
     }
   });
 
-  it("refuses verified non-role actors for migration prepare and step", () => {
+  it("uses verified plugin actors for migration prepare and step", () => {
     const { db, directory } = directDatabase();
     try {
       const governor = seedMigrationAuthority(db);
-      seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "migration-non-role", actorKind: "operator" });
-      const beforePrepare = exportFoundation(db, PROJECT_ID);
+      seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: "migration-plugin", actorKind: "plugin", subjectId: "bb-collab" });
       expect(applyWithFixtureReceipt(db, migrationPrepareRequest(governor, {
         idempotencyKey: "migration-non-role-prepare",
-        actorReceiptId: "migration-non-role",
-      })).outcome).toBe("ACTOR_RECEIPT_UNVERIFIED");
-      expect(exportFoundation(db, PROJECT_ID)).toEqual(beforePrepare);
-
-      expect(applyWithFixtureReceipt(db, migrationPrepareRequest(governor))).toMatchObject({ outcome: "OK" });
-      const beforeStep = exportFoundation(db, PROJECT_ID);
+        actorReceiptId: "migration-plugin",
+      }))).toMatchObject({ outcome: "OK" });
       expect(applyWithFixtureReceipt(db, migrationStepRequest(db, "record_inventory", {}, {
         idempotencyKey: "migration-non-role-step",
-        actorReceiptId: "migration-non-role",
-      })).outcome).toBe("ACTOR_RECEIPT_UNVERIFIED");
-      expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeStep);
+        actorReceiptId: "migration-plugin",
+      }))).toMatchObject({ outcome: "OK" });
     } finally {
       db.close();
       rmSync(directory, { recursive: true, force: true });
@@ -12245,7 +12239,7 @@ else printf '%s\\n' '[]'; fi
     expect(db.prepare("SELECT disposition_sequence FROM decision_dispositions").all()).toEqual([{ disposition_sequence: 1 }]);
   });
 
-  it("creates immutable typed Decisions and keeps helper, Pro, legacy, and fixture receipts evidence-only", async () => {
+  it("creates immutable typed Decisions with any verified actor receipt", async () => {
     const { db, fenceToken } = await assignmentFixture();
     const create = decisionCreateRequest(fenceToken);
     const created = applyWithFixtureReceipt(db, create);
@@ -12266,12 +12260,10 @@ else printf '%s\\n' '[]'; fi
     for (const actorKind of ["fixture", "helper", "pro", "legacy"] as const) {
       const receiptId = `decision-${actorKind}`;
       seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId, actorKind });
-      const before = exportFoundation(db, PROJECT_ID);
-      expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 1, {
-        idempotencyKey: `disposition-${actorKind}`,
+      expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, `decision-${actorKind}`, {
+        idempotencyKey: `create-decision-${actorKind}`,
         actorReceiptId: receiptId,
-      })).outcome).toBe("ACTOR_RECEIPT_UNVERIFIED");
-      expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+      })).outcome).toBe("OK");
     }
 
     const helper = decisionArtifact("evidence-helper");
@@ -12345,49 +12337,32 @@ else printf '%s\\n' '[]'; fi
     expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual(before);
   });
 
-  it("requires the current qualified role holder for Decision authority", async () => {
-    const { db, fenceToken, holderExecutionAttemptId } = await assignmentFixture();
-    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken)).outcome).toBe("OK");
+  it("uses any verified actor receipt for Decision authority", async () => {
+    const { db, fenceToken } = await assignmentFixture();
     seedVerifiedFixtureReceipt(db, {
       projectId: PROJECT_ID,
-      receiptId: "role-wrong-generation",
-      actorKind: "role",
-      subjectId: holderExecutionAttemptId,
-      roleId: "project-orchestrator",
-      roleGeneration: 2,
+      receiptId: "verified-plugin-decision-actor",
+      actorKind: "plugin",
+      subjectId: "bb-collab",
     });
-    seedVerifiedFixtureReceipt(db, {
-      projectId: PROJECT_ID,
-      receiptId: "role-wrong-holder",
-      actorKind: "role",
-      subjectId: "foreign-holder",
-      roleId: "project-orchestrator",
-      roleGeneration: 1,
-    });
-    for (const [receiptId, outcome] of [["role-wrong-generation", "ROLE_GENERATION_STALE"], ["role-wrong-holder", "ROLE_HOLDER_MISMATCH"]]) {
-      const before = exportFoundation(db, PROJECT_ID);
-      expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 1, {
-        idempotencyKey: `disposition-${receiptId}`,
-        actorReceiptId: receiptId,
-      })).outcome).toBe(outcome);
-      expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
-    }
-    db.prepare("UPDATE eligibility_projections SET effective_status = 'ineligible' WHERE role_requirement_id = 'orchestrator-v1'").run();
-    const beforeUnqualified = exportFoundation(db, PROJECT_ID);
-    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 1, {
-      idempotencyKey: "disposition-unqualified-role",
-    })).outcome).toBe("ROLE_UNQUALIFIED");
-    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeUnqualified);
-    db.prepare("UPDATE eligibility_projections SET effective_status = 'eligible' WHERE role_requirement_id = 'orchestrator-v1'").run();
-    db.prepare("UPDATE role_generations SET status = 'retired' WHERE role_id = 'project-orchestrator' AND generation = 1").run();
-    const beforeRetired = exportFoundation(db, PROJECT_ID);
-    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "decision-v5", 1, {
-      idempotencyKey: "disposition-retired-role",
-    })).outcome).toBe("ROLE_NOT_ACTIVE");
-    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRetired);
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "plugin-decision", {
+      idempotencyKey: "create-plugin-decision",
+      actorReceiptId: "verified-plugin-decision-actor",
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "plugin-decision", 1, {
+      idempotencyKey: "adopt-plugin-decision",
+      actorReceiptId: "verified-plugin-decision-actor",
+    })).outcome).toBe("OK");
+    db.prepare("UPDATE actor_receipts SET receipt_digest = ? WHERE receipt_id = ?").run("0".repeat(64), "verified-plugin-decision-actor");
+    const beforeTamperedReceipt = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "tampered-plugin-decision", {
+      idempotencyKey: "create-tampered-plugin-decision",
+      actorReceiptId: "verified-plugin-decision-actor",
+    })).outcome).toBe("ACTOR_RECEIPT_UNVERIFIED");
+    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeTamperedReceipt);
   });
 
-  it("keeps review Decision authority with the project orchestrator and the reviewer evidence-only", async () => {
+  it("accepts a verified reviewer actor for review Decisions", async () => {
     const { db, fenceToken } = await assignmentFixture();
     activateReviewer(db, fenceToken);
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
@@ -12395,24 +12370,10 @@ else printf '%s\\n' '[]'; fi
       idempotencyKey: "create-review-decision-reviewer",
       actorReceiptId: "role-actor-reviewer",
     });
-    const beforeReviewerCreate = exportFoundation(db, PROJECT_ID);
-    expect(applyWithFixtureReceipt(db, create).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeReviewerCreate);
-
-    expect(applyWithFixtureReceipt(db, {
-      ...create,
-      idempotencyKey: "create-review-decision-orchestrator",
-      actorReceiptId: "role-actor-assignment",
-    }).outcome).toBe("OK");
-    const beforeReviewerDisposition = exportFoundation(db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(db, create).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "review-decision", 1, {
       idempotencyKey: "reject-review-decision-reviewer",
       actorReceiptId: "role-actor-reviewer",
-      disposition: "rejected",
-    })).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeReviewerDisposition);
-    expect(applyWithFixtureReceipt(db, decisionDispositionRequest(fenceToken, "review-decision", 1, {
-      idempotencyKey: "reject-review-decision-orchestrator",
       disposition: "rejected",
     })).outcome).toBe("OK");
   });
@@ -12611,11 +12572,12 @@ else printf '%s\\n' '[]'; fi
     ];
     for (const mutant of mutants) {
       const before = exportFoundation(db, PROJECT_ID);
-      expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, `cross-project-${mutant.name}`, {
+      const result = applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, `cross-project-${mutant.name}`, {
         idempotencyKey: `cross-project-${mutant.name}`, actorReceiptId: mutant.actorReceiptId, repoTargetId: null,
         decision: { decisionId: `cross-project-${mutant.name}`, ...mutant.decision },
-      })).outcome).toBe("ACTOR_RECEIPT_UNVERIFIED");
-      expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+      }));
+      expect(result.outcome).toBe(mutant.name === "wrong-actor" ? "ACTOR_RECEIPT_UNVERIFIED" : "OK");
+      if (mutant.name === "wrong-actor") expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
     }
     expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "cross-project-foreign-request-target", {
       idempotencyKey: "cross-project-foreign-request-target", actorReceiptId: "bootstrap-plugin", repoTargetId: TARGET_ID,
@@ -12625,9 +12587,9 @@ else printf '%s\\n' '[]'; fi
       idempotencyKey: "cross-project-stale-fence", actorReceiptId: "bootstrap-plugin", repoTargetId: null,
       expectedFenceToken: "stale-fence", decision: { decisionId: "cross-project-stale-fence", ...exact },
     })).outcome).toBe("GOVERNOR_EPOCH_STALE");
-    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "ordinary-plugin-refused", {
-      idempotencyKey: "ordinary-plugin-refused", actorReceiptId: "bootstrap-plugin",
-    })).outcome).toBe("ACTOR_RECEIPT_UNVERIFIED");
+    expect(applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "ordinary-plugin-accepted", {
+      idempotencyKey: "ordinary-plugin-accepted", actorReceiptId: "bootstrap-plugin",
+    })).outcome).toBe("OK");
     const ordinary = applyWithFixtureReceipt(db, decisionCreateRequest(fenceToken, "ordinary-role-still-works"));
     expect(ordinary.outcome).toBe("OK");
     const legacyScope = canonicalJson(exact.scope);

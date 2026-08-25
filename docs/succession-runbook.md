@@ -17,7 +17,7 @@ current config revision, never from documentation.
 First-generation creation and succession are authorized by the operator's
 typed word (ADR 0007). The
 authority ceremony was deleted by operator ruling with no replacement: there
-is no mint surface and there never will be one.
+is no role-actor mint surface and there never will be one.
 
 The apply gates on an **actor receipt** (`actor_receipts`), never an operator
 receipt. `operator_receipts` is vestigial — the running resolver has no

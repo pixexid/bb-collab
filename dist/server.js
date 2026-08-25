@@ -18879,10 +18879,9 @@ function requireCurrentAdoptedDecision(db, projectId, configRevision, decisionId
     domainId: actor.domain_id
   });
   const bootstrapPluginActor = authorityRoot !== null && disposition.actor_receipt_id === authorityRoot.actorReceiptId && actor?.actor_kind === "plugin" && actor.project_id === projectId && actor.verification_state === "verified" && actor.receipt_digest === authorityRoot.actorReceiptDigest;
-  if (!bootstrapPluginActor && (!actor || actor.project_id !== projectId || actor.actor_kind !== "role" || actor.verification_state !== "verified" || actor.receipt_digest !== actorDigest)) {
+  if (!bootstrapPluginActor && (!actor || actor.project_id !== projectId || actor.verification_state !== "verified" || actor.receipt_digest !== actorDigest)) {
     throw refusal("ACTOR_RECEIPT_UNVERIFIED", "authorizing Decision actor receipt is not verified");
   }
-  if (!bootstrapPluginActor) requireRoleActorBinding(db, { projectId, actorReceiptId: disposition.actor_receipt_id });
 }
 function rotateMigrationGovernor(db, request, actorReceiptId, head, runtimeId, state) {
   const governanceEpoch = head.governance_epoch + 1;
@@ -19091,7 +19090,6 @@ function applyMigrationPrepare(db, request, digest2) {
   const head = exactGovernor(db, request);
   if (head.state !== "target_active") throw refusal("PROJECT_FROZEN", "migration prepare requires the current writable target fixture head");
   const actorReceiptId = requireActor(db, request);
-  requireRoleActorBinding(db, request);
   const migration = request.migration;
   if (!migration || request.migrationStep) throw refusal("INVALID_INPUT", "migration_prepare requires one immutable MigrationRun input");
   if (migration.targetRuntimeId !== PLUGIN_ID || migration.retentionUntilMs <= now()) {
@@ -19195,7 +19193,6 @@ function requireCompleteCanaries(request) {
 function applyMigrationStep(db, request, digest2) {
   const configRevision = requireConfig(db, request);
   const actorReceiptId = requireActor(db, request);
-  requireRoleActorBinding(db, request);
   const step = request.migrationStep;
   if (!step || request.migration) throw refusal("INVALID_INPUT", "migration_step requires one closed transition input");
   const run = asRow(db.prepare("SELECT * FROM migration_runs WHERE project_id = ? AND migration_id = ?").get(request.projectId, step.migrationId));
@@ -19683,18 +19680,7 @@ function requireDecisionAuthority(db, request, decision, capture = false) {
   return { actorReceiptId: current.actorReceiptId, authorityRoot: stored };
 }
 function requireDecisionActor(db, request) {
-  const actorReceiptId = requireActor(db, request);
-  const actor = asRow(
-    db.prepare("SELECT actor_kind, role_id FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(request.projectId, actorReceiptId)
-  );
-  if (!actor || actor.actor_kind !== "role") {
-    throw refusal("ACTOR_RECEIPT_UNVERIFIED", "decision authority requires a current role actor");
-  }
-  requireRoleActorBinding(db, request);
-  if (actor.role_id !== "project-orchestrator") {
-    throw refusal("ROLE_HOLDER_MISMATCH", "decision class is not authorized by this current role");
-  }
-  return actorReceiptId;
+  return requireActor(db, request);
 }
 function applyDecisionCreate(db, request, digest2) {
   const currentRevision = requireConfig(db, request);
@@ -20042,7 +20028,7 @@ function requireRoleTargetContext(db, request, resolved, context) {
     throw refusal("ROLE_CONTEXT_FOREIGN", "holder context does not match the exact repository target source, host, and path");
   }
 }
-function requireRoleActorBinding(db, request, required2 = true) {
+function requireRoleActorBinding(db, request, required2 = false) {
   if (!request.actorReceiptId) return;
   const actor = asRow(
     db.prepare("SELECT actor_kind, subject_id, role_id, role_generation, domain_id FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(
