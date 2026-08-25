@@ -31,7 +31,6 @@ import {
   MIGRATION_STATES,
   MIGRATION_STEPS,
   PLUGIN_ID,
-  PREPARED_DISPATCH_MIN_AGE_MS,
   SCHEMA_VERSION,
   TABLES,
   assembleV22CachedConsumerRolloutEvidence,
@@ -7101,7 +7100,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       request: transitionRequest(fixture.fenceToken, "in_progress", 2),
       spawn: dispatchSpawn(fixture.orchestratorThreadId),
     }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId });
-    fixture.db.prepare("UPDATE execution_attempts SET created_at_ms = ? WHERE origin = 'work_item'").run(Date.now() - PREPARED_DISPATCH_MIN_AGE_MS - 1);
+    fixture.db.prepare("UPDATE execution_attempts SET created_at_ms = ? WHERE origin = 'work_item'").run(Date.now() - 45_000);
     const wedges = reconcilePreparedWorkItemDispatches(fixture.db, PROJECT_ID, [{
       id: "lane-renamed",
       parentThreadId: fixture.orchestratorThreadId,
@@ -7130,7 +7129,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
         request: transitionRequest(fixture.fenceToken, "in_progress", 2),
         spawn: dispatchSpawn(fixture.orchestratorThreadId),
       }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId });
-      fixture.db.prepare("UPDATE execution_attempts SET created_at_ms = ? WHERE origin = 'work_item'").run(Date.now() - PREPARED_DISPATCH_MIN_AGE_MS - 1);
+      fixture.db.prepare("UPDATE execution_attempts SET created_at_ms = ? WHERE origin = 'work_item'").run(Date.now() - 45_000);
       const attempt = fixture.db.prepare("SELECT reason_code FROM execution_attempts WHERE origin = 'work_item'").get() as { reason_code: string };
       const marker = attempt.reason_code.match(/^work_item_dispatch_intent:(.*):parent=/u)?.[1];
       expect(marker).toBeTruthy();
