@@ -13517,6 +13517,90 @@ else printf '%s\\n' '[]'; fi
     expect(db.prepare("SELECT waker FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, githubTargetId)).toEqual({ waker: `${GITHUB_OWNER}/${GITHUB_REPO}#${storedBlocker.issueNumber}` });
   });
 
+  it("requires an exact closed GitHub issue for GitHub satisfaction", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    const github = new DeterministicGitHubIssueAdapter();
+    const githubRead = github.read.bind(github);
+    const issue = { kind: "github_issue_closed" as const, owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 901 };
+    const targetId = "github-satisfaction-target";
+    const transition = (workItemId: string, state: ApplyRequest["lifecycleState"], revision: number, overrides: Partial<ApplyRequest> = {}) =>
+      applyWithFixtureReceipt(db, transitionRequest(fenceToken, state, revision, {
+        idempotencyKey: `${workItemId}-${state}-${revision}`,
+        workItemId,
+        ...overrides,
+      }));
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      idempotencyKey: "github-satisfaction-create",
+      workItem: { workItemId: targetId, title: targetId, body: targetId, githubIssue: { issueNumber: issue.issueNumber } },
+    }))).toMatchObject({ outcome: "OK" });
+    expect(transition(targetId, "ready", 1).outcome).toBe("OK");
+    expect(transition(targetId, "succeeded", 2)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+
+    github.put({ ...issue, issueNumber: 902, title: "Wrong issue", body: "", state: "closed", stateReason: "COMPLETED", labels: [], externalRevision: "wrong-closed" });
+    expect(applyFixtureMutation(db, transitionRequest(fenceToken, "succeeded", 2, {
+      idempotencyKey: "github-satisfaction-mismatch",
+      workItemId: targetId,
+      satisfactionEvidence: { ...issue, issueNumber: 902 },
+    }), null, null, null, null, githubRead)).toMatchObject({
+      outcome: "EXTERNAL_REF_CONFLICT",
+      attempted: 0,
+    });
+
+    github.put({ ...issue, title: "Open issue", body: "", state: "open", stateReason: "REOPENED", labels: [], externalRevision: "open-issue" });
+    expect(applyFixtureMutation(db, transitionRequest(fenceToken, "succeeded", 2, {
+      idempotencyKey: "github-satisfaction-open",
+      workItemId: targetId,
+      satisfactionEvidence: issue,
+    }), null, null, null, null, githubRead)).toMatchObject({
+      outcome: "WORK_ITEM_STATE_INVALID",
+      message: "satisfaction evidence does not name a closed GitHub issue",
+      attempted: 0,
+    });
+
+    github.put({ ...issue, title: "Closed issue", body: "", state: "closed", stateReason: "COMPLETED", labels: [], externalRevision: "closed-issue" });
+    expect(applyFixtureMutation(db, transitionRequest(fenceToken, "succeeded", 2, {
+      idempotencyKey: "github-satisfaction-valid",
+      workItemId: targetId,
+      satisfactionEvidence: issue,
+    }), null, null, null, null, githubRead)).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+  });
+
+  it("uses exact closed GitHub satisfaction to drain a blocked item with a dead blocker", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    const github = new DeterministicGitHubIssueAdapter();
+    const githubRead = github.read.bind(github);
+    const targetId = "github-satisfaction-blocked-target";
+    const blockerId = "github-satisfaction-cancelled-blocker";
+    const issue = { kind: "github_issue_closed" as const, owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 903 };
+    const create = (workItemId: string, githubIssue?: number) => applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      idempotencyKey: `${workItemId}-create`,
+      workItemId,
+      workItem: { workItemId, title: workItemId, body: workItemId, ...(githubIssue === undefined ? {} : { githubIssue: { issueNumber: githubIssue } }) },
+    }));
+    const transition = (workItemId: string, state: ApplyRequest["lifecycleState"], revision: number, overrides: Partial<ApplyRequest> = {}) =>
+      applyWithFixtureReceipt(db, transitionRequest(fenceToken, state, revision, {
+        idempotencyKey: `${workItemId}-${state}-${revision}`,
+        workItemId,
+        ...overrides,
+      }));
+    expect(create(targetId, issue.issueNumber).outcome).toBe("OK");
+    expect(create(blockerId).outcome).toBe("OK");
+    expect(transition(targetId, "ready", 1).outcome).toBe("OK");
+    expect(transition(targetId, "blocked", 2, {
+      workItemWait: { kind: "work_item_succeeded", workItemId: blockerId, declaredBySeat: "worker-seat" },
+    }).outcome).toBe("OK");
+    expect(transition(blockerId, "cancelled", 1).outcome).toBe("OK");
+    github.put({ ...issue, title: "Closed blocked target", body: "", state: "closed", stateReason: "COMPLETED", labels: [], externalRevision: "blocked-closed" });
+    expect(applyFixtureMutation(db, transitionRequest(fenceToken, "succeeded", 3, {
+      idempotencyKey: "github-satisfaction-blocked-valid",
+      workItemId: targetId,
+      satisfactionEvidence: issue,
+    }), null, null, null, null, githubRead)).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    expect(db.prepare("SELECT 1 FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, targetId)).toBeUndefined();
+  });
+
   it("requires review_pending between authorship and terminal success and supports review findings re-entry", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host);

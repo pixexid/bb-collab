@@ -16856,7 +16856,8 @@ var workItemExternalEventSchema = external_exports.object({
 var gitShaSchema = external_exports.string().regex(/^[0-9a-f]{40,64}$/u);
 var workItemSatisfactionEvidenceSchema = external_exports.discriminatedUnion("kind", [
   external_exports.object({ kind: external_exports.literal("config_revision"), configRevision: external_exports.number().int().positive(), digest: digestSchema }).strict(),
-  external_exports.object({ kind: external_exports.literal("decision"), decisionId: id }).strict()
+  external_exports.object({ kind: external_exports.literal("decision"), decisionId: id }).strict(),
+  external_exports.object({ kind: external_exports.literal("github_issue_closed"), owner: githubRefPartSchema, repo: githubRefPartSchema, issueNumber: external_exports.number().int().positive().refine(Number.isSafeInteger) }).strict()
 ]);
 var projectionRecoveryEvidenceSchema = external_exports.object({
   kind: external_exports.literal("github_issue_unchanged"),
@@ -21177,7 +21178,12 @@ function sameWorkItemBlocker(left, right) {
   return canonicalJson(left) === canonicalJson(right);
 }
 function workItemGithubReadTarget(request) {
-  const targets = [request.workItemWait, request.workItemUnblock, request.workItemExternalEvent].flatMap((value) => value && value.kind !== "work_item_succeeded" && value.kind !== "schedule" && value.kind !== "seat" ? [{ owner: value.owner, repo: value.repo, issueNumber: value.issueNumber }] : []);
+  const targets = [
+    request.workItemWait,
+    request.workItemUnblock,
+    request.workItemExternalEvent,
+    request.satisfactionEvidence?.kind === "github_issue_closed" ? request.satisfactionEvidence : void 0
+  ].flatMap((value) => value && value.kind !== "work_item_succeeded" && value.kind !== "schedule" && value.kind !== "seat" ? [{ owner: value.owner, repo: value.repo, issueNumber: value.issueNumber }] : []);
   const swapping = request.lifecycleState === "blocked" && request.workItemWait !== void 0 && request.workItemUnblock !== void 0;
   if (targets.length > 1 && !swapping) throw refusal("WORK_ITEM_STATE_INVALID", "work item transition accepts one external condition");
   return targets;
@@ -21224,6 +21230,8 @@ function requireWorkItemSatisfactionEvidence(db, request) {
     if (!decision || !decision.decision_identity_digest || storedDecisionIdentityDigest(decision) !== decision.decision_identity_digest) {
       throw refusal("WORK_ITEM_STATE_INVALID", "satisfaction evidence does not name an exact project Decision");
     }
+  } else {
+    requireBoundGithubIssue(db, request.projectId, request.workItemId, evidence);
   }
   return evidence;
 }
@@ -22008,6 +22016,10 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
   }
   const satisfactionEvidence = satisfactionExit ? requireWorkItemSatisfactionEvidence(db, request) : void 0;
+  const githubIssueSatisfaction = satisfactionEvidence?.kind === "github_issue_closed";
+  if (githubIssueSatisfaction && (!githubObservation || githubObservation.state !== "closed")) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "satisfaction evidence does not name a closed GitHub issue");
+  }
   let recordedExternalEvent = null;
   if (githubObservation && !validGithubSnapshotStateReason(githubObservation.state, githubObservation.stateReason)) {
     throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue state and reason do not match");
@@ -22027,7 +22039,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
       if (unblock !== void 0 && !sameWorkItemBlocker(storedBlocker, unblock)) {
         throw refusal("WORK_ITEM_STATE_INVALID", "blocked to succeeded requires the exact stored blocker when blocker evidence is supplied");
       }
-      if (!blockerConditionSatisfied(db, request, storedBlocker, githubObservation)) {
+      if (!githubIssueSatisfaction && !blockerConditionSatisfied(db, request, storedBlocker, githubObservation)) {
         throw refusal("WORK_ITEM_STATE_INVALID", "blocked work item blocker is still live");
       }
     }
