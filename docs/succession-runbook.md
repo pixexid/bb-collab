@@ -34,6 +34,10 @@ class-specific validators. Bootstrap Decisions remain rooted in the exact
 current governorship actor. Role-holder binding remains for role-aware
 operations; it is not silently treated as Decision authority when the request
 does not carry authenticated caller-thread identity.
+If caller-thread authentication is ever added to apply-path request shapes,
+the holder-evidence check becomes buildable and this decision should be
+revisited: `role_generations` already binds
+`holder_execution_attempt_id`, so only requester identity is missing.
 
 ## Seat pairing and epoch naming
 
