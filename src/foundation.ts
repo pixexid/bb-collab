@@ -2474,6 +2474,15 @@ const roleRequirementSchema = z
       ctx.addIssue({ code: "custom", path: ["executedProfile", "visibility"], message: "active role holders must be visible" });
     }
     const isDirectorSeat = requirement.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID;
+    const hasRoutingSuffix = (profile: unknown): boolean => profile !== undefined
+      && typeof profile === "object"
+      && profile !== null
+      && "model" in profile
+      && typeof profile.model === "string"
+      && /\[[^\]]+\]$/u.test(profile.model);
+    if (!isDirectorSeat && (hasRoutingSuffix(requirement.executedProfile) || hasRoutingSuffix(requirement.standbyProfile))) {
+      ctx.addIssue({ code: "custom", path: ["executedProfile", "model"], message: "routing-suffix SKU models are reserved for the ratified director-seat profiles" });
+    }
     if (requirement.roleId === "director" && !isDirectorSeat) {
       ctx.addIssue({ code: "custom", path: ["roleRequirementId"], message: "director role is reserved for director-seat" });
     }
@@ -2747,6 +2756,7 @@ export const applyRequestSchema = z
     workItemExternalEvent: workItemExternalEventSchema.optional(),
     workAttempt: workAttemptSchema.optional(),
     projectionKind: z.literal("github_issue").optional(),
+    queueLabel: z.literal("queue:dispatched").optional(),
     roleId: roleIdSchema.optional(),
     roleRequirementId: id.optional(),
     qualificationId: id.optional(),
@@ -2838,7 +2848,7 @@ export interface GitHubIssueAdapter {
   mutateAsync?(input: GitHubIssueMutation): Promise<GitHubIssueSnapshot>;
 }
 
-export type GitHubIssueReader = (owner: string, repo: string, issueNumber: number) => GitHubIssueSnapshot | null;
+export type GitHubIssueReader = (owner: string, repo: string, issueNumber: number, connectorHost?: string) => GitHubIssueSnapshot | null;
 
 export interface RoleThreadFact {
   id: string;
@@ -9048,10 +9058,11 @@ interface DesiredProjection {
   state: "open" | "closed";
   managedLabels: string[];
   managedNames: Set<string>;
+  queueLabel?: "queue:dispatched";
   digest: string;
 }
 
-function desiredProjection(workItem: WorkItemRow, github: GithubIssuesConfig, blocker: string | null = null): DesiredProjection {
+function desiredProjection(workItem: WorkItemRow, github: GithubIssuesConfig, blocker: string | null = null, queueLabel?: "queue:dispatched"): DesiredProjection {
   const convention = github.issue;
   const names = new Set(convention?.managedLabels?.names ?? []);
   const managedLabels = [...new Set(convention?.managedLabels?.byLifecycle?.[workItem.lifecycle_state] ?? [])].sort();
@@ -9064,6 +9075,7 @@ function desiredProjection(workItem: WorkItemRow, github: GithubIssuesConfig, bl
     state,
     managedLabels,
     managedNames: names,
+    ...(queueLabel === undefined ? {} : { queueLabel }),
     digest: sha256(canonicalJson({ title, body, state, managedLabels })),
   };
 }
@@ -9083,6 +9095,12 @@ function observedDigest(snapshot: GitHubIssueSnapshot, desired: DesiredProjectio
     state: snapshot.state,
     managedLabels: snapshot.labels.filter((label) => desired.managedNames.has(label)).sort(),
   }));
+}
+
+function queueLabelMatches(snapshot: GitHubIssueSnapshot, desired: DesiredProjection): boolean {
+  return desired.queueLabel === undefined
+    || (snapshot.labels.filter((label) => label.startsWith("queue:")).every((label) => label === desired.queueLabel)
+      && snapshot.labels.includes(desired.queueLabel));
 }
 
 function bindExistingGithubIssue(
@@ -9466,7 +9484,7 @@ function prepareProjection(
       "SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?",
     ).get(request.projectId, workItem.work_item_id));
     const blocker = wait ? storedWorkItemBlocker(wait) : null;
-    const desired = desiredProjection(workItem, github, blocker ? workItemBlockerWaker(blocker) : null);
+    const desired = desiredProjection(workItem, github, blocker ? workItemBlockerWaker(blocker) : null, request.queueLabel);
     let ref = externalRef(db, request.projectId, workItem.work_item_id);
     if (ref) {
       if (ref.project_id !== request.projectId || ref.work_item_id !== workItem.work_item_id || ref.provider !== "github") {
@@ -9659,6 +9677,9 @@ function finalizeProjection(
     }
     const observed = observedDigest(snapshot, context.desired);
     if (observed !== context.desired.digest) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub read-back does not match the desired projection");
+    if (!queueLabelMatches(snapshot, context.desired)) {
+      throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub read-back does not contain the required dispatch queue label");
+    }
     const updated = db.prepare(
       `UPDATE external_work_refs SET issue_number = ?, projection_state = 'current', attempted_resource_revision = ?,
        projected_resource_revision = ?, desired_digest = ?, observed_external_revision = ?,
@@ -9744,7 +9765,7 @@ function applyGithubIssueProjection(
       title: context.desired.title,
       body: context.desired.body,
       state: context.desired.state,
-      addLabels: context.desired.managedLabels,
+      addLabels: [...context.desired.managedLabels, ...(context.desired.queueLabel === undefined ? [] : [context.desired.queueLabel])],
       removeLabels: [],
     };
   } else {
@@ -9768,7 +9789,7 @@ function applyGithubIssueProjection(
         return result("EXTERNAL_DIVERGED", request.projectId, 1, 1, 0, { message: "the GitHub issue diverged from its last verified projection" });
       }
     }
-    if (observedDigest(current, context.desired) === context.desired.digest) {
+    if (observedDigest(current, context.desired) === context.desired.digest && queueLabelMatches(current, context.desired)) {
       try {
         return finalizeProjection(db, request, digest, context, adapter, current, "verify");
       } catch (error) {
@@ -9783,6 +9804,9 @@ function applyGithubIssueProjection(
       return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
     }
     const currentLabels = new Set(current.labels);
+    const queueLabelsToRemove = context.desired.queueLabel === undefined
+      ? []
+      : current.labels.filter((label) => label.startsWith("queue:") && label !== context.desired.queueLabel);
     mutation = {
       kind: "update",
       owner: context.mapping.owner,
@@ -9791,8 +9815,14 @@ function applyGithubIssueProjection(
       title: context.desired.title,
       body: context.desired.body,
       state: context.desired.state,
-      addLabels: context.desired.managedLabels.filter((label) => !currentLabels.has(label)),
-      removeLabels: current.labels.filter((label) => context.desired.managedNames.has(label) && !context.desired.managedLabels.includes(label)),
+      addLabels: [
+        ...context.desired.managedLabels.filter((label) => !currentLabels.has(label)),
+        ...(context.desired.queueLabel !== undefined && !currentLabels.has(context.desired.queueLabel) ? [context.desired.queueLabel] : []),
+      ],
+      removeLabels: [
+        ...current.labels.filter((label) => context.desired.managedNames.has(label) && !context.desired.managedLabels.includes(label)),
+        ...queueLabelsToRemove,
+      ],
     };
   }
 
@@ -9864,7 +9894,7 @@ async function applyGithubIssueProjectionAsync(
       title: context.desired.title,
       body: context.desired.body,
       state: context.desired.state,
-      addLabels: context.desired.managedLabels,
+      addLabels: [...context.desired.managedLabels, ...(context.desired.queueLabel === undefined ? [] : [context.desired.queueLabel])],
       removeLabels: [],
     };
   } else {
@@ -9888,7 +9918,7 @@ async function applyGithubIssueProjectionAsync(
         return result("EXTERNAL_DIVERGED", request.projectId, 1, 1, 0, { message: "the GitHub issue diverged from its last verified projection" });
       }
     }
-    if (observedDigest(current, context.desired) === context.desired.digest) {
+    if (observedDigest(current, context.desired) === context.desired.digest && queueLabelMatches(current, context.desired)) {
       try {
         return finalizeProjection(db, request, digest, context, adapter, current, "verify");
       } catch (error) {
@@ -9903,6 +9933,9 @@ async function applyGithubIssueProjectionAsync(
       return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
     }
     const currentLabels = new Set(current.labels);
+    const queueLabelsToRemove = context.desired.queueLabel === undefined
+      ? []
+      : current.labels.filter((label) => label.startsWith("queue:") && label !== context.desired.queueLabel);
     mutation = {
       kind: "update",
       owner: context.mapping.owner,
@@ -9911,8 +9944,14 @@ async function applyGithubIssueProjectionAsync(
       title: context.desired.title,
       body: context.desired.body,
       state: context.desired.state,
-      addLabels: context.desired.managedLabels.filter((label) => !currentLabels.has(label)),
-      removeLabels: current.labels.filter((label) => context.desired.managedNames.has(label) && !context.desired.managedLabels.includes(label)),
+      addLabels: [
+        ...context.desired.managedLabels.filter((label) => !currentLabels.has(label)),
+        ...(context.desired.queueLabel !== undefined && !currentLabels.has(context.desired.queueLabel) ? [context.desired.queueLabel] : []),
+      ],
+      removeLabels: [
+        ...current.labels.filter((label) => context.desired.managedNames.has(label) && !context.desired.managedLabels.includes(label)),
+        ...queueLabelsToRemove,
+      ],
     };
   }
 
@@ -10935,6 +10974,18 @@ export async function doctor(
       .all(...TABLES) as Array<{ name: string }>;
     const configJson = storedConfigJson(db, projectId, configHead.config_revision);
     const writingLaneCeiling = writingLaneCeilingFromJson(configJson);
+    const staleProjections = db.prepare(
+      `SELECT refs.work_item_id, refs.provider, refs.owner, refs.repo, refs.issue_number,
+              refs.projection_state, refs.attempted_resource_revision,
+              items.resource_revision AS canonical_resource_revision
+         FROM external_work_refs AS refs
+         JOIN work_items AS items
+           ON items.project_id = refs.project_id AND items.work_item_id = refs.work_item_id
+        WHERE refs.project_id = ?
+          AND refs.projection_state <> 'pending'
+          AND refs.attempted_resource_revision <> items.resource_revision
+        ORDER BY refs.work_item_id, refs.provider`,
+    ).all(projectId) as Array<Record<string, unknown>>;
     const assignmentAttempts: Array<Record<string, unknown>> = [];
     const capacityEvidence = workItemCapacityLaneEvidence(db, projectId);
     const activeWriters = capacityEvidence.lanes;
@@ -10982,6 +11033,7 @@ export async function doctor(
     const doctorMessage = [
       pluginCompatibilityMessage,
       ...routing.messages,
+      ...(staleProjections.length === 0 ? [] : [`${staleProjections.length} external projection(s) are stale against canonical resource revisions`]),
       ...(pluginSourceUnavailable ? ["plugin source checkout is unavailable"] : []),
     ].filter(Boolean).join("; ");
     const expected = targets.length + 1;
@@ -11012,6 +11064,7 @@ export async function doctor(
           roleRequirementIds: domain.roleRequirements.map((requirement) => requirement.roleRequirementId),
         })),
         eligibility,
+        projections: { stale: staleProjections },
         assignments: assignmentAttempts,
         profileAudit,
         capacity: {

@@ -17021,6 +17021,10 @@ var roleRequirementSchema = external_exports.object({
     ctx.addIssue({ code: "custom", path: ["executedProfile", "visibility"], message: "active role holders must be visible" });
   }
   const isDirectorSeat = requirement.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID;
+  const hasRoutingSuffix = (profile) => profile !== void 0 && typeof profile === "object" && profile !== null && "model" in profile && typeof profile.model === "string" && /\[[^\]]+\]$/u.test(profile.model);
+  if (!isDirectorSeat && (hasRoutingSuffix(requirement.executedProfile) || hasRoutingSuffix(requirement.standbyProfile))) {
+    ctx.addIssue({ code: "custom", path: ["executedProfile", "model"], message: "routing-suffix SKU models are reserved for the ratified director-seat profiles" });
+  }
   if (requirement.roleId === "director" && !isDirectorSeat) {
     ctx.addIssue({ code: "custom", path: ["roleRequirementId"], message: "director role is reserved for director-seat" });
   }
@@ -17271,6 +17275,7 @@ var applyRequestSchema = external_exports.object({
   workItemExternalEvent: workItemExternalEventSchema.optional(),
   workAttempt: workAttemptSchema.optional(),
   projectionKind: external_exports.literal("github_issue").optional(),
+  queueLabel: external_exports.literal("queue:dispatched").optional(),
   roleId: roleIdSchema.optional(),
   roleRequirementId: id.optional(),
   qualificationId: id.optional(),
@@ -22167,7 +22172,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
     }
   );
 }
-function desiredProjection(workItem, github, blocker = null) {
+function desiredProjection(workItem, github, blocker = null, queueLabel) {
   const convention = github.issue;
   const names = new Set(convention?.managedLabels?.names ?? []);
   const managedLabels = [...new Set(convention?.managedLabels?.byLifecycle?.[workItem.lifecycle_state] ?? [])].sort();
@@ -22180,6 +22185,7 @@ function desiredProjection(workItem, github, blocker = null) {
     state,
     managedLabels,
     managedNames: names,
+    ...queueLabel === void 0 ? {} : { queueLabel },
     digest: sha256(canonicalJson({ title, body, state, managedLabels }))
   };
 }
@@ -22197,6 +22203,9 @@ function observedDigest(snapshot2, desired) {
     state: snapshot2.state,
     managedLabels: snapshot2.labels.filter((label) => desired.managedNames.has(label)).sort()
   }));
+}
+function queueLabelMatches(snapshot2, desired) {
+  return desired.queueLabel === void 0 || snapshot2.labels.filter((label) => label.startsWith("queue:")).every((label) => label === desired.queueLabel) && snapshot2.labels.includes(desired.queueLabel);
 }
 function bindExistingGithubIssue(db, input) {
   const existing = externalRef(db, input.projectId, input.workItem.work_item_id);
@@ -22455,7 +22464,7 @@ function prepareProjection(db, request, digest2, adapter) {
       "SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?"
     ).get(request.projectId, workItem.work_item_id));
     const blocker = wait ? storedWorkItemBlocker(wait) : null;
-    const desired = desiredProjection(workItem, github, blocker ? workItemBlockerWaker(blocker) : null);
+    const desired = desiredProjection(workItem, github, blocker ? workItemBlockerWaker(blocker) : null, request.queueLabel);
     let ref = externalRef(db, request.projectId, workItem.work_item_id);
     if (ref) {
       if (ref.project_id !== request.projectId || ref.work_item_id !== workItem.work_item_id || ref.provider !== "github") {
@@ -22613,6 +22622,9 @@ function finalizeProjection(db, request, digest2, context, adapter, snapshot2, m
     }
     const observed = observedDigest(snapshot2, context.desired);
     if (observed !== context.desired.digest) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub read-back does not match the desired projection");
+    if (!queueLabelMatches(snapshot2, context.desired)) {
+      throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub read-back does not contain the required dispatch queue label");
+    }
     const updated = db.prepare(
       `UPDATE external_work_refs SET issue_number = ?, projection_state = 'current', attempted_resource_revision = ?,
        projected_resource_revision = ?, desired_digest = ?, observed_external_revision = ?,
@@ -22691,7 +22703,7 @@ function applyGithubIssueProjection(db, request, digest2, adapter) {
       title: context.desired.title,
       body: context.desired.body,
       state: context.desired.state,
-      addLabels: context.desired.managedLabels,
+      addLabels: [...context.desired.managedLabels, ...context.desired.queueLabel === void 0 ? [] : [context.desired.queueLabel]],
       removeLabels: []
     };
   } else {
@@ -22715,7 +22727,7 @@ function applyGithubIssueProjection(db, request, digest2, adapter) {
         return result("EXTERNAL_DIVERGED", request.projectId, 1, 1, 0, { message: "the GitHub issue diverged from its last verified projection" });
       }
     }
-    if (observedDigest(current, context.desired) === context.desired.digest) {
+    if (observedDigest(current, context.desired) === context.desired.digest && queueLabelMatches(current, context.desired)) {
       try {
         return finalizeProjection(db, request, digest2, context, adapter, current, "verify");
       } catch (error48) {
@@ -22730,6 +22742,7 @@ function applyGithubIssueProjection(db, request, digest2, adapter) {
       return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
     }
     const currentLabels = new Set(current.labels);
+    const queueLabelsToRemove = context.desired.queueLabel === void 0 ? [] : current.labels.filter((label) => label.startsWith("queue:") && label !== context.desired.queueLabel);
     mutation = {
       kind: "update",
       owner: context.mapping.owner,
@@ -22738,8 +22751,14 @@ function applyGithubIssueProjection(db, request, digest2, adapter) {
       title: context.desired.title,
       body: context.desired.body,
       state: context.desired.state,
-      addLabels: context.desired.managedLabels.filter((label) => !currentLabels.has(label)),
-      removeLabels: current.labels.filter((label) => context.desired.managedNames.has(label) && !context.desired.managedLabels.includes(label))
+      addLabels: [
+        ...context.desired.managedLabels.filter((label) => !currentLabels.has(label)),
+        ...context.desired.queueLabel !== void 0 && !currentLabels.has(context.desired.queueLabel) ? [context.desired.queueLabel] : []
+      ],
+      removeLabels: [
+        ...current.labels.filter((label) => context.desired.managedNames.has(label) && !context.desired.managedLabels.includes(label)),
+        ...queueLabelsToRemove
+      ]
     };
   }
   try {
@@ -22799,7 +22818,7 @@ async function applyGithubIssueProjectionAsync(db, request, digest2, adapter) {
       title: context.desired.title,
       body: context.desired.body,
       state: context.desired.state,
-      addLabels: context.desired.managedLabels,
+      addLabels: [...context.desired.managedLabels, ...context.desired.queueLabel === void 0 ? [] : [context.desired.queueLabel]],
       removeLabels: []
     };
   } else {
@@ -22823,7 +22842,7 @@ async function applyGithubIssueProjectionAsync(db, request, digest2, adapter) {
         return result("EXTERNAL_DIVERGED", request.projectId, 1, 1, 0, { message: "the GitHub issue diverged from its last verified projection" });
       }
     }
-    if (observedDigest(current, context.desired) === context.desired.digest) {
+    if (observedDigest(current, context.desired) === context.desired.digest && queueLabelMatches(current, context.desired)) {
       try {
         return finalizeProjection(db, request, digest2, context, adapter, current, "verify");
       } catch (error48) {
@@ -22838,6 +22857,7 @@ async function applyGithubIssueProjectionAsync(db, request, digest2, adapter) {
       return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
     }
     const currentLabels = new Set(current.labels);
+    const queueLabelsToRemove = context.desired.queueLabel === void 0 ? [] : current.labels.filter((label) => label.startsWith("queue:") && label !== context.desired.queueLabel);
     mutation = {
       kind: "update",
       owner: context.mapping.owner,
@@ -22846,8 +22866,14 @@ async function applyGithubIssueProjectionAsync(db, request, digest2, adapter) {
       title: context.desired.title,
       body: context.desired.body,
       state: context.desired.state,
-      addLabels: context.desired.managedLabels.filter((label) => !currentLabels.has(label)),
-      removeLabels: current.labels.filter((label) => context.desired.managedNames.has(label) && !context.desired.managedLabels.includes(label))
+      addLabels: [
+        ...context.desired.managedLabels.filter((label) => !currentLabels.has(label)),
+        ...context.desired.queueLabel !== void 0 && !currentLabels.has(context.desired.queueLabel) ? [context.desired.queueLabel] : []
+      ],
+      removeLabels: [
+        ...current.labels.filter((label) => context.desired.managedNames.has(label) && !context.desired.managedLabels.includes(label)),
+        ...queueLabelsToRemove
+      ]
     };
   }
   try {
@@ -23562,6 +23588,18 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
     const schemaState = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (" + TABLES.map(() => "?").join(",") + ") ORDER BY name").all(...TABLES);
     const configJson = storedConfigJson(db, projectId, configHead.config_revision);
     const writingLaneCeiling = writingLaneCeilingFromJson(configJson);
+    const staleProjections = db.prepare(
+      `SELECT refs.work_item_id, refs.provider, refs.owner, refs.repo, refs.issue_number,
+              refs.projection_state, refs.attempted_resource_revision,
+              items.resource_revision AS canonical_resource_revision
+         FROM external_work_refs AS refs
+         JOIN work_items AS items
+           ON items.project_id = refs.project_id AND items.work_item_id = refs.work_item_id
+        WHERE refs.project_id = ?
+          AND refs.projection_state <> 'pending'
+          AND refs.attempted_resource_revision <> items.resource_revision
+        ORDER BY refs.work_item_id, refs.provider`
+    ).all(projectId);
     const assignmentAttempts = [];
     const capacityEvidence = workItemCapacityLaneEvidence(db, projectId);
     const activeWriters = capacityEvidence.lanes;
@@ -23601,6 +23639,7 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
     const doctorMessage = [
       pluginCompatibilityMessage,
       ...routing.messages,
+      ...staleProjections.length === 0 ? [] : [`${staleProjections.length} external projection(s) are stale against canonical resource revisions`],
       ...pluginSourceUnavailable ? ["plugin source checkout is unavailable"] : []
     ].filter(Boolean).join("; ");
     const expected = targets.length + 1;
@@ -23631,6 +23670,7 @@ async function doctor(db, sdk, projectId, checkoutDivergence) {
           roleRequirementIds: domain2.roleRequirements.map((requirement) => requirement.roleRequirementId)
         })),
         eligibility,
+        projections: { stale: staleProjections },
         assignments: assignmentAttempts,
         profileAudit,
         capacity: {
@@ -25217,7 +25257,7 @@ function githubIssueBriefTarget(db, projectId, workItemId) {
   ).get(projectId, workItemId);
   if (!ref) return null;
   const initialPending = ref.projection_state === "pending" && ref.issue_number !== null;
-  if (typeof ref.owner !== "string" || typeof ref.repo !== "string" || typeof ref.issue_number !== "number" || !Number.isSafeInteger(ref.issue_number) || ref.issue_number < 1 || typeof ref.resource_revision !== "number" || !Number.isSafeInteger(ref.resource_revision) || ref.resource_revision < 1 || typeof ref.attempted_resource_revision !== "number" || !Number.isSafeInteger(ref.attempted_resource_revision) || ref.attempted_resource_revision < 1 || ref.projected_resource_revision !== null && (typeof ref.projected_resource_revision !== "number" || !Number.isSafeInteger(ref.projected_resource_revision) || ref.projected_resource_revision < 1) || typeof ref.desired_digest !== "string" || ref.desired_digest.length === 0 || ref.observed_external_digest !== null && typeof ref.observed_external_digest !== "string" || ref.observed_external_revision !== null && typeof ref.observed_external_revision !== "string" || ref.projection_state !== "pending" && ref.projection_state !== "current" && ref.projection_state !== "drifted" && ref.projection_state !== "delivery_ambiguous" || initialPending && (ref.projected_resource_revision !== null || ref.observed_external_digest !== null || ref.observed_external_revision !== null) || ref.projection_state === "current" && (ref.projected_resource_revision === null || ref.observed_external_digest === null || ref.observed_external_revision === null) || ref.projection_state !== "pending" && ref.attempted_resource_revision !== ref.resource_revision) {
+  if (typeof ref.owner !== "string" || typeof ref.repo !== "string" || typeof ref.issue_number !== "number" || !Number.isSafeInteger(ref.issue_number) || ref.issue_number < 1 || typeof ref.resource_revision !== "number" || !Number.isSafeInteger(ref.resource_revision) || ref.resource_revision < 1 || typeof ref.attempted_resource_revision !== "number" || !Number.isSafeInteger(ref.attempted_resource_revision) || ref.attempted_resource_revision < 1 || ref.projected_resource_revision !== null && (typeof ref.projected_resource_revision !== "number" || !Number.isSafeInteger(ref.projected_resource_revision) || ref.projected_resource_revision < 1) || typeof ref.desired_digest !== "string" || ref.desired_digest.length === 0 || ref.observed_external_digest !== null && typeof ref.observed_external_digest !== "string" || ref.observed_external_revision !== null && typeof ref.observed_external_revision !== "string" || ref.projection_state !== "pending" && ref.projection_state !== "current" && ref.projection_state !== "drifted" && ref.projection_state !== "delivery_ambiguous" || initialPending && (ref.projected_resource_revision !== null || ref.observed_external_digest !== null || ref.observed_external_revision !== null) || ref.projection_state === "current" && (ref.projected_resource_revision === null || ref.observed_external_digest === null || ref.observed_external_revision === null)) {
     return "invalid";
   }
   return {
@@ -25226,6 +25266,7 @@ function githubIssueBriefTarget(db, projectId, workItemId) {
     owner: ref.owner,
     repo: ref.repo,
     issueNumber: ref.issue_number,
+    stale: ref.projection_state !== "pending" && ref.attempted_resource_revision !== ref.resource_revision,
     projection: {
       projectionState: ref.projection_state,
       canonicalResourceRevision: ref.resource_revision,
@@ -25978,7 +26019,7 @@ async function dispatchLane(bb, db, input) {
   if (briefTarget === "invalid") {
     return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub issue projection identity is malformed or ambiguous" };
   }
-  if (briefTarget && !projectionIsCurrent(briefTarget) && !projectionIsInitialPending(briefTarget)) {
+  if (briefTarget && !briefTarget.stale && !projectionIsCurrent(briefTarget) && !projectionIsInitialPending(briefTarget)) {
     return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub issue projection is stale or ambiguous for the canonical WorkItem" };
   }
   const githubAdapter = briefTarget ? githubCliAdapterForWorkItem(db, request.projectId, request.workItemId ?? "") : null;
@@ -26024,6 +26065,7 @@ async function dispatchLane(bb, db, input) {
         expectedResourceRevision: currentWorkItem.resource_revision,
         workItemId: request.workItemId,
         projectionKind: "github_issue",
+        queueLabel: "queue:dispatched",
         ...configProof.continued ? {
           configRevision: configProof.currentConfigRevision,
           fixtureContextDigest: configProof.proofDigest
@@ -26691,7 +26733,7 @@ async function prepareWorkItemAttemptTerminalization(bb, db, request, policy) {
   }
   return null;
 }
-async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = readGithubIssueForBackfill, githubAdapter = null, preMutationGuard, allowThreadlessPreparedClosure = false) {
+async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = null, githubAdapter = null, preMutationGuard, allowThreadlessPreparedClosure = false) {
   const parsed = applyRequestSchema.safeParse(input);
   if (parsed.success && parsed.data.threadlessPreparedClosure !== void 0 && !allowThreadlessPreparedClosure) {
     return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less prepared closure is accepted only through the governed live inventory seam" };
@@ -26730,11 +26772,11 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
     if ("outcome" in resolved) return resolved;
     evidenceReader = resolved;
   }
-  const result2 = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader, evidenceReader);
+  const result2 = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader ?? (parsed.success ? projectGithubIssueReader(db, parsed.data.projectId) : readGithubIssueForBackfill), evidenceReader);
   await deliverSucceededRoleGenerationBrief(bb, db, input, result2);
   return result2;
 }
-async function applyLiveAuthorizedMutationAsync(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = readGithubIssueForBackfill, githubAdapter = null) {
+async function applyLiveAuthorizedMutationAsync(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = null, githubAdapter = null) {
   const parsed = applyRequestSchema.safeParse(input);
   if (parsed.success && parsed.data.threadlessPreparedClosure !== void 0) {
     return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less prepared closure is accepted only through the governed live inventory seam" };
@@ -26757,7 +26799,7 @@ async function applyLiveAuthorizedMutationAsync(bb, db, input, allowCachedConsum
     if ("outcome" in resolved) return resolved;
     evidenceReader = resolved;
   }
-  const result2 = await applyAuthorizedMutationAsync(db, input, githubAdapter, reader, null, null, githubIssueReader, evidenceReader);
+  const result2 = await applyAuthorizedMutationAsync(db, input, githubAdapter, reader, null, null, githubIssueReader ?? (parsed.success ? projectGithubIssueReader(db, parsed.data.projectId) : readGithubIssueForBackfill), evidenceReader);
   await deliverSucceededRoleGenerationBrief(bb, db, input, result2);
   return result2;
 }
