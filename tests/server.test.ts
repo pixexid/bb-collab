@@ -1677,6 +1677,117 @@ exit 0
   });
 });
 
+describe("GH-676 projection recovery evidence", () => {
+  async function boundIssueFixture() {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    const adapter = new DeterministicGitHubIssueAdapter();
+    adapter.put({
+      owner: GITHUB_OWNER,
+      repo: GITHUB_REPO,
+      issueNumber: 1,
+      title: "Existing issue",
+      body: "Existing body",
+      state: "open",
+      labels: [],
+      externalRevision: "first-observation",
+    });
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      workItem: { workItemId: WORK_ITEM_ID, title: "Ship projection", body: "Keep canonical state local.", githubIssue: { issueNumber: 1 } },
+    })).outcome).toBe("OK");
+    return { db, fenceToken, adapter };
+  }
+
+  function recoveryEvidence(externalRevision: string) {
+    return {
+      kind: "github_issue_unchanged" as const,
+      owner: GITHUB_OWNER,
+      repo: GITHUB_REPO,
+      issueNumber: 1,
+      externalRevision,
+    };
+  }
+
+  it("recovers a ref that becomes ambiguous on its first projection", async () => {
+    const { db, fenceToken, adapter } = await boundIssueFixture();
+    adapter.nextMutationOutcome = "ambiguous";
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1), adapter).outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(db.prepare("SELECT issue_number, projection_state, observed_external_revision, observed_external_digest FROM external_work_refs").get()).toMatchObject({
+      issue_number: 1,
+      projection_state: "delivery_ambiguous",
+      observed_external_revision: "first-observation",
+      observed_external_digest: expect.any(String),
+    });
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, {
+      idempotencyKey: "recover-first-projection",
+      projectionRecoveryEvidence: recoveryEvidence("first-observation"),
+    }), adapter).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, { idempotencyKey: "project-after-first-recovery" }), adapter).outcome).toBe("OK");
+  });
+
+  it("refuses recovery when the recorded observation shows the write landed", async () => {
+    const { db, fenceToken, adapter } = await boundIssueFixture();
+    const mutate = adapter.mutate.bind(adapter);
+    adapter.mutate = (input) => {
+      const response = mutate(input);
+      adapter.put({ ...response, labels: response.labels.filter((label) => label !== "queue:dispatched"), externalRevision: "landed-desired" });
+      return response;
+    };
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, {
+      idempotencyKey: "landed-but-ambiguous",
+      queueLabel: "queue:dispatched",
+    }), adapter).outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(db.prepare("SELECT observed_external_revision, observed_external_digest FROM external_work_refs").get()).toMatchObject({
+      observed_external_revision: "landed-desired",
+      observed_external_digest: expect.any(String),
+    });
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, {
+      idempotencyKey: "refuse-landed-recovery",
+      projectionRecoveryEvidence: recoveryEvidence("landed-desired"),
+      queueLabel: "queue:dispatched",
+    }), adapter).outcome).toBe("EXTERNAL_RESPONSE_INVALID");
+  });
+
+  it("refuses recovery when the external revision does not match the recorded observation", async () => {
+    const { db, fenceToken, adapter } = await boundIssueFixture();
+    adapter.nextMutationOutcome = "ambiguous";
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1), adapter).outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(db.prepare("SELECT observed_external_revision, observed_external_digest FROM external_work_refs").get()).toMatchObject({
+      observed_external_revision: "first-observation",
+      observed_external_digest: expect.any(String),
+    });
+    const changed = adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)!;
+    adapter.put({ ...changed, externalRevision: "newer-revision" });
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, {
+      idempotencyKey: "refuse-mismatched-recovery",
+      projectionRecoveryEvidence: recoveryEvidence("newer-revision"),
+    }), adapter).outcome).toBe("EXTERNAL_RESPONSE_INVALID");
+    expect(db.prepare("SELECT projection_state FROM external_work_refs").get()).toEqual({ projection_state: "delivery_ambiguous" });
+  });
+
+  it("recovers an already-current ref that later becomes ambiguous", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    const adapter = new DeterministicGitHubIssueAdapter();
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1), adapter).outcome).toBe("OK");
+    const unchanged = adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)!;
+    adapter.put({ ...unchanged, externalRevision: "current-refresh" });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
+    adapter.nextMutationOutcome = "ambiguous";
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 2, { idempotencyKey: "ambiguous-after-current" }), adapter).outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(db.prepare("SELECT observed_external_revision, observed_external_digest FROM external_work_refs").get()).toMatchObject({
+      observed_external_revision: "current-refresh",
+      observed_external_digest: expect.any(String),
+    });
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 2, {
+      idempotencyKey: "recover-after-current",
+      projectionRecoveryEvidence: recoveryEvidence("current-refresh"),
+    }), adapter).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 2, { idempotencyKey: "project-after-current-recovery" }), adapter).outcome).toBe("OK");
+  });
+});
+
 function directDatabase() {
   const directory = mkdtempSync(join(tmpdir(), "bb-collab-issue3-"));
   const path = join(directory, "data.db");

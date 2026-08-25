@@ -9795,19 +9795,25 @@ function recordProjectionState(
   outcome: "EXTERNAL_DIVERGED" | "EXTERNAL_DELIVERY_AMBIGUOUS",
   counts: { expected: number; attempted: number; verified: number },
   message: string,
+  observation?: GitHubIssueSnapshot,
 ): FoundationResult {
   return transaction(db, () => {
     const replay = checkIdempotency(db, request, digest);
     if (replay) return replay;
     const authority = revalidateProjectionContext(db, request, context);
+    const observed = observation === undefined ? null : observedDigest(observation, context.desired);
     const updated = db.prepare(
-      `UPDATE external_work_refs SET projection_state = ?, attempted_resource_revision = ?, desired_digest = ?,
-       last_idempotency_key = ?, last_request_digest = ?, updated_at_ms = ?
+      `UPDATE external_work_refs SET issue_number = COALESCE(?, issue_number), projection_state = ?,
+       attempted_resource_revision = ?, desired_digest = ?, observed_external_revision = COALESCE(?, observed_external_revision),
+       observed_external_digest = COALESCE(?, observed_external_digest), last_idempotency_key = ?, last_request_digest = ?, updated_at_ms = ?
        WHERE ${EXTERNAL_REF_CAS_WHERE}`,
     ).run(
+      observation?.issueNumber ?? null,
       state,
       context.workItem.resource_revision,
       context.desired.digest,
+      observation?.externalRevision ?? null,
+      observed,
       request.idempotencyKey,
       digest,
       now(),
@@ -9955,6 +9961,7 @@ function applyGithubIssueProjection(
   if (request.projectionRecoveryEvidence !== undefined) return recoverAmbiguousProjection(db, request, digest, context, adapter);
 
   let mutation: GitHubIssueMutation;
+  let observation: GitHubIssueSnapshot | undefined;
   if (context.ref.issue_number === null) {
     mutation = {
       kind: "create",
@@ -9976,7 +9983,8 @@ function applyGithubIssueProjection(
       if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
       return result("EXTERNAL_UNAVAILABLE", request.projectId, 1, 1, 0, { message: "the bound GitHub issue could not be read" });
     }
-    if (current.owner !== context.mapping.owner || current.repo !== context.mapping.repo || current.issueNumber !== context.ref.issue_number) {
+    observation = current;
+   if (current.owner !== context.mapping.owner || current.repo !== context.mapping.repo || current.issueNumber !== context.ref.issue_number) {
       return result("EXTERNAL_TARGET_MISMATCH", request.projectId, 1, 1, 0, { message: "the GitHub issue response has the wrong exact identity" });
     }
     const initialBinding = context.ref.projection_state === "pending" && context.ref.issue_number !== null && context.ref.observed_external_digest === null;
@@ -10039,6 +10047,7 @@ function applyGithubIssueProjection(
     if (readBack.owner !== mutation.owner || readBack.repo !== mutation.repo || readBack.issueNumber !== mutationResponse.issueNumber) {
       throw new GitHubIssueAdapterError("ambiguous");
     }
+    observation = readBack;
     return finalizeProjection(db, request, digest, context, adapter, readBack, mutation.kind);
   } catch {
     try {
@@ -10051,6 +10060,7 @@ function applyGithubIssueProjection(
         "EXTERNAL_DELIVERY_AMBIGUOUS",
         { expected: 1, attempted: 1, verified: 0 },
         "GitHub delivery or exact read-back could not be proven",
+        observation,
       );
     } catch {
       return result("EXTERNAL_DELIVERY_AMBIGUOUS", request.projectId, 1, 1, 0, { message: "GitHub delivery or local finalization could not be proven" });
@@ -10085,6 +10095,7 @@ async function applyGithubIssueProjectionAsync(
   }
 
   let mutation: GitHubIssueMutation;
+  let observation: GitHubIssueSnapshot | undefined;
   if (context.ref.issue_number === null) {
     mutation = {
       kind: "create",
@@ -10106,6 +10117,7 @@ async function applyGithubIssueProjectionAsync(
       if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
       return result("EXTERNAL_UNAVAILABLE", request.projectId, 1, 1, 0, { message: "the bound GitHub issue could not be read" });
     }
+    observation = current;
     if (current.owner !== context.mapping.owner || current.repo !== context.mapping.repo || current.issueNumber !== context.ref.issue_number) {
       return result("EXTERNAL_TARGET_MISMATCH", request.projectId, 1, 1, 0, { message: "the GitHub issue response has the wrong exact identity" });
     }
@@ -10167,6 +10179,7 @@ async function applyGithubIssueProjectionAsync(
     if (readBack.owner !== mutation.owner || readBack.repo !== mutation.repo || readBack.issueNumber !== mutationResponse.issueNumber) {
       throw new GitHubIssueAdapterError("ambiguous");
     }
+    observation = readBack;
     return finalizeProjection(db, request, digest, context, adapter, readBack, mutation.kind);
   } catch {
     try {
@@ -10179,6 +10192,7 @@ async function applyGithubIssueProjectionAsync(
         "EXTERNAL_DELIVERY_AMBIGUOUS",
         { expected: 1, attempted: 1, verified: 0 },
         "GitHub delivery or exact read-back could not be proven",
+        observation,
       );
     } catch {
       return result("EXTERNAL_DELIVERY_AMBIGUOUS", request.projectId, 1, 1, 0, { message: "GitHub delivery or local finalization could not be proven" });
