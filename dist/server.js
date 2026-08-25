@@ -27650,7 +27650,8 @@ async function runCli(db, bb, argv, ctx, deps) {
       const rawRequest = JSON.parse(requestJson);
       const request = parseApplyRequest(rawRequest);
       if (request.projectId !== projectId) return invalidCli("--project does not match request.projectId");
-      return cliResult(await applyLiveAuthorizedMutation(bb, db, rawRequest));
+      const githubAdapter = request.operationClass === "github_issue_projection" && request.projectionRecoveryEvidence !== void 0 ? githubCliAdapterForWorkItem(db, request.projectId, request.workItemId ?? "") : null;
+      return cliResult(await applyLiveAuthorizedMutation(bb, db, rawRequest, false, "refuse-active", null, githubAdapter));
     } catch (error48) {
       return invalidCli(error48 instanceof Error ? error48.message : String(error48));
     }
