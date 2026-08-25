@@ -53,6 +53,7 @@ import {
   WORK_ITEM_CAPACITY_LIFECYCLE_STATES,
   workItemCapacityLaneEvidence,
   parseWorkItemDispatchIntent,
+  threadlessPreparedClosurePopulation,
   reconcilePreparedWorkItemDispatches,
   type ApplyRequest,
   type FoundationCode,
@@ -1581,11 +1582,13 @@ function dispatchInventoryEvidence(
 ) {
   const active = threads.filter((thread) => thread.archivedAt === null).map((thread) => ({ id: thread.id, projectId: thread.projectId, parentThreadId: thread.parentThreadId, title: thread.title, status: thread.status, archivedAt: thread.archivedAt, deletedAt: thread.deletedAt }));
   const archived = threads.filter((thread) => thread.archivedAt !== null).map((thread) => ({ id: thread.id, projectId: thread.projectId, parentThreadId: thread.parentThreadId, title: thread.title, status: thread.status, archivedAt: thread.archivedAt, deletedAt: thread.deletedAt }));
+  const population = threadlessPreparedClosurePopulation(projectId);
   return {
     active,
     archived,
     matching: threads.filter((thread) => hasExactDispatchMarker(thread.title, dispatchMarker)),
-    digest: sha256(canonicalJson({ projectId, executionAttemptId, dispatchMarker, active, archived })),
+    population,
+    digest: sha256(canonicalJson({ projectId, executionAttemptId, dispatchMarker, population, active, archived })),
   };
 }
 
@@ -1639,10 +1642,10 @@ async function closeThreadlessPreparedAttempt(
     "SELECT reason_code FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ? AND work_item_id = ?",
   ).get(request.projectId, request.executionAttemptId, request.workItemId) as { reason_code: string | null } | undefined;
   const dispatchIntent = parseWorkItemDispatchIntent(attempt?.reason_code ?? null);
-  if (!attempt || !dispatchIntent || dispatchIntent.idempotencyKey !== dispatchIntentIdempotencyKey) {
+  if (!attempt || (dispatchIntent !== null && dispatchIntent.idempotencyKey !== dispatchIntentIdempotencyKey)) {
     return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure marker does not match the exact canonical attempt" };
   }
-  const dispatchMarker = `[dispatch:${dispatchIntent.idempotencyKey}]`;
+  const dispatchMarker = `[dispatch:${dispatchIntentIdempotencyKey}]`;
   const preparationRows = db.prepare(
     `SELECT event_sequence, event_json, idempotency_key
      FROM state_events
@@ -1723,7 +1726,7 @@ async function closeThreadlessPreparedAttempt(
           { kind: "dispatch_refusal", reference: `mutation:${dispatchIntentIdempotencyKey}`, digest: sha256(canonicalJson(dispatchEvidence)) },
           { kind: "replay_conflict", reference: `replay:${dispatchIntentIdempotencyKey}`, requestDigest: replayRequestDigest, digest: sha256(canonicalJson(replayEvidence)) },
           { kind: "terminalization_refusal", reference: "terminalization-refusal", digest: sha256(canonicalJson(terminalizationEvidence)) },
-          { kind: "zero_thread", reference: "native-thread-inventory", activeCount: inventory.active.length, archivedCount: inventory.archived.length, matchingCount: 0, digest: inventoryDigest },
+          { kind: "zero_thread", reference: "native-thread-inventory", population: inventory.population, activeCount: inventory.active.length, archivedCount: inventory.archived.length, matchingCount: 0, digest: inventoryDigest },
         ],
       },
     };
