@@ -17,7 +17,7 @@ current config revision, never from documentation.
 First-generation creation and succession are authorized by the operator's
 typed word (ADR 0007). The
 authority ceremony was deleted by operator ruling with no replacement: there
-is no mint surface and there never will be one.
+is no role-actor mint surface and there never will be one.
 
 The apply gates on an **actor receipt** (`actor_receipts`), never an operator
 receipt. `operator_receipts` is vestigial — the running resolver has no
@@ -25,6 +25,19 @@ operator-receipt read or write path. Cautionary, once: on 2026-08-19 the
 fleet spent hours hunting an operator-receipt mint that the resolver never
 required. Check which receipt class the code gates on before asking how to
 mint one.
+
+For non-bootstrap Decisions, GH-677 deliberately chooses actor-verified-only
+authority: any verified plugin actor may author a canonical Decision. That is
+acceptable because the mutation still requires the current project governor
+fence, verified receipt digest, immutable Decision identity, and the existing
+class-specific validators. Bootstrap Decisions remain rooted in the exact
+current governorship actor. Role-holder binding remains for role-aware
+operations; it is not silently treated as Decision authority when the request
+does not carry authenticated caller-thread identity.
+If caller-thread authentication is ever added to apply-path request shapes,
+the holder-evidence check becomes buildable and this decision should be
+revisited: `role_generations` already binds
+`holder_execution_attempt_id`, so only requester identity is missing.
 
 ## Seat pairing and epoch naming
 
