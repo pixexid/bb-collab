@@ -6066,6 +6066,11 @@ function requireDecisionAuthority(
 }
 
 function requireDecisionActor(db: SqliteDatabase, request: ApplyRequest): string {
+  // GH-677 decision: non-bootstrap Decisions are intentionally actor-verified
+  // only. Any verified plugin actor may author them; the governor fence,
+  // immutable Decision identity, and operation-specific validators remain the
+  // authority boundary. Role-holder binding belongs to role-aware operations,
+  // not this request shape, which carries no authenticated caller thread.
   return requireActor(db, request);
 }
 
