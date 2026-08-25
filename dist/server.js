@@ -14783,8 +14783,8 @@ function assertGithubIssueBriefBinding(brief, expected) {
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var RUNTIME_CONTRACT_VERSION = 30;
-var SCHEMA_VERSION = 34;
+var RUNTIME_CONTRACT_VERSION = 31;
+var SCHEMA_VERSION = 35;
 var PREVIOUS_RUNTIME_CONTRACT_VERSION = 27;
 var DEFAULT_WRITING_LANE_CEILING = 3;
 var MAX_WRITING_LANE_CEILING = 3;
@@ -15366,7 +15366,7 @@ var MIGRATIONS = [
     mutation_class TEXT NOT NULL CHECK (mutation_class IN (
       'bootstrap', 'config_revision', 'governor_claim', 'decision_create',
       'decision_disposition', 'work_item_create', 'work_item_transition',
-      'github_issue_projection', 'qualification_observation_record',
+      'github_issue_projection', 'github_pr_observation_record', 'qualification_observation_record',
       'role_generation_succession', 'assignment_prepare', 'assignment_dispatch',
       'assignment_reconcile', 'assignment_terminal', 'migration_prepare',
       'migration_step'
@@ -16240,6 +16240,90 @@ var GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION = `
 `;
 MIGRATIONS.push(GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION);
 var GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID = MIGRATIONS.length - 1;
+var GH658_GITHUB_PR_WAIT_MIGRATION = `
+  PRAGMA defer_foreign_keys = ON;
+  CREATE TABLE work_item_waits_gh658 (
+    project_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL,
+    waker TEXT NOT NULL,
+    declared_at_ms INTEGER NOT NULL CHECK (declared_at_ms >= 0),
+    declared_by_seat TEXT NOT NULL,
+    waker_kind TEXT NOT NULL
+      CHECK (waker_kind IN ('schedule', 'seat', 'work_item_succeeded', 'github_issue_closed', 'github_pr')),
+    note TEXT CHECK (note IS NULL OR length(note) <= 4096),
+    domain_id TEXT NOT NULL DEFAULT 'default',
+    pr_owner TEXT,
+    pr_repo TEXT,
+    pr_number INTEGER CHECK (pr_number IS NULL OR pr_number > 0),
+    pr_condition_kind TEXT CHECK (pr_condition_kind IS NULL OR pr_condition_kind IN ('pr_merged', 'pr_checks', 'pr_review_state')),
+    pr_expected_state TEXT,
+    pr_expected_head_sha TEXT CHECK (pr_expected_head_sha IS NULL OR (length(pr_expected_head_sha) = 40 AND pr_expected_head_sha NOT GLOB '*[^0-9a-f]*')),
+    pr_execution_attempt_id TEXT,
+    pr_waiting_thread_id TEXT,
+    pr_waiting_role_id TEXT,
+    pr_waiting_role_generation INTEGER CHECK (pr_waiting_role_generation IS NULL OR pr_waiting_role_generation > 0),
+    pr_waker_schedule TEXT,
+    pr_deadline_at_ms INTEGER CHECK (pr_deadline_at_ms IS NULL OR pr_deadline_at_ms >= 0),
+    pr_initial_semantic_digest TEXT,
+    pr_last_observed_semantic_digest TEXT,
+    pr_delivery_state TEXT NOT NULL DEFAULT 'pending'
+      CHECK (pr_delivery_state IN ('pending', 'fired', 'expired', 'cancelled', 'delivery_ambiguous')),
+    PRIMARY KEY (project_id, work_item_id),
+    FOREIGN KEY (project_id, work_item_id) REFERENCES work_items(project_id, work_item_id),
+    CHECK ((waker_kind = 'github_pr' AND pr_owner IS NOT NULL AND pr_repo IS NOT NULL AND pr_number IS NOT NULL
+      AND pr_condition_kind IS NOT NULL AND pr_expected_state IS NOT NULL AND pr_execution_attempt_id IS NOT NULL
+      AND pr_waiting_thread_id IS NOT NULL AND pr_waiting_role_id IS NOT NULL AND pr_waiting_role_generation IS NOT NULL
+      AND pr_waker_schedule IS NOT NULL AND pr_deadline_at_ms IS NOT NULL
+      AND pr_initial_semantic_digest IS NOT NULL AND pr_last_observed_semantic_digest IS NOT NULL)
+      OR waker_kind != 'github_pr'),
+    CHECK ((pr_condition_kind IN ('pr_checks', 'pr_review_state') AND pr_expected_head_sha IS NOT NULL)
+      OR pr_condition_kind IS NULL OR pr_condition_kind = 'pr_merged')
+  );
+  INSERT INTO work_item_waits_gh658 (
+    project_id, work_item_id, waker, declared_at_ms, declared_by_seat, waker_kind, note, domain_id
+  ) SELECT project_id, work_item_id, waker, declared_at_ms, declared_by_seat, waker_kind, note, domain_id
+    FROM work_item_waits;
+  DROP TABLE work_item_waits;
+  ALTER TABLE work_item_waits_gh658 RENAME TO work_item_waits;
+  CREATE INDEX work_item_waits_github_pr_delivery
+    ON work_item_waits(project_id, waker_kind, pr_delivery_state, pr_deadline_at_ms)
+    WHERE waker_kind = 'github_pr';
+  CREATE TABLE operator_receipts_gh658 (
+    project_id TEXT NOT NULL,
+    receipt_id TEXT NOT NULL UNIQUE,
+    receipt_type TEXT NOT NULL CHECK (receipt_type = 'operator_confirmation'),
+    mutation_class TEXT NOT NULL CHECK (mutation_class IN (
+      'bootstrap', 'config_revision', 'governor_claim', 'decision_create',
+      'decision_disposition', 'work_item_create', 'work_item_transition',
+      'github_issue_projection', 'github_pr_observation_record', 'qualification_observation_record',
+      'role_generation_succession', 'assignment_prepare', 'assignment_dispatch',
+      'assignment_reconcile', 'assignment_terminal', 'migration_prepare',
+      'migration_step'
+    )),
+    candidate_head TEXT NOT NULL CHECK (length(candidate_head) BETWEEN 40 AND 64 AND candidate_head NOT GLOB '*[^0-9a-f]*'),
+    binding_digest TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status = 'interim'),
+    retirement_condition TEXT NOT NULL CHECK (retirement_condition = 'host-issued receipt get-bb/bb#1541'),
+    caller_thread_id TEXT NOT NULL,
+    caller_plugin_id TEXT NOT NULL,
+    requested_from_background INTEGER NOT NULL CHECK (requested_from_background IN (0, 1)),
+    receipt_digest TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    idempotency_key TEXT,
+    request_digest TEXT,
+    consumed_at_ms INTEGER,
+    consumed_event_sequence INTEGER,
+    approver_id TEXT,
+    authorizing_decision_id TEXT,
+    authorizing_disposition_sequence INTEGER,
+    issuance_provenance TEXT CHECK (issuance_provenance IN ('console', 'attestation') OR issuance_provenance IS NULL),
+    PRIMARY KEY (project_id, receipt_id)
+  );
+  INSERT INTO operator_receipts_gh658 SELECT * FROM operator_receipts;
+  DROP TABLE operator_receipts;
+  ALTER TABLE operator_receipts_gh658 RENAME TO operator_receipts;`;
+MIGRATIONS.push(GH658_GITHUB_PR_WAIT_MIGRATION);
+var GH658_GITHUB_PR_WAIT_MIGRATION_ID = MIGRATIONS.length - 1;
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
 var GH300_BACKFILL_MIGRATION_ID = MIGRATIONS.findIndex((statement) => statement.includes("CREATE TABLE execution_attempts_gh300"));
 var CACHED_CONSUMERS = [
@@ -16372,6 +16456,7 @@ function persistedCachedConsumerRolloutEvidence(db, projectId) {
   }
 }
 var id = external_exports.string().trim().min(1).max(256);
+var roleIdSchema = external_exports.enum(ROLE_IDS);
 var targetSchema = external_exports.object({
   repoTargetId: id,
   sourceId: id,
@@ -16836,18 +16921,100 @@ var workItemInputSchema = external_exports.object({
   githubIssue: githubIssueBindingSchema.optional()
 }).strict();
 var githubRefPartSchema = external_exports.string().trim().min(1).max(256).regex(/^[A-Za-z0-9_.-]+$/u);
-var workItemBlockerSchema = external_exports.discriminatedUnion("kind", [
+var pullRequestHeadShaSchema = external_exports.string().regex(/^[0-9a-f]{40}$/u);
+var githubPrMergeStateSchema = external_exports.enum(["open", "closed_unmerged", "merged"]);
+var githubPrChecksStateSchema = external_exports.enum(["pending", "success", "failure", "cancelled", "unknown"]);
+var githubPrReviewStateSchema = external_exports.enum(["none", "approved", "changes_requested", "dismissed_or_changed", "unknown"]);
+var githubPrConditionSchema = external_exports.discriminatedUnion("kind", [
+  external_exports.object({
+    kind: external_exports.literal("pr_merged"),
+    owner: githubRefPartSchema,
+    repo: githubRefPartSchema,
+    prNumber: external_exports.number().int().positive().refine(Number.isSafeInteger),
+    expectedState: githubPrMergeStateSchema,
+    expectedHeadSha: pullRequestHeadShaSchema.optional()
+  }).strict(),
+  external_exports.object({
+    kind: external_exports.literal("pr_checks"),
+    owner: githubRefPartSchema,
+    repo: githubRefPartSchema,
+    prNumber: external_exports.number().int().positive().refine(Number.isSafeInteger),
+    expectedState: githubPrChecksStateSchema,
+    expectedHeadSha: pullRequestHeadShaSchema
+  }).strict(),
+  external_exports.object({
+    kind: external_exports.literal("pr_review_state"),
+    owner: githubRefPartSchema,
+    repo: githubRefPartSchema,
+    prNumber: external_exports.number().int().positive().refine(Number.isSafeInteger),
+    expectedState: githubPrReviewStateSchema,
+    expectedHeadSha: pullRequestHeadShaSchema
+  }).strict()
+]);
+var githubPrWaitSchema = external_exports.discriminatedUnion("kind", [
+  external_exports.object({
+    kind: external_exports.literal("pr_merged"),
+    owner: githubRefPartSchema,
+    repo: githubRefPartSchema,
+    prNumber: external_exports.number().int().positive().refine(Number.isSafeInteger),
+    expectedState: githubPrMergeStateSchema,
+    expectedHeadSha: pullRequestHeadShaSchema.optional(),
+    declaredBySeat: id,
+    executionAttemptId: id,
+    waitingThreadId: id,
+    waitingRoleId: roleIdSchema,
+    waitingRoleGeneration: external_exports.number().int().positive(),
+    wakerSchedule: id,
+    deadlineAtMs: external_exports.number().int().nonnegative(),
+    note: external_exports.string().trim().min(1).max(4096).optional()
+  }).strict(),
+  external_exports.object({
+    kind: external_exports.literal("pr_checks"),
+    owner: githubRefPartSchema,
+    repo: githubRefPartSchema,
+    prNumber: external_exports.number().int().positive().refine(Number.isSafeInteger),
+    expectedState: githubPrChecksStateSchema,
+    expectedHeadSha: pullRequestHeadShaSchema,
+    declaredBySeat: id,
+    executionAttemptId: id,
+    waitingThreadId: id,
+    waitingRoleId: roleIdSchema,
+    waitingRoleGeneration: external_exports.number().int().positive(),
+    wakerSchedule: id,
+    deadlineAtMs: external_exports.number().int().nonnegative(),
+    note: external_exports.string().trim().min(1).max(4096).optional()
+  }).strict(),
+  external_exports.object({
+    kind: external_exports.literal("pr_review_state"),
+    owner: githubRefPartSchema,
+    repo: githubRefPartSchema,
+    prNumber: external_exports.number().int().positive().refine(Number.isSafeInteger),
+    expectedState: githubPrReviewStateSchema,
+    expectedHeadSha: pullRequestHeadShaSchema,
+    declaredBySeat: id,
+    executionAttemptId: id,
+    waitingThreadId: id,
+    waitingRoleId: roleIdSchema,
+    waitingRoleGeneration: external_exports.number().int().positive(),
+    wakerSchedule: id,
+    deadlineAtMs: external_exports.number().int().nonnegative(),
+    note: external_exports.string().trim().min(1).max(4096).optional()
+  }).strict()
+]);
+var workItemBlockerSchema = external_exports.union([
   external_exports.object({ kind: external_exports.literal("work_item_succeeded"), workItemId: id }).strict(),
-  external_exports.object({ kind: external_exports.literal("github_issue_closed"), owner: githubRefPartSchema, repo: githubRefPartSchema, issueNumber: external_exports.number().int().positive().refine(Number.isSafeInteger) }).strict()
+  external_exports.object({ kind: external_exports.literal("github_issue_closed"), owner: githubRefPartSchema, repo: githubRefPartSchema, issueNumber: external_exports.number().int().positive().refine(Number.isSafeInteger) }).strict(),
+  githubPrConditionSchema
 ]);
-var workItemBlockerWithDeclarationSchema = external_exports.discriminatedUnion("kind", [
+var workItemBlockerWithDeclarationSchema = external_exports.union([
   external_exports.object({ kind: external_exports.literal("work_item_succeeded"), workItemId: id, declaredBySeat: id, note: external_exports.string().trim().min(1).max(4096).optional() }).strict(),
-  external_exports.object({ kind: external_exports.literal("github_issue_closed"), owner: githubRefPartSchema, repo: githubRefPartSchema, issueNumber: external_exports.number().int().positive().refine(Number.isSafeInteger), declaredBySeat: id, note: external_exports.string().trim().min(1).max(4096).optional() }).strict()
+  external_exports.object({ kind: external_exports.literal("github_issue_closed"), owner: githubRefPartSchema, repo: githubRefPartSchema, issueNumber: external_exports.number().int().positive().refine(Number.isSafeInteger), declaredBySeat: id, note: external_exports.string().trim().min(1).max(4096).optional() }).strict(),
+  githubPrWaitSchema
 ]);
-var workItemWaitSchema = external_exports.discriminatedUnion("kind", [
+var workItemWaitSchema = external_exports.union([
   external_exports.object({ kind: external_exports.literal("schedule"), schedule: id, declaredBySeat: id }).strict(),
   external_exports.object({ kind: external_exports.literal("seat"), seat: external_exports.enum(ROLE_IDS), declaredBySeat: id }).strict(),
-  ...workItemBlockerWithDeclarationSchema.options
+  workItemBlockerWithDeclarationSchema
 ]);
 var workItemExternalEventSchema = external_exports.object({
   kind: external_exports.enum(["github_issue_closed", "github_issue_reopened"]),
@@ -16868,7 +17035,18 @@ var projectionRecoveryEvidenceSchema = external_exports.object({
   issueNumber: external_exports.number().int().positive().refine(Number.isSafeInteger),
   externalRevision: id
 }).strict();
-var pullRequestHeadShaSchema = external_exports.string().regex(/^[0-9a-f]{40}$/u);
+var githubPrObservationSchema = external_exports.object({
+  repositoryIdentity: external_exports.object({ owner: githubRefPartSchema, repo: githubRefPartSchema }).strict(),
+  pullRequestNumber: external_exports.number().int().positive().refine(Number.isSafeInteger),
+  headSha: pullRequestHeadShaSchema,
+  state: external_exports.enum(["open", "closed"]),
+  merged: external_exports.boolean(),
+  checksSummary: githubPrChecksStateSchema,
+  reviewDecision: githubPrReviewStateSchema
+}).strict();
+function isGithubPrWait(value) {
+  return typeof value === "object" && value !== null && "kind" in value && (value.kind === "pr_merged" || value.kind === "pr_checks" || value.kind === "pr_review_state");
+}
 var reviewCandidateKindSchema = external_exports.enum(["pull-request", "local"]);
 var reviewCandidateEnvironmentSchema = external_exports.object({
   bbServerId: id,
@@ -17013,7 +17191,6 @@ var githubIssuesConfigSchema = external_exports.object({
   }
 });
 var reviewPolicySchema = external_exports.object({ connectors: reviewConnectorsSchema }).strict();
-var roleIdSchema = external_exports.enum(ROLE_IDS);
 function profileIsOneOf(profile, profiles) {
   const value = canonicalJson(profile);
   return profiles.some((candidate) => value === canonicalJson(candidate));
@@ -17130,6 +17307,7 @@ var CANONICAL_MUTATION_CLASSES = [
   "execution_attempt_terminal_report",
   "execution_attempt_interruption",
   "github_issue_projection",
+  "github_pr_observation_record",
   "qualification_observation_record",
   "role_generation_succession",
   "migration_prepare",
@@ -17300,6 +17478,8 @@ var applyRequestSchema = external_exports.object({
   workItemWait: workItemWaitSchema.nullable().optional(),
   workItemUnblock: workItemBlockerSchema.optional(),
   workItemExternalEvent: workItemExternalEventSchema.optional(),
+  githubPrObservation: githubPrObservationSchema.optional(),
+  githubPrDeliveryDisposition: external_exports.enum(["cancelled", "delivery_ambiguous"]).optional(),
   satisfactionEvidence: workItemSatisfactionEvidenceSchema.optional(),
   projectionRecoveryEvidence: projectionRecoveryEvidenceSchema.optional(),
   workAttempt: workAttemptSchema.optional(),
@@ -18079,6 +18259,10 @@ function normalizeRequest(request) {
     workItemBody: request.workItemBody ?? void 0,
     lifecycleState: request.lifecycleState ?? void 0,
     workItemWait: request.workItemWait === void 0 ? void 0 : request.workItemWait,
+    workItemUnblock: request.workItemUnblock ?? void 0,
+    workItemExternalEvent: request.workItemExternalEvent ?? void 0,
+    githubPrObservation: request.githubPrObservation ?? void 0,
+    githubPrDeliveryDisposition: request.githubPrDeliveryDisposition ?? void 0,
     satisfactionEvidence: request.satisfactionEvidence ?? void 0,
     projectionRecoveryEvidence: request.projectionRecoveryEvidence ?? void 0,
     workAttempt: request.workAttempt ?? void 0,
@@ -20630,6 +20814,8 @@ function insertWorkItemAttempt(db, input) {
     domainId: input.domainId ?? "default",
     laneId: input.laneId,
     threadId: input.threadId,
+    roleId: input.roleId ?? null,
+    roleGeneration: input.roleGeneration ?? null,
     assignmentKind: input.assignmentKind,
     requestedProfileDigest: input.requestedProfile ? requestedProfileDigest(input.requestedProfile) : null,
     reviewPrNumber: input.reviewPrNumber,
@@ -20654,6 +20840,7 @@ function insertWorkItemAttempt(db, input) {
     `INSERT INTO execution_attempts (
        project_id, execution_attempt_id, origin, lane_id, assignment_kind, attempt_ordinal,
        config_revision, work_item_id, repo_target_id, state, thread_id, reason_code,
+       role_id, role_generation,
        requested_provider_id, requested_model, requested_reasoning_level, requested_profile_digest,
        review_pr_number, review_pr_head_sha, review_candidate_kind, review_candidate_json,
        review_role_requirement_id, review_role_id, review_role_generation, review_frozen_brief_version,
@@ -20663,6 +20850,7 @@ function insertWorkItemAttempt(db, input) {
      ) VALUES (
        @projectId, @executionAttemptId, 'work_item', @laneId, @assignmentKind, @attemptOrdinal,
        @configRevision, @workItemId, @repoTargetId, @state, @threadId, @reasonCode,
+       @roleId, @roleGeneration,
        @requestedProviderId, @requestedModel, @requestedReasoningLevel, @requestedProfileDigest,
        @reviewPrNumber, @reviewPrHeadSha, @reviewCandidateKind, @reviewCandidateJson,
        @reviewRoleRequirementId, @reviewRoleId, @reviewRoleGeneration, @reviewFrozenBriefVersion,
@@ -20682,6 +20870,8 @@ function insertWorkItemAttempt(db, input) {
     state: input.state,
     threadId: input.threadId,
     reasonCode: input.reasonCode,
+    roleId: input.roleId ?? null,
+    roleGeneration: input.roleGeneration ?? null,
     requestedProviderId: input.requestedProfile?.providerId ?? null,
     requestedModel: input.requestedProfile?.model ?? null,
     requestedReasoningLevel: input.requestedProfile?.reasoningLevel ?? null,
@@ -21150,11 +21340,22 @@ function workItemReconciliationIssues(db, projectId) {
   return issues;
 }
 function workItemBlockerWaker(blocker) {
-  return blocker.kind === "work_item_succeeded" ? blocker.workItemId : `${blocker.owner}/${blocker.repo}#${blocker.issueNumber}`;
+  return blocker.kind === "work_item_succeeded" ? blocker.workItemId : blocker.kind === "github_issue_closed" ? `${blocker.owner}/${blocker.repo}#${blocker.issueNumber}` : `${blocker.owner}/${blocker.repo}#${blocker.prNumber}`;
 }
 function storedWorkItemBlocker(row) {
   if (row.waker_kind === "work_item_succeeded") {
     return { kind: "work_item_succeeded", workItemId: row.waker };
+  }
+  if (row.waker_kind === "github_pr") {
+    if (!row.pr_owner || !row.pr_repo || !row.pr_number || !row.pr_condition_kind || !row.pr_expected_state || !row.pr_execution_attempt_id || !row.pr_waiting_thread_id || !row.pr_waiting_role_id || !row.pr_waiting_role_generation || !row.pr_waker_schedule || !row.pr_deadline_at_ms) return null;
+    return {
+      kind: row.pr_condition_kind,
+      owner: row.pr_owner,
+      repo: row.pr_repo,
+      prNumber: row.pr_number,
+      expectedState: row.pr_expected_state,
+      ...row.pr_expected_head_sha === null ? {} : { expectedHeadSha: row.pr_expected_head_sha }
+    };
   }
   if (row.waker_kind !== "github_issue_closed") return null;
   const match = row.waker.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/u);
@@ -21170,7 +21371,7 @@ function workItemGithubReadTarget(request) {
     request.workItemUnblock,
     request.workItemExternalEvent,
     request.satisfactionEvidence?.kind === "github_issue_closed" ? request.satisfactionEvidence : void 0
-  ].flatMap((value) => value && value.kind !== "work_item_succeeded" && value.kind !== "schedule" && value.kind !== "seat" ? [{ owner: value.owner, repo: value.repo, issueNumber: value.issueNumber }] : []);
+  ].flatMap((value) => value && (value.kind === "github_issue_closed" || value.kind === "github_issue_reopened") ? [{ owner: value.owner, repo: value.repo, issueNumber: value.issueNumber }] : []);
   const swapping = request.lifecycleState === "blocked" && request.workItemWait !== void 0 && request.workItemUnblock !== void 0;
   if (targets.length > 1 && !swapping) throw refusal("WORK_ITEM_STATE_INVALID", "work item transition accepts one external condition");
   return targets;
@@ -21193,6 +21394,59 @@ var githubSnapshotSchema = external_exports.object({
     context.addIssue({ code: external_exports.ZodIssueCode.custom, path: ["stateReason"], message: "GitHub issue state and reason do not match" });
   }
 });
+function githubPrSemanticDigest(observation2) {
+  return sha256(canonicalJson({
+    repositoryIdentity: observation2.repositoryIdentity,
+    pullRequestNumber: observation2.pullRequestNumber,
+    headSha: observation2.headSha,
+    merge: observation2.merged ? "merged" : observation2.state === "open" ? "open" : "closed_unmerged",
+    checks: observation2.checksSummary,
+    review: observation2.reviewDecision
+  }));
+}
+function githubPrConditionSatisfied(condition, observation2) {
+  if (condition.owner !== observation2.repositoryIdentity.owner || condition.repo !== observation2.repositoryIdentity.repo || condition.prNumber !== observation2.pullRequestNumber) return false;
+  if (condition.expectedHeadSha !== void 0 && condition.expectedHeadSha !== observation2.headSha) return false;
+  const observedState = condition.kind === "pr_merged" ? observation2.merged ? "merged" : observation2.state === "open" ? "open" : "closed_unmerged" : condition.kind === "pr_checks" ? observation2.checksSummary : observation2.reviewDecision;
+  return observedState !== "unknown" && observedState === condition.expectedState;
+}
+function githubPrHeadChanged(condition, observation2) {
+  return condition.expectedHeadSha !== void 0 && condition.expectedHeadSha !== observation2.headSha;
+}
+function githubRemoteIdentity(remoteUrl) {
+  if (!remoteUrl) return null;
+  const match = remoteUrl.match(/(?:github\.com[/:])([^/]+)\/([^/]+?)(?:\.git)?$/iu);
+  return match?.[1] && match[2] ? { owner: match[1], repo: match[2] } : null;
+}
+function requireGithubPrTarget(db, projectId, configRevision, repoTargetId, condition) {
+  const target = requireTarget(db, projectId, configRevision, repoTargetId);
+  const identity = githubRemoteIdentity(typeof target.remote_url === "string" ? target.remote_url : null);
+  if (!identity || identity.owner !== condition.owner || identity.repo !== condition.repo) {
+    throw refusal("REPO_TARGET_FOREIGN", "GitHub PR wait does not match the exact configured repository target");
+  }
+}
+function requireGithubPrObservation(condition, observation2, exactHead = true) {
+  if (!observation2) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub PR observation is required");
+  if (observation2.repositoryIdentity.owner !== condition.owner || observation2.repositoryIdentity.repo !== condition.repo || observation2.pullRequestNumber !== condition.prNumber) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub PR observation does not match the exact wait identity");
+  if (exactHead && condition.expectedHeadSha !== void 0 && condition.expectedHeadSha !== observation2.headSha) {
+    throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub PR observation does not match the exact expected head SHA");
+  }
+  return observation2;
+}
+function requireGithubPrWaitBinding(db, request, workItem, configRevision, wait) {
+  requireGithubPrTarget(db, request.projectId, configRevision, workItem.repo_target_id, wait);
+  const attempt = asRow(db.prepare(
+    "SELECT execution_attempt_id, work_item_id, thread_id, role_id, role_generation, state FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?"
+  ).get(request.projectId, wait.executionAttemptId));
+  if (!attempt || attempt.work_item_id !== workItem.work_item_id || attempt.state === "interrupted" || !WORK_ITEM_CAPACITY_ATTEMPT_STATES.includes(attempt.state)) {
+    throw refusal("EXECUTION_CONTEXT_FOREIGN", "GitHub PR wait does not bind to the exact live execution attempt");
+  }
+  if (attempt.thread_id !== wait.waitingThreadId) throw refusal("ROLE_CONTEXT_FOREIGN", "GitHub PR wait does not bind to the exact waiting thread");
+  if (attempt.role_id !== wait.waitingRoleId || attempt.role_generation !== wait.waitingRoleGeneration) {
+    throw refusal("ROLE_CONTEXT_FOREIGN", "GitHub PR wait does not bind to the exact waiting seat generation");
+  }
+  if (wait.deadlineAtMs <= now()) throw refusal("WORK_ITEM_STATE_INVALID", "GitHub PR wait deadline is already expired");
+}
 function storedConfigJson(db, projectId, configRevision) {
   const row = asRow(
     db.prepare("SELECT canonical_config_json FROM project_config_revisions WHERE project_id = ? AND config_revision = ?").get(projectId, configRevision)
@@ -21572,7 +21826,7 @@ function assertNoWorkItemBlockerCycle(db, request, blocker) {
     dependencyId = next.waker;
   }
 }
-function blockerConditionSatisfied(db, request, blocker, githubObservation) {
+function blockerConditionSatisfied(db, request, blocker, githubObservation, githubPrObservation = void 0) {
   if (blocker.kind === "work_item_succeeded") {
     assertNoWorkItemBlockerCycle(db, request, blocker);
     const dependency = asRow(db.prepare(
@@ -21584,12 +21838,13 @@ function blockerConditionSatisfied(db, request, blocker, githubObservation) {
     }
     return dependency.lifecycle_state === "succeeded";
   }
+  if (blocker.kind !== "github_issue_closed") return githubPrConditionSatisfied(blocker, requireGithubPrObservation(blocker, githubPrObservation));
   if (!githubObservation) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub blocker observation is unavailable");
   if (githubObservation.owner !== blocker.owner || githubObservation.repo !== blocker.repo || githubObservation.issueNumber !== blocker.issueNumber) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub blocker observation does not match the exact stored blocker");
   return githubObservation.state === "closed";
 }
-function requireBlockerCondition(db, request, blocker, githubObservation, satisfied) {
-  const conditionSatisfied = blockerConditionSatisfied(db, request, blocker, githubObservation);
+function requireBlockerCondition(db, request, blocker, githubObservation, satisfied, githubPrObservation = void 0) {
+  const conditionSatisfied = blockerConditionSatisfied(db, request, blocker, githubObservation, githubPrObservation);
   if (conditionSatisfied !== satisfied) {
     throw refusal("WORK_ITEM_STATE_INVALID", satisfied ? "work item blocker has not fired" : "work item blocker already fired");
   }
@@ -21621,7 +21876,120 @@ function recordedGithubCloseObservation(db, projectId, workItemId, resourceRevis
   if (!parsed.success) throw refusal("WORK_ITEM_STATE_INVALID", "succeeded work item has no exact recorded close observation");
   return parsed.data.externalEvent;
 }
-function applyWorkItemTransition(db, request, digest2, githubObservation) {
+function applyGithubPrObservation(db, request, digest2) {
+  const configRevision = requireConfig(db, request);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request, false);
+  if (!request.workItemId || !request.repoTargetId || !request.executionAttemptId) {
+    throw refusal("INVALID_INPUT", "GitHub PR observation requires the exact work item, repository target, and execution attempt");
+  }
+  const currentWorkItem = asRow(db.prepare(
+    "SELECT resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?"
+  ).get(request.projectId, request.workItemId));
+  if (!currentWorkItem) throw refusal("WORK_ITEM_UNKNOWN", "work item is not known in the exact project");
+  const workItem = requireWorkItem(db, request, configRevision, request.expectedResourceRevision ?? currentWorkItem.resource_revision);
+  const wait = asRow(db.prepare(
+    "SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?"
+  ).get(request.projectId, workItem.work_item_id));
+  if (!wait || wait.waker_kind !== "github_pr") throw refusal("WORK_ITEM_WAIT_OPEN", "work item has no open GitHub PR wait");
+  const condition = storedWorkItemBlocker(wait);
+  if (!condition || !isGithubPrWait(condition)) throw refusal("WORK_ITEM_STATE_INVALID", "stored GitHub PR wait is malformed");
+  if (wait.pr_execution_attempt_id !== request.executionAttemptId) throw refusal("EXECUTION_CONTEXT_FOREIGN", "observation does not match the exact waiting execution attempt");
+  requireGithubPrTarget(db, request.projectId, configRevision, workItem.repo_target_id, condition);
+  if (request.githubPrDeliveryDisposition !== void 0) {
+    if (wait.pr_delivery_state !== "pending") {
+      return result("OK", request.projectId, 1, 0, 0, { evidence: { status: wait.pr_delivery_state, wake: false } });
+    }
+    db.prepare(
+      "UPDATE work_item_waits SET pr_delivery_state = ? WHERE project_id = ? AND work_item_id = ? AND waker_kind = 'github_pr' AND pr_delivery_state = 'pending'"
+    ).run(request.githubPrDeliveryDisposition, request.projectId, workItem.work_item_id);
+    const eventType = request.githubPrDeliveryDisposition === "cancelled" ? "github_pr_wait_cancelled" : "github_pr_wait_delivery_ambiguous";
+    return commitMutation(
+      db,
+      request,
+      digest2,
+      actorReceiptId,
+      {
+        aggregateType: "work_item",
+        aggregateId: workItem.work_item_id,
+        aggregateRevision: nextAggregateRevision(db, request.projectId, "work_item", workItem.work_item_id),
+        eventType,
+        event: { workItemId: workItem.work_item_id, condition, deliveryState: request.githubPrDeliveryDisposition }
+      },
+      { expected: 1, attempted: 1, verified: 1 },
+      {
+        currentConfigRevision: configRevision,
+        currentGovernanceEpoch: governor.governance_epoch,
+        evidence: { status: request.githubPrDeliveryDisposition, wake: false }
+      }
+    );
+  }
+  const observation2 = requireGithubPrObservation(condition, request.githubPrObservation, false);
+  const observedAtMs = request.observedAtMs ?? now();
+  if (wait.pr_delivery_state !== "pending") {
+    return result("OK", request.projectId, 1, 0, 0, { evidence: { status: wait.pr_delivery_state, wake: false } });
+  }
+  if (wait.pr_deadline_at_ms !== null && observedAtMs >= wait.pr_deadline_at_ms) {
+    db.prepare(
+      "UPDATE work_item_waits SET pr_delivery_state = 'expired' WHERE project_id = ? AND work_item_id = ? AND waker_kind = 'github_pr' AND pr_delivery_state = 'pending'"
+    ).run(request.projectId, workItem.work_item_id);
+    return commitMutation(
+      db,
+      request,
+      digest2,
+      actorReceiptId,
+      {
+        aggregateType: "work_item",
+        aggregateId: workItem.work_item_id,
+        aggregateRevision: nextAggregateRevision(db, request.projectId, "work_item", workItem.work_item_id),
+        eventType: "github_pr_wait_expired",
+        event: { workItemId: workItem.work_item_id, condition, observedAtMs, wakeKind: "github_pr_wait_expired" }
+      },
+      { expected: 1, attempted: 1, verified: 1 },
+      { currentConfigRevision: configRevision, currentGovernanceEpoch: governor.governance_epoch, evidence: { status: "expired", wake: true } }
+    );
+  }
+  const semanticDigest = githubPrSemanticDigest(observation2);
+  if (semanticDigest === wait.pr_last_observed_semantic_digest) {
+    return result("OK", request.projectId, 1, 0, 0, { evidence: { status: "silent", semanticDigest, wake: false } });
+  }
+  const headChanged = githubPrHeadChanged(condition, observation2);
+  const satisfied = githubPrConditionSatisfied(condition, observation2);
+  const wakeKind = headChanged ? "github_pr_head_changed" : satisfied ? "github_pr_condition_satisfied" : null;
+  db.prepare(
+    `UPDATE work_item_waits SET pr_last_observed_semantic_digest = ?, pr_delivery_state = ?
+     WHERE project_id = ? AND work_item_id = ? AND waker_kind = 'github_pr' AND pr_delivery_state = 'pending'`
+  ).run(semanticDigest, wakeKind === null ? "pending" : "fired", request.projectId, workItem.work_item_id);
+  return commitMutation(
+    db,
+    request,
+    digest2,
+    actorReceiptId,
+    {
+      aggregateType: "work_item",
+      aggregateId: workItem.work_item_id,
+      aggregateRevision: nextAggregateRevision(db, request.projectId, "work_item", workItem.work_item_id),
+      eventType: "github_pr_observation_recorded",
+      event: {
+        workItemId: workItem.work_item_id,
+        condition,
+        observation: observation2,
+        semanticDigest,
+        previousSemanticDigest: wait.pr_last_observed_semantic_digest,
+        wakeKind,
+        observedAtMs
+      }
+    },
+    { expected: 1, attempted: 1, verified: 1 },
+    {
+      currentConfigRevision: configRevision,
+      currentGovernanceEpoch: governor.governance_epoch,
+      evidence: { status: wakeKind === null ? "observed" : "fired", wake: wakeKind !== null, wakeKind, semanticDigest }
+    }
+  );
+}
+function applyWorkItemTransition(db, request, digest2, githubObservation, githubPrObservation) {
   if (request.threadlessPreparedClosure !== void 0) return applyThreadlessPreparedClosure(db, request, digest2);
   const committedDispatchIntent = request.reasonCode === "dispatch_intent_finalize" && request.lifecycleState === void 0 && request.workAttempt?.threadId !== void 0;
   let configRevision;
@@ -21713,7 +22081,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
   if (request.workItemBody !== void 0 && nextState === void 0 && wait === void 0) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item body updates require a lifecycle or wait transition");
   }
-  const machineWait = wait && (wait.kind === "work_item_succeeded" || wait.kind === "github_issue_closed") ? wait : null;
+  const machineWait = wait && (wait.kind === "work_item_succeeded" || wait.kind === "github_issue_closed" || wait.kind === "pr_merged" || wait.kind === "pr_checks" || wait.kind === "pr_review_state") ? wait : null;
   const enteringBlocked = nextState === "blocked" && workItem.lifecycle_state !== "blocked";
   const swappingBlockedWait = workItem.lifecycle_state === "blocked" && nextState === "blocked";
   let firedReplacementSwap = false;
@@ -21722,8 +22090,18 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
       throw refusal("WORK_ITEM_STATE_INVALID", "entering blocked requires exactly one machine-evaluable blocker");
     }
     if (existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item already carries an open wait");
-    const blocker = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber };
-    requireBlockerCondition(db, request, blocker, githubObservation, false);
+    const blocker = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : machineWait.kind === "github_issue_closed" ? { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber } : machineWait;
+    if (machineWait.kind === "pr_merged" || machineWait.kind === "pr_checks" || machineWait.kind === "pr_review_state") {
+      requireGithubPrWaitBinding(db, request, workItem, configRevision, machineWait);
+      const observation2 = requireGithubPrObservation(machineWait, githubPrObservation);
+      if (githubPrConditionSatisfied(machineWait, observation2)) {
+        return result("OK", request.projectId, 1, 0, 0, {
+          registration: "already_satisfied",
+          evidence: { kind: machineWait.kind, semanticDigest: githubPrSemanticDigest(observation2), wake: false }
+        });
+      }
+    }
+    requireBlockerCondition(db, request, blocker, githubObservation, false, githubPrObservation);
   } else if (wait !== void 0 && !swappingBlockedWait && (nextState !== void 0 || workAttempt !== void 0)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item wait mutation cannot change lifecycle state");
   }
@@ -21735,15 +22113,16 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
     if (!storedBlocker || !sameWorkItemBlocker(storedBlocker, unblock)) {
       throw refusal("WORK_ITEM_STATE_INVALID", "blocked wait swap requires the exact stored blocker");
     }
-    const replacement = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber };
+    const replacement = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : machineWait.kind === "github_issue_closed" ? { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber } : machineWait;
     if (sameWorkItemBlocker(storedBlocker, replacement)) {
       throw refusal("WORK_ITEM_STATE_INVALID", "blocked wait swap requires a different replacement blocker");
     }
+    if (isGithubPrWait(machineWait)) requireGithubPrWaitBinding(db, request, workItem, configRevision, machineWait);
     if (machineWait.kind === "work_item_succeeded") {
-      firedReplacementSwap = blockerConditionSatisfied(db, request, replacement, githubObservation);
+      firedReplacementSwap = blockerConditionSatisfied(db, request, replacement, githubObservation, githubPrObservation);
       if (firedReplacementSwap) nextState = "ready";
     } else {
-      requireBlockerCondition(db, request, replacement, githubObservation, false);
+      requireBlockerCondition(db, request, replacement, githubObservation, false, githubPrObservation);
     }
   }
   if (wait !== void 0 && !enteringBlocked && !swappingBlockedWait) {
@@ -21960,6 +22339,8 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
       repoTargetId: workItem.repo_target_id,
       laneId: workAttempt.laneId,
       threadId: workAttempt.threadId ?? null,
+      roleId: request.roleId ?? null,
+      roleGeneration: request.expectedGeneration ?? null,
       leaseOwnerThreadId: workAttempt.threadId ?? null,
       assignmentKind: workAttempt.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt),
@@ -22021,7 +22402,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
       if (!unblock || !sameWorkItemBlocker(storedBlocker, unblock)) {
         throw refusal("WORK_ITEM_STATE_INVALID", "blocked to ready requires the exact stored blocker");
       }
-      if (!firedReplacementSwap) requireBlockerCondition(db, request, unblock, githubObservation, true);
+      if (!firedReplacementSwap) requireBlockerCondition(db, request, unblock, githubObservation, true, githubPrObservation);
     } else if (unblock !== void 0 && !swappingBlockedWait && !satisfactionExit) {
       throw refusal("WORK_ITEM_STATE_INVALID", "work item unblock evidence only permits blocked to ready or an atomic blocker swap");
     }
@@ -22029,7 +22410,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
       if (unblock !== void 0 && !sameWorkItemBlocker(storedBlocker, unblock)) {
         throw refusal("WORK_ITEM_STATE_INVALID", "blocked to succeeded requires the exact stored blocker when blocker evidence is supplied");
       }
-      if (!githubIssueSatisfaction && !blockerConditionSatisfied(db, request, storedBlocker, githubObservation)) {
+      if (!githubIssueSatisfaction && !blockerConditionSatisfied(db, request, storedBlocker, githubObservation, githubPrObservation)) {
         throw refusal("WORK_ITEM_STATE_INVALID", "blocked work item blocker is still live");
       }
     }
@@ -22089,18 +22470,86 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
     });
   }
   if (enteringBlocked) {
-    const blocker = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber };
-    db.prepare(
-      `INSERT INTO work_item_waits (project_id, work_item_id, domain_id, waker, waker_kind, declared_at_ms, declared_by_seat, note)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(request.projectId, workItem.work_item_id, workItem.domain_id, workItemBlockerWaker(blocker), blocker.kind, now(), machineWait.declaredBySeat, machineWait.note ?? null);
+    const blocker = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : machineWait.kind === "github_issue_closed" ? { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber } : machineWait;
+    if (isGithubPrWait(machineWait)) {
+      const semanticDigest = githubPrSemanticDigest(githubPrObservation);
+      db.prepare(
+        `INSERT INTO work_item_waits (
+           project_id, work_item_id, domain_id, waker, waker_kind, declared_at_ms, declared_by_seat, note,
+           pr_owner, pr_repo, pr_number, pr_condition_kind, pr_expected_state, pr_expected_head_sha,
+           pr_execution_attempt_id, pr_waiting_thread_id, pr_waiting_role_id, pr_waiting_role_generation,
+           pr_waker_schedule, pr_deadline_at_ms, pr_initial_semantic_digest, pr_last_observed_semantic_digest, pr_delivery_state
+         ) VALUES (?, ?, ?, ?, 'github_pr', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
+      ).run(
+        request.projectId,
+        workItem.work_item_id,
+        workItem.domain_id,
+        workItemBlockerWaker(blocker),
+        now(),
+        machineWait.declaredBySeat,
+        machineWait.note ?? null,
+        machineWait.owner,
+        machineWait.repo,
+        machineWait.prNumber,
+        machineWait.kind,
+        machineWait.expectedState,
+        machineWait.expectedHeadSha ?? null,
+        machineWait.executionAttemptId,
+        machineWait.waitingThreadId,
+        machineWait.waitingRoleId,
+        machineWait.waitingRoleGeneration,
+        machineWait.wakerSchedule,
+        machineWait.deadlineAtMs,
+        semanticDigest,
+        semanticDigest
+      );
+    } else {
+      db.prepare(
+        `INSERT INTO work_item_waits (project_id, work_item_id, domain_id, waker, waker_kind, declared_at_ms, declared_by_seat, note)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(request.projectId, workItem.work_item_id, workItem.domain_id, workItemBlockerWaker(blocker), blocker.kind, now(), machineWait.declaredBySeat, machineWait.note ?? null);
+    }
   } else if (swappingBlockedWait && !firedReplacementSwap) {
-    const blocker = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber };
-    db.prepare(
-      `UPDATE work_item_waits
-       SET domain_id = ?, waker = ?, waker_kind = ?, declared_at_ms = ?, declared_by_seat = ?, note = ?
-       WHERE project_id = ? AND work_item_id = ?`
-    ).run(workItem.domain_id, workItemBlockerWaker(blocker), blocker.kind, now(), machineWait.declaredBySeat, machineWait.note ?? null, request.projectId, workItem.work_item_id);
+    const blocker = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : machineWait.kind === "github_issue_closed" ? { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber } : machineWait;
+    if (isGithubPrWait(machineWait)) {
+      const semanticDigest = githubPrSemanticDigest(githubPrObservation);
+      db.prepare(
+        `UPDATE work_item_waits SET domain_id = ?, waker = ?, waker_kind = 'github_pr', declared_at_ms = ?, declared_by_seat = ?, note = ?,
+          pr_owner = ?, pr_repo = ?, pr_number = ?, pr_condition_kind = ?, pr_expected_state = ?, pr_expected_head_sha = ?,
+          pr_execution_attempt_id = ?, pr_waiting_thread_id = ?, pr_waiting_role_id = ?, pr_waiting_role_generation = ?,
+          pr_waker_schedule = ?, pr_deadline_at_ms = ?, pr_initial_semantic_digest = ?, pr_last_observed_semantic_digest = ?,
+          pr_delivery_state = 'pending'
+         WHERE project_id = ? AND work_item_id = ?`
+      ).run(
+        workItem.domain_id,
+        workItemBlockerWaker(blocker),
+        now(),
+        machineWait.declaredBySeat,
+        machineWait.note ?? null,
+        machineWait.owner,
+        machineWait.repo,
+        machineWait.prNumber,
+        machineWait.kind,
+        machineWait.expectedState,
+        machineWait.expectedHeadSha ?? null,
+        machineWait.executionAttemptId,
+        machineWait.waitingThreadId,
+        machineWait.waitingRoleId,
+        machineWait.waitingRoleGeneration,
+        machineWait.wakerSchedule,
+        machineWait.deadlineAtMs,
+        semanticDigest,
+        semanticDigest,
+        request.projectId,
+        workItem.work_item_id
+      );
+    } else {
+      db.prepare(
+        `UPDATE work_item_waits
+         SET domain_id = ?, waker = ?, waker_kind = ?, declared_at_ms = ?, declared_by_seat = ?, note = ?
+         WHERE project_id = ? AND work_item_id = ?`
+      ).run(workItem.domain_id, workItemBlockerWaker(blocker), blocker.kind, now(), machineWait.declaredBySeat, machineWait.note ?? null, request.projectId, workItem.work_item_id);
+    }
   } else if (workItem.lifecycle_state === "blocked") {
     db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(request.projectId, workItem.work_item_id);
   }
@@ -22117,6 +22566,8 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
       repoTargetId: workItem.repo_target_id,
       laneId: workAttempt.laneId,
       threadId: workAttempt.threadId ?? null,
+      roleId: request.roleId ?? null,
+      roleGeneration: request.expectedGeneration ?? null,
       leaseOwnerThreadId: workAttempt.threadId ?? null,
       assignmentKind: workAttempt.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt),
@@ -22195,6 +22646,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
         ...reviewExecutionAttemptId === null ? {} : { reviewExecutionAttemptId },
         ...workAttempt === void 0 ? {} : { workAttempt },
         ...machineWait === null ? {} : { blocker: machineWait },
+        ...isGithubPrWait(machineWait ?? { kind: "none" }) ? { initialObservation: githubPrObservation, initialSemanticDigest: githubPrSemanticDigest(githubPrObservation) } : {},
         ...unblock === void 0 ? {} : { unblock },
         ...satisfactionEvidence === void 0 ? {} : { satisfactionEvidence },
         ...firedReplacementSwap ? { previousBlocker: unblock, replacementBlocker: machineWait } : {},
@@ -22216,12 +22668,14 @@ function applyWorkItemTransition(db, request, digest2, githubObservation) {
       currentGovernanceEpoch: governor.governance_epoch,
       currentResourceRevision: nextRevision,
       expectedResourceRevision: request.expectedResourceRevision ?? void 0,
+      ...isGithubPrWait(machineWait ?? { kind: "none" }) ? { registration: "registered" } : {},
       evidence: {
         workItemId: workItem.work_item_id,
         lifecycleState: nextState,
         ...executionAttemptId === null ? {} : { executionAttemptId },
         ...reviewExecutionAttemptId === null ? {} : { reviewExecutionAttemptId },
         ...machineWait === null ? {} : { blocker: machineWait },
+        ...isGithubPrWait(machineWait ?? { kind: "none" }) ? { initialSemanticDigest: githubPrSemanticDigest(githubPrObservation) } : {},
         ...unblock === void 0 ? {} : { unblock },
         ...satisfactionEvidence === void 0 ? {} : { satisfactionEvidence },
         ...firedReplacementSwap ? { previousBlocker: unblock, replacementBlocker: machineWait } : {},
@@ -23164,7 +23618,9 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
         case "work_item_create":
           return applyWorkItemCreate(db, request, digest2);
         case "work_item_transition":
-          return applyWorkItemTransition(db, request, digest2, githubObservation);
+          return applyWorkItemTransition(db, request, digest2, githubObservation, request.githubPrObservation);
+        case "github_pr_observation_record":
+          return applyGithubPrObservation(db, request, digest2);
         case "execution_attempt_terminal_report":
           return applyExecutionAttemptTerminalReport(db, request, digest2, executionAttemptEvidenceReader);
         case "execution_attempt_interruption":
@@ -23190,7 +23646,11 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
       throw error48;
     }
   } catch (error48) {
-    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+    if (error48 instanceof Refusal) {
+      const refused = refusalResult(request.projectId, error48.data);
+      const isPrRegistration = request.operationClass === "work_item_transition" && request.lifecycleState === "blocked" && isGithubPrWait(request.workItemWait);
+      return isPrRegistration ? { ...refused, registration: "refused" } : refused;
+    }
     if (isConstraintError(error48)) return result("CANONICAL_STORE_UNAVAILABLE", request.projectId, 1, 0, 0, { message: String(error48) });
     return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
   }
@@ -24067,6 +24527,7 @@ function migrateCanonicalStore(db, migrate) {
   if (!has(GH644_LOCAL_CANDIDATE_REVIEW_MIGRATION_ID) || !["review_candidate_kind", "review_candidate_json", "review_role_requirement_id", "review_role_id", "review_role_generation", "review_frozen_brief_version", "review_frozen_brief_content", "review_frozen_brief_digest", "review_return_path_json", "dispatch_input_digest"].every((column) => tableColumns(db, "execution_attempts").includes(column))) {
     throw new Error("GH644 migration ledger is incomplete");
   }
+  if (!has(GH658_GITHUB_PR_WAIT_MIGRATION_ID)) throw new Error("GH658 migration ledger is incomplete");
 }
 function databaseIsReady(db) {
   db.pragma("foreign_keys = ON");
