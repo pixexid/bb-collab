@@ -8777,12 +8777,13 @@ function applyGithubPrObservation(
   if (wait.pr_execution_attempt_id !== request.executionAttemptId) throw refusal("EXECUTION_CONTEXT_FOREIGN", "observation does not match the exact waiting execution attempt");
   requireGithubPrTarget(db, request.projectId, configRevision, workItem.repo_target_id, condition);
   if (request.githubPrDeliveryDisposition !== undefined) {
-    if (wait.pr_delivery_state !== "pending") {
+    const canRetainAmbiguousSend = request.githubPrDeliveryDisposition === "delivery_ambiguous" && wait.pr_delivery_state === "fired";
+    if (wait.pr_delivery_state !== "pending" && !canRetainAmbiguousSend) {
       return result("OK", request.projectId, 1, 0, 0, { evidence: { status: wait.pr_delivery_state, wake: false } });
     }
     db.prepare(
-      "UPDATE work_item_waits SET pr_delivery_state = ? WHERE project_id = ? AND work_item_id = ? AND waker_kind = 'github_pr' AND pr_delivery_state = 'pending'",
-    ).run(request.githubPrDeliveryDisposition, request.projectId, workItem.work_item_id);
+      "UPDATE work_item_waits SET pr_delivery_state = ? WHERE project_id = ? AND work_item_id = ? AND waker_kind = 'github_pr' AND pr_delivery_state = ?",
+    ).run(request.githubPrDeliveryDisposition, request.projectId, workItem.work_item_id, canRetainAmbiguousSend ? "fired" : "pending");
     const eventType = request.githubPrDeliveryDisposition === "cancelled"
       ? "github_pr_wait_cancelled"
       : "github_pr_wait_delivery_ambiguous";
