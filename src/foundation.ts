@@ -2265,7 +2265,6 @@ const workItemExternalEventSchema = z.object({
 const gitShaSchema = z.string().regex(/^[0-9a-f]{40,64}$/u);
 const workItemSatisfactionEvidenceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("config_revision"), configRevision: z.number().int().positive(), digest: digestSchema }).strict(),
-  z.object({ kind: z.literal("merged_commit"), commitSha: gitShaSchema }).strict(),
   z.object({ kind: z.literal("decision"), decisionId: id }).strict(),
 ]);
 const pullRequestHeadShaSchema = z.string().regex(/^[0-9a-f]{40}$/u);
@@ -8388,6 +8387,11 @@ function blockerConditionSatisfied(
     return dependency.lifecycle_state === "succeeded";
   }
   if (!githubObservation) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub blocker observation is unavailable");
+  if (
+    githubObservation.owner !== blocker.owner ||
+    githubObservation.repo !== blocker.repo ||
+    githubObservation.issueNumber !== blocker.issueNumber
+  ) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub blocker observation does not match the exact stored blocker");
   return githubObservation.state === "closed";
 }
 

@@ -16849,7 +16849,6 @@ var workItemExternalEventSchema = external_exports.object({
 var gitShaSchema = external_exports.string().regex(/^[0-9a-f]{40,64}$/u);
 var workItemSatisfactionEvidenceSchema = external_exports.discriminatedUnion("kind", [
   external_exports.object({ kind: external_exports.literal("config_revision"), configRevision: external_exports.number().int().positive(), digest: digestSchema }).strict(),
-  external_exports.object({ kind: external_exports.literal("merged_commit"), commitSha: gitShaSchema }).strict(),
   external_exports.object({ kind: external_exports.literal("decision"), decisionId: id }).strict()
 ]);
 var pullRequestHeadShaSchema = external_exports.string().regex(/^[0-9a-f]{40}$/u);
@@ -21563,6 +21562,7 @@ function blockerConditionSatisfied(db, request, blocker, githubObservation) {
     return dependency.lifecycle_state === "succeeded";
   }
   if (!githubObservation) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub blocker observation is unavailable");
+  if (githubObservation.owner !== blocker.owner || githubObservation.repo !== blocker.repo || githubObservation.issueNumber !== blocker.issueNumber) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub blocker observation does not match the exact stored blocker");
   return githubObservation.state === "closed";
 }
 function requireBlockerCondition(db, request, blocker, githubObservation, satisfied) {

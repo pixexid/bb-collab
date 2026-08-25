@@ -13391,6 +13391,10 @@ else printf '%s\\n' '[]'; fi
     expect(transition(WORK_ITEM_ID, "succeeded", 2, {
       satisfactionEvidence: { ...evidence, digest: "0".repeat(64) },
     })).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
+    expect(applyFixtureMutation(db, {
+      ...transitionRequest(fenceToken, "succeeded", 2, { idempotencyKey: "unverifiable-merged-commit" }),
+      satisfactionEvidence: { kind: "merged_commit", commitSha: "f".repeat(40) },
+    })).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0 });
     expect(transition(WORK_ITEM_ID, "succeeded", 2, { satisfactionEvidence: evidence })).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
 
     const targetId = "satisfied-blocked-target";
@@ -13422,6 +13426,36 @@ else printf '%s\\n' '[]'; fi
       to: "succeeded",
       satisfactionEvidence: evidence,
     });
+
+    const github = new DeterministicGitHubIssueAdapter();
+    const githubRead = github.read.bind(github);
+    const githubTargetId = "satisfied-github-target";
+    const storedBlocker = { kind: "github_issue_closed" as const, owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 902 };
+    const callerEvent = { kind: "github_issue_closed" as const, owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 901 };
+    github.put({ ...callerEvent, title: "Caller target", body: "", state: "closed", stateReason: "COMPLETED", labels: [], externalRevision: "caller-closed" });
+    github.put({ ...storedBlocker, title: "Stored blocker", body: "", state: "open", labels: [], externalRevision: "blocker-open" });
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      idempotencyKey: "satisfied-github-target-create",
+      workItem: { workItemId: githubTargetId, title: githubTargetId, body: githubTargetId, githubIssue: { issueNumber: callerEvent.issueNumber } },
+    }))).toMatchObject({ outcome: "OK" });
+    expect(transition(githubTargetId, "ready", 1).outcome).toBe("OK");
+    expect(applyFixtureMutation(db, transitionRequest(fenceToken, "blocked", 2, {
+      idempotencyKey: "satisfied-github-blocked",
+      workItemId: githubTargetId,
+      workItemWait: { ...storedBlocker, declaredBySeat: "worker-seat" },
+    }), null, null, null, null, githubRead)).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+    expect(applyFixtureMutation(db, transitionRequest(fenceToken, "succeeded", 3, {
+      idempotencyKey: "satisfied-github-substitute",
+      workItemId: githubTargetId,
+      satisfactionEvidence: evidence,
+      workItemExternalEvent: callerEvent,
+    }), null, null, null, null, githubRead)).toMatchObject({
+      outcome: "EXTERNAL_RESPONSE_INVALID",
+      message: "GitHub blocker observation does not match the exact stored blocker",
+      attempted: 0,
+    });
+    expect(db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, githubTargetId)).toEqual({ lifecycle_state: "blocked" });
+    expect(db.prepare("SELECT waker FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, githubTargetId)).toEqual({ waker: `${GITHUB_OWNER}/${GITHUB_REPO}#${storedBlocker.issueNumber}` });
   });
 
   it("requires review_pending between authorship and terminal success and supports review findings re-entry", async () => {
