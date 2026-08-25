@@ -489,6 +489,7 @@ type GithubIssueBriefTarget = {
   owner: string;
   repo: string;
   issueNumber: number;
+  stale: boolean;
   projection: GithubIssueBriefProjection;
 };
 
@@ -516,7 +517,7 @@ function githubIssueBriefTarget(db: SqliteDatabase | null, projectId: string, wo
     || (ref.projection_state !== "pending" && ref.projection_state !== "current" && ref.projection_state !== "drifted" && ref.projection_state !== "delivery_ambiguous")
     || (initialPending && (ref.projected_resource_revision !== null || ref.observed_external_digest !== null || ref.observed_external_revision !== null))
     || (ref.projection_state === "current" && (ref.projected_resource_revision === null || ref.observed_external_digest === null || ref.observed_external_revision === null))
-    || (ref.projection_state !== "pending" && ref.attempted_resource_revision !== ref.resource_revision)) {
+    ) {
     return "invalid";
   }
   return {
@@ -525,6 +526,7 @@ function githubIssueBriefTarget(db: SqliteDatabase | null, projectId: string, wo
     owner: ref.owner,
     repo: ref.repo,
     issueNumber: ref.issue_number,
+    stale: ref.projection_state !== "pending" && ref.attempted_resource_revision !== ref.resource_revision,
     projection: {
       projectionState: ref.projection_state as GithubIssueBriefProjection["projectionState"],
       canonicalResourceRevision: ref.resource_revision,
@@ -1402,7 +1404,7 @@ async function dispatchLane(
   if (briefTarget === "invalid") {
     return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub issue projection identity is malformed or ambiguous" };
   }
-  if (briefTarget && !projectionIsCurrent(briefTarget) && !projectionIsInitialPending(briefTarget)) {
+  if (briefTarget && !briefTarget.stale && !projectionIsCurrent(briefTarget) && !projectionIsInitialPending(briefTarget)) {
     return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub issue projection is stale or ambiguous for the canonical WorkItem" };
   }
   const githubAdapter = briefTarget ? githubCliAdapterForWorkItem(db, request.projectId, request.workItemId ?? "") : null;
@@ -1451,6 +1453,7 @@ async function dispatchLane(
         expectedResourceRevision: currentWorkItem.resource_revision,
         workItemId: request.workItemId,
         projectionKind: "github_issue",
+        queueLabel: "queue:dispatched",
         ...(configProof.continued ? {
           configRevision: configProof.currentConfigRevision,
           fixtureContextDigest: configProof.proofDigest,
@@ -2263,7 +2266,7 @@ async function applyLiveAuthorizedMutation(
   input: unknown,
   allowCachedConsumerRollout = false,
   terminalizationPolicy: WorkItemAttemptTerminalizationPolicy = "refuse-active",
-  githubIssueReader: (owner: string, repo: string, issueNumber: number) => GitHubIssueSnapshot | null = readGithubIssueForBackfill,
+  githubIssueReader: ((owner: string, repo: string, issueNumber: number) => GitHubIssueSnapshot | null) | null = null,
   githubAdapter: GitHubIssueAdapter | null = null,
   preMutationGuard?: PreMutationGuard,
   allowThreadlessPreparedClosure = false,
@@ -2307,7 +2310,7 @@ async function applyLiveAuthorizedMutation(
     if ("outcome" in resolved) return resolved;
     evidenceReader = resolved;
   }
-  const result = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader, evidenceReader);
+  const result = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader ?? (parsed.success ? projectGithubIssueReader(db, parsed.data.projectId) : readGithubIssueForBackfill), evidenceReader);
   await deliverSucceededRoleGenerationBrief(bb, db, input, result);
   return result;
 }
@@ -2318,7 +2321,7 @@ async function applyLiveAuthorizedMutationAsync(
   input: unknown,
   allowCachedConsumerRollout = false,
   terminalizationPolicy: WorkItemAttemptTerminalizationPolicy = "refuse-active",
-  githubIssueReader: (owner: string, repo: string, issueNumber: number) => GitHubIssueSnapshot | null = readGithubIssueForBackfill,
+  githubIssueReader: ((owner: string, repo: string, issueNumber: number) => GitHubIssueSnapshot | null) | null = null,
   githubAdapter: GitHubIssueAdapter | null = null,
 ): Promise<FoundationResult> {
   const parsed = applyRequestSchema.safeParse(input);
@@ -2343,7 +2346,7 @@ async function applyLiveAuthorizedMutationAsync(
     if ("outcome" in resolved) return resolved;
     evidenceReader = resolved;
   }
-  const result = await applyAuthorizedMutationAsync(db, input, githubAdapter, reader, null, null, githubIssueReader, evidenceReader);
+  const result = await applyAuthorizedMutationAsync(db, input, githubAdapter, reader, null, null, githubIssueReader ?? (parsed.success ? projectGithubIssueReader(db, parsed.data.projectId) : readGithubIssueForBackfill), evidenceReader);
   await deliverSucceededRoleGenerationBrief(bb, db, input, result);
   return result;
 }

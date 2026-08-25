@@ -913,7 +913,7 @@ async function currentGithubBriefDispatch(projectId = PROJECT_ID, connectorHost 
     ...ready,
     body: `canonical: ${maintainedIssueBody({ lifecycleState: "in_progress", scope: "Keep canonical state local." })}`,
     state: "open" as const,
-    labels: ["work-active"],
+    labels: ["work-active", "queue:dispatched"],
     externalRevision: "fixture-in-progress",
   };
   return {
@@ -925,7 +925,7 @@ async function currentGithubBriefDispatch(projectId = PROJECT_ID, connectorHost 
   };
 }
 
-function installGithubBriefGh(snapshot: { title: string; body: string; state: "open" | "closed"; labels: readonly string[]; externalRevision: string }, options: { transitionSnapshot?: typeof snapshot; incomplete?: boolean; mutationFailure?: boolean; slowConnectorHost?: string; responseUrl?: string } = {}) {
+function installGithubBriefGh(snapshot: { title: string; body: string; state: "open" | "closed"; labels: readonly string[]; externalRevision: string }, options: { transitionSnapshot?: typeof snapshot; incomplete?: boolean; mutationFailure?: boolean; slowConnectorHost?: string; responseUrl?: string; issueNumber?: number } = {}) {
   const bin = mkdtempSync(join(tmpdir(), "bb-collab-github-brief-"));
   const gh = join(bin, "gh");
   const calls = join(bin, "calls");
@@ -933,9 +933,10 @@ function installGithubBriefGh(snapshot: { title: string; body: string; state: "o
   const fastTransitioned = join(bin, "fast-transitioned");
   const slowStarted = join(bin, "slow-started");
   const slowFinished = join(bin, "slow-finished");
-  const issue = JSON.stringify({ number: 1, title: snapshot.title, body: snapshot.body, state: snapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: snapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: snapshot.labels.map((name) => ({ name })), updatedAt: snapshot.externalRevision, url: options.responseUrl ?? "https://__GH_HOST__/example/project/issues/1" });
+  const issueNumber = options.issueNumber ?? 1;
+  const issue = JSON.stringify({ number: issueNumber, title: snapshot.title, body: snapshot.body, state: snapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: snapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: snapshot.labels.map((name) => ({ name })), updatedAt: snapshot.externalRevision, url: options.responseUrl ?? `https://__GH_HOST__/example/project/issues/${issueNumber}` });
   const transitionSnapshot = options.transitionSnapshot ?? snapshot;
-  const transitionedIssue = JSON.stringify({ number: 1, title: transitionSnapshot.title, body: transitionSnapshot.body, state: transitionSnapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: transitionSnapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: transitionSnapshot.labels.map((name) => ({ name })), updatedAt: transitionSnapshot.externalRevision, url: options.responseUrl ?? "https://__GH_HOST__/example/project/issues/1" });
+  const transitionedIssue = JSON.stringify({ number: issueNumber, title: transitionSnapshot.title, body: transitionSnapshot.body, state: transitionSnapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: transitionSnapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: transitionSnapshot.labels.map((name) => ({ name })), updatedAt: transitionSnapshot.externalRevision, url: options.responseUrl ?? `https://__GH_HOST__/example/project/issues/${issueNumber}` });
   const allComments = Array.from({ length: 48 }, (_, index) => ({ id: 48 - index, body: `comment-${48 - index}`, updated_at: `comment-revision-${48 - index}` }));
   const recent = JSON.stringify(allComments.slice(0, 8));
   const older = JSON.stringify(options.incomplete ? { not: "comments" } : allComments.slice(8, 16));
@@ -956,7 +957,7 @@ fi
 if [ "$1" = api ]; then
   case "$*" in
     *--method*PATCH*|*--method*POST*)
-      ${options.mutationFailure ? "exit 12" : `touch "$state_file"; printf '%s\\n' '{"number":1,"html_url":"https://__GH_HOST__/example/project/issues/1"}' | sed "s/__GH_HOST__/$connector_host/g"`}
+      ${options.mutationFailure ? "exit 12" : `touch "$state_file"; printf '%s\\n' '{"number":${issueNumber},"html_url":"https://__GH_HOST__/example/project/issues/${issueNumber}"}' | sed "s/__GH_HOST__/$connector_host/g"`}
       exit 0 ;;
     *--paginate*) exit 12 ;;
     *page=1*) printf '%s\\n' '${recent}'; exit 0 ;;
@@ -2641,6 +2642,35 @@ else printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue:startable"}]}]]'; 
     expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "fleet-watchdog", "worktree-cleanup", "thread-archive-sweep"]);
     expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "closeThreadlessPreparedAttempt", "dispatchLane", "doctor", "export", "registerProject", "registerWait", "roleBrief", "v1-inbox-archive", "v1-inbox-mark-read", "v1-inbox-read", "v1-inbox-reply", "v1-lanes"]);
     expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["dispatch_lane", "close_threadless_prepared_attempt", "send_to_operator"]);
+  });
+
+  it("evaluates a GitHub blocker through the CLI apply reader", async () => {
+    const fixture = await assignmentFixture({ connectorHost: CONNECTOR_HOST });
+    const blocker = { kind: "github_issue_closed" as const, owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 659, declaredBySeat: "worker-seat" };
+    const github = new DeterministicGitHubIssueAdapter();
+    github.put({ owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 659, title: "Blocker", body: "", state: "open", stateReason: undefined, labels: [], externalRevision: "blocker-open" });
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "blocked", 2, { workItemWait: blocker }), github)).toMatchObject({ outcome: "OK" });
+
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-cli-github-blocker-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\nprintf '%s\\n' '{\"number\":659,\"title\":\"Blocker\",\"body\":\"\",\"state\":\"CLOSED\",\"stateReason\":\"COMPLETED\",\"labels\":[],\"updatedAt\":\"blocker-closed\",\"url\":\"https://github.test/example/project/issues/659\"}'\n");
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const request = transitionRequest(fixture.fenceToken, "ready", 3, {
+        idempotencyKey: "cli-github-blocker-ready",
+        workItemUnblock: { kind: "github_issue_closed", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 659 },
+      });
+      const cli = await fixture.host.harness.runCli(["apply", "--project", PROJECT_ID, "--request", JSON.stringify(request)]);
+      expect(cli.exitCode).toBe(0);
+      expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+      expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "ready" });
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
   });
 
   it("registers a second synthetic project through the strict seam and preserves tenant isolation", async () => {
@@ -5903,7 +5933,9 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       }) as string);
       expect(second).toMatchObject({ outcome: "OK" });
       expect(projected.fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
-      expect(restore.readCallsAndCleanup().match(/--method PATCH/gu)).toHaveLength(1);
+      const calls = restore.readCallsAndCleanup();
+      expect(calls.match(/--method PATCH/gu)).toHaveLength(1);
+      expect(calls).toContain("labels[]=queue:dispatched");
     } finally {
       restore.cleanup();
     }
@@ -5923,6 +5955,45 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       expect(result.outcome).toBe("EXTERNAL_UNAVAILABLE");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
       expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "ready" });
+    }
+  });
+
+  it("refreshes an actually wedged projection and reports it in Doctor before the refresh", async () => {
+    const fixture = await fleetWatchdogFixture(0, false, 1, false);
+    const wedgeWorkItemId = "wedge-item";
+    expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+      idempotencyKey: "wedge-create",
+      workItemId: wedgeWorkItemId,
+      workItem: { workItemId: wedgeWorkItemId, title: "Wedge", body: "Refresh this projection.", githubIssue: { issueNumber: 2 } },
+    })).outcome).toBe("OK");
+    const adapter = new DeterministicGitHubIssueAdapter();
+    adapter.put({ owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 2, title: "[bb] Wedge", body: `canonical: ${maintainedIssueBody({ lifecycleState: "proposed", scope: "Refresh this projection." })}`, state: "open", stateReason: undefined, labels: ["work-proposed"], externalRevision: "wedge-proposed" });
+    expect(applyWithFixtureReceipt(fixture.db, projectionRequest(fixture.fenceToken, 1, { workItemId: wedgeWorkItemId, idempotencyKey: "wedge-project" }), adapter).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, { idempotencyKey: "wedge-ready", workItemId: wedgeWorkItemId })).outcome).toBe("OK");
+    expect(fixture.db.prepare(
+        "SELECT projection_state, attempted_resource_revision, projected_resource_revision FROM external_work_refs WHERE project_id = ? AND work_item_id = ?",
+    ).get(PROJECT_ID, wedgeWorkItemId)).toEqual({ projection_state: "current", attempted_resource_revision: 1, projected_resource_revision: 1 });
+
+    const before = await doctor(fixture.db, fixture.host.bb.sdk, PROJECT_ID);
+    expect(before).toMatchObject({
+      outcome: "OK",
+      evidence: { projections: { stale: [{ work_item_id: wedgeWorkItemId, attempted_resource_revision: 1, canonical_resource_revision: 2 }] } },
+    });
+
+    const snapshot = { title: "[bb] Wedge", body: `canonical: ${maintainedIssueBody({ lifecycleState: "proposed", scope: "Refresh this projection." })}`, state: "open" as const, labels: ["work-proposed"], externalRevision: "wedge-proposed" };
+    const transitionSnapshot = { ...snapshot, body: `canonical: ${maintainedIssueBody({ lifecycleState: "in_progress", scope: "Refresh this projection." })}`, labels: ["work-active", "queue:dispatched"], externalRevision: "wedge-in-progress" };
+    const restore = installGithubBriefGh(snapshot, { transitionSnapshot, issueNumber: 2 });
+    try {
+      const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: transitionRequest(fixture.fenceToken, "in_progress", 2, { idempotencyKey: "refresh-wedged", workItemId: wedgeWorkItemId }),
+        spawn: dispatchSpawn(fixture.orchestratorThreadId),
+      }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+      expect(result.outcome).toBe("OK");
+      expect(fixture.db.prepare(
+        "SELECT projection_state, attempted_resource_revision, projected_resource_revision FROM external_work_refs WHERE project_id = ? AND work_item_id = ?",
+      ).get(PROJECT_ID, wedgeWorkItemId)).toEqual({ projection_state: "current", attempted_resource_revision: 3, projected_resource_revision: 3 });
+    } finally {
+      restore.cleanup();
     }
   });
 
@@ -12666,6 +12737,34 @@ else printf '%s\\n' '[]'; fi
       { repo_target_id: TARGET_ID },
       { repo_target_id: TARGET_ID },
     ]);
+  });
+
+  it("rejects routing-suffix SKUs outside director-seat and preserves the ratified standby", async () => {
+    for (const mutate of [
+      (config: ReturnType<typeof roleConfig>) => {
+        const worker = (config.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>).find((requirement) => requirement.roleId === "worker")!;
+        worker.executedProfile = { ...(worker.executedProfile as Record<string, unknown>), model: "gpt-5.6-luna[1m]" };
+      },
+      (config: ReturnType<typeof roleConfig>) => {
+        const worker = (config.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>).find((requirement) => requirement.roleId === "worker")!;
+        worker.standbyProfile = { ...DIRECTOR_PROFILE };
+      },
+    ]) {
+      const host = await loadedHost();
+      const db = host.bb.storage.database();
+      seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
+      const config = roleConfig();
+      mutate(config);
+      expect(applyFixtureMutation(db, bootstrapRequest(PROJECT_ID, { config })).outcome).toBe("INVALID_INPUT");
+      expect(db.prepare("SELECT COUNT(*) AS count FROM project_config_revisions").get()).toEqual({ count: 0 });
+    }
+
+    const directorHost = await loadedHost();
+    const directorDb = directorHost.bb.storage.database();
+    seedVerifiedFixtureReceipt(directorDb, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
+    expect(applyFixtureMutation(directorDb, bootstrapRequest(PROJECT_ID, {
+      config: directorSeatConfig(DIRECTOR_STANDBY_PROFILE, DIRECTOR_PROFILE),
+    })).outcome).toBe("OK");
   });
 
   it("allows stale proposed -> ready -> in_progress -> review_pending -> in_progress transitions without rebinding", async () => {
