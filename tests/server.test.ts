@@ -6690,7 +6690,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       configRevision: 2,
       expectedGovernanceEpoch: 1,
       expectedFenceToken: fixture.fenceToken,
-      config: { ...bootstrapRequest().config, permissionMode: "auto", visibility: "visible" },
+      config: { ...(bootstrapRequest().config as Record<string, unknown>), permissionMode: "auto", visibility: "visible" },
       targets: [{ ...bootstrapRequest().targets![0]!, defaultBranch: "develop" }],
     })).toMatchObject({ outcome: "OK", currentConfigRevision: 2 });
     fixture.host.harness.sdk.stub("threads.list", (async () => []) as never);
@@ -12988,7 +12988,7 @@ else printf '%s\\n' '[]'; fi
       configRevision: 2,
       expectedGovernanceEpoch: 1,
       expectedFenceToken: fenceToken,
-      config: { ...bootstrapRequest().config, permissionMode: "auto", visibility: "visible" },
+      config: { ...(bootstrapRequest().config as Record<string, unknown>), permissionMode: "auto", visibility: "visible" },
       targets: [{ ...bootstrapRequest().targets![0]!, defaultBranch: "develop" }],
     })).toMatchObject({ outcome: "OK", currentConfigRevision: 2 });
 
