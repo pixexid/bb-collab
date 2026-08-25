@@ -15366,7 +15366,7 @@ var MIGRATIONS = [
     mutation_class TEXT NOT NULL CHECK (mutation_class IN (
       'bootstrap', 'config_revision', 'governor_claim', 'decision_create',
       'decision_disposition', 'work_item_create', 'work_item_transition',
-      'github_issue_projection', 'qualification_observation_record',
+      'github_issue_projection', 'github_pr_observation_record', 'qualification_observation_record',
       'role_generation_succession', 'assignment_prepare', 'assignment_dispatch',
       'assignment_reconcile', 'assignment_terminal', 'migration_prepare',
       'migration_step'
@@ -16287,7 +16287,41 @@ var GH658_GITHUB_PR_WAIT_MIGRATION = `
   ALTER TABLE work_item_waits_gh658 RENAME TO work_item_waits;
   CREATE INDEX work_item_waits_github_pr_delivery
     ON work_item_waits(project_id, waker_kind, pr_delivery_state, pr_deadline_at_ms)
-    WHERE waker_kind = 'github_pr';`;
+    WHERE waker_kind = 'github_pr';
+  CREATE TABLE operator_receipts_gh658 (
+    project_id TEXT NOT NULL,
+    receipt_id TEXT NOT NULL UNIQUE,
+    receipt_type TEXT NOT NULL CHECK (receipt_type = 'operator_confirmation'),
+    mutation_class TEXT NOT NULL CHECK (mutation_class IN (
+      'bootstrap', 'config_revision', 'governor_claim', 'decision_create',
+      'decision_disposition', 'work_item_create', 'work_item_transition',
+      'github_issue_projection', 'github_pr_observation_record', 'qualification_observation_record',
+      'role_generation_succession', 'assignment_prepare', 'assignment_dispatch',
+      'assignment_reconcile', 'assignment_terminal', 'migration_prepare',
+      'migration_step'
+    )),
+    candidate_head TEXT NOT NULL CHECK (length(candidate_head) BETWEEN 40 AND 64 AND candidate_head NOT GLOB '*[^0-9a-f]*'),
+    binding_digest TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status = 'interim'),
+    retirement_condition TEXT NOT NULL CHECK (retirement_condition = 'host-issued receipt get-bb/bb#1541'),
+    caller_thread_id TEXT NOT NULL,
+    caller_plugin_id TEXT NOT NULL,
+    requested_from_background INTEGER NOT NULL CHECK (requested_from_background IN (0, 1)),
+    receipt_digest TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    idempotency_key TEXT,
+    request_digest TEXT,
+    consumed_at_ms INTEGER,
+    consumed_event_sequence INTEGER,
+    approver_id TEXT,
+    authorizing_decision_id TEXT,
+    authorizing_disposition_sequence INTEGER,
+    issuance_provenance TEXT CHECK (issuance_provenance IN ('console', 'attestation') OR issuance_provenance IS NULL),
+    PRIMARY KEY (project_id, receipt_id)
+  );
+  INSERT INTO operator_receipts_gh658 SELECT * FROM operator_receipts;
+  DROP TABLE operator_receipts;
+  ALTER TABLE operator_receipts_gh658 RENAME TO operator_receipts;`;
 MIGRATIONS.push(GH658_GITHUB_PR_WAIT_MIGRATION);
 var GH658_GITHUB_PR_WAIT_MIGRATION_ID = MIGRATIONS.length - 1;
 var schemaDigest = sha256(MIGRATIONS.join("\n"));
@@ -19959,11 +19993,7 @@ function applyDecisionMutation(db, request, digest2, _reader) {
       return replay ?? applyDecisionDisposition(db, request, digest2);
     });
   } catch (error48) {
-    if (error48 instanceof Refusal) {
-      const refused = refusalResult(request.projectId, error48.data);
-      const isPrRegistration = request.operationClass === "work_item_transition" && request.lifecycleState === "blocked" && isGithubPrWait(request.workItemWait);
-      return isPrRegistration ? { ...refused, registration: "refused" } : refused;
-    }
+    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
     if (isConstraintError(error48)) return unavailableResult(request.projectId, "canonical decision disposition could not be committed unambiguously");
     return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal decision mutation error" });
   }
@@ -20784,6 +20814,8 @@ function insertWorkItemAttempt(db, input) {
     domainId: input.domainId ?? "default",
     laneId: input.laneId,
     threadId: input.threadId,
+    roleId: input.roleId ?? null,
+    roleGeneration: input.roleGeneration ?? null,
     assignmentKind: input.assignmentKind,
     requestedProfileDigest: input.requestedProfile ? requestedProfileDigest(input.requestedProfile) : null,
     reviewPrNumber: input.reviewPrNumber,
@@ -20808,6 +20840,7 @@ function insertWorkItemAttempt(db, input) {
     `INSERT INTO execution_attempts (
        project_id, execution_attempt_id, origin, lane_id, assignment_kind, attempt_ordinal,
        config_revision, work_item_id, repo_target_id, state, thread_id, reason_code,
+       role_id, role_generation,
        requested_provider_id, requested_model, requested_reasoning_level, requested_profile_digest,
        review_pr_number, review_pr_head_sha, review_candidate_kind, review_candidate_json,
        review_role_requirement_id, review_role_id, review_role_generation, review_frozen_brief_version,
@@ -20817,6 +20850,7 @@ function insertWorkItemAttempt(db, input) {
      ) VALUES (
        @projectId, @executionAttemptId, 'work_item', @laneId, @assignmentKind, @attemptOrdinal,
        @configRevision, @workItemId, @repoTargetId, @state, @threadId, @reasonCode,
+       @roleId, @roleGeneration,
        @requestedProviderId, @requestedModel, @requestedReasoningLevel, @requestedProfileDigest,
        @reviewPrNumber, @reviewPrHeadSha, @reviewCandidateKind, @reviewCandidateJson,
        @reviewRoleRequirementId, @reviewRoleId, @reviewRoleGeneration, @reviewFrozenBriefVersion,
@@ -20836,6 +20870,8 @@ function insertWorkItemAttempt(db, input) {
     state: input.state,
     threadId: input.threadId,
     reasonCode: input.reasonCode,
+    roleId: input.roleId ?? null,
+    roleGeneration: input.roleGeneration ?? null,
     requestedProviderId: input.requestedProfile?.providerId ?? null,
     requestedModel: input.requestedProfile?.model ?? null,
     requestedReasoningLevel: input.requestedProfile?.reasoningLevel ?? null,
@@ -21400,12 +21436,15 @@ function requireGithubPrObservation(condition, observation2, exactHead = true) {
 function requireGithubPrWaitBinding(db, request, workItem, configRevision, wait) {
   requireGithubPrTarget(db, request.projectId, configRevision, workItem.repo_target_id, wait);
   const attempt = asRow(db.prepare(
-    "SELECT execution_attempt_id, work_item_id, thread_id, state FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?"
+    "SELECT execution_attempt_id, work_item_id, thread_id, role_id, role_generation, state FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?"
   ).get(request.projectId, wait.executionAttemptId));
   if (!attempt || attempt.work_item_id !== workItem.work_item_id || attempt.state === "interrupted" || !WORK_ITEM_CAPACITY_ATTEMPT_STATES.includes(attempt.state)) {
     throw refusal("EXECUTION_CONTEXT_FOREIGN", "GitHub PR wait does not bind to the exact live execution attempt");
   }
   if (attempt.thread_id !== wait.waitingThreadId) throw refusal("ROLE_CONTEXT_FOREIGN", "GitHub PR wait does not bind to the exact waiting thread");
+  if (attempt.role_id !== wait.waitingRoleId || attempt.role_generation !== wait.waitingRoleGeneration) {
+    throw refusal("ROLE_CONTEXT_FOREIGN", "GitHub PR wait does not bind to the exact waiting seat generation");
+  }
   if (wait.deadlineAtMs <= now()) throw refusal("WORK_ITEM_STATE_INVALID", "GitHub PR wait deadline is already expired");
 }
 function storedConfigJson(db, projectId, configRevision) {
@@ -22078,6 +22117,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
     if (sameWorkItemBlocker(storedBlocker, replacement)) {
       throw refusal("WORK_ITEM_STATE_INVALID", "blocked wait swap requires a different replacement blocker");
     }
+    if (isGithubPrWait(machineWait)) requireGithubPrWaitBinding(db, request, workItem, configRevision, machineWait);
     if (machineWait.kind === "work_item_succeeded") {
       firedReplacementSwap = blockerConditionSatisfied(db, request, replacement, githubObservation, githubPrObservation);
       if (firedReplacementSwap) nextState = "ready";
@@ -22299,6 +22339,8 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
       repoTargetId: workItem.repo_target_id,
       laneId: workAttempt.laneId,
       threadId: workAttempt.threadId ?? null,
+      roleId: request.roleId ?? null,
+      roleGeneration: request.expectedGeneration ?? null,
       leaseOwnerThreadId: workAttempt.threadId ?? null,
       assignmentKind: workAttempt.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt),
@@ -22524,6 +22566,8 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
       repoTargetId: workItem.repo_target_id,
       laneId: workAttempt.laneId,
       threadId: workAttempt.threadId ?? null,
+      roleId: request.roleId ?? null,
+      roleGeneration: request.expectedGeneration ?? null,
       leaseOwnerThreadId: workAttempt.threadId ?? null,
       assignmentKind: workAttempt.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt),
@@ -23602,7 +23646,11 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
       throw error48;
     }
   } catch (error48) {
-    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+    if (error48 instanceof Refusal) {
+      const refused = refusalResult(request.projectId, error48.data);
+      const isPrRegistration = request.operationClass === "work_item_transition" && request.lifecycleState === "blocked" && isGithubPrWait(request.workItemWait);
+      return isPrRegistration ? { ...refused, registration: "refused" } : refused;
+    }
     if (isConstraintError(error48)) return result("CANONICAL_STORE_UNAVAILABLE", request.projectId, 1, 0, 0, { message: String(error48) });
     return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
   }

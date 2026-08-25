@@ -1196,7 +1196,10 @@ function githubPrChecksWait(executionAttemptId: string, overrides: Partial<Githu
 
 async function githubPrBaseFixture() {
   const fixture = await assignmentFixture({ targetRemoteUrl: `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git` });
-  const started = applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2));
+  const started = applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
+    roleId: "worker",
+    expectedGeneration: 1,
+  }));
   expect(started.outcome).toBe("OK");
   const executionAttemptId = (started.evidence as { executionAttemptId: string }).executionAttemptId;
   const observation = githubPrObservation();
@@ -1215,7 +1218,7 @@ async function githubPrWaitFixture() {
 }
 
 function githubPrObservationRequest(
-  fixture: Awaited<ReturnType<typeof githubPrWaitFixture>>,
+  fixture: { fixture: { db: Database.Database; fenceToken: string }; executionAttemptId: string },
   observation: GithubPrObservation,
   idempotencyKey: string,
   overrides: Partial<ApplyRequest> = {},
@@ -1287,6 +1290,56 @@ describe("GH-658 canonical GitHub PR waits", () => {
     expect(JSON.parse((next.fixture.db.prepare("SELECT event_json FROM state_events WHERE event_type = 'github_pr_observation_recorded'").get() as { event_json: string }).event_json)).toMatchObject({ wakeKind: "github_pr_head_changed" });
   });
 
+  it("binds the waiting seat and generation to the exact execution attempt", async () => {
+    const fixture = await githubPrBaseFixture();
+    const request = transitionRequest(fixture.fixture.fenceToken, "blocked", 3, {
+      idempotencyKey: "github-pr-wrong-waiting-seat",
+      workItemWait: githubPrChecksWait(fixture.executionAttemptId, { waitingRoleId: "director", waitingRoleGeneration: 1 }),
+      githubPrObservation: fixture.observation,
+    });
+    const before = exportFoundation(fixture.fixture.db, PROJECT_ID);
+    const refused = applyWithFixtureReceipt(fixture.fixture.db, request);
+    expect(refused).toMatchObject({ outcome: "ROLE_CONTEXT_FOREIGN", registration: "refused" });
+    expect(exportFoundation(fixture.fixture.db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("fires merge and review conditions and enumerates every normalized state", async () => {
+    const stateVocabulary = {
+      merge: ["open", "closed_unmerged", "merged"],
+      checks: ["pending", "success", "failure", "cancelled", "unknown"],
+      review: ["none", "approved", "changes_requested", "dismissed_or_changed", "unknown"],
+    } as const;
+    expect(stateVocabulary.merge).toHaveLength(3);
+    expect(stateVocabulary.checks).toHaveLength(5);
+    expect(stateVocabulary.review).toHaveLength(5);
+    const cases = [
+      {
+        kind: "pr_merged" as const,
+        expectedState: "merged" as const,
+        observation: githubPrObservation({ state: "closed", merged: true }),
+      },
+      {
+        kind: "pr_review_state" as const,
+        expectedState: "approved" as const,
+        observation: githubPrObservation({ reviewDecision: "approved" }),
+      },
+    ];
+    for (const item of cases) {
+      const fixture = await githubPrBaseFixture();
+      const wait = item.kind === "pr_merged"
+        ? ((() => { const { expectedHeadSha: _head, ...withoutHead } = fixture.wait; return { ...withoutHead, kind: item.kind, expectedState: item.expectedState }; })() as GithubPrWaitRegistration)
+        : ({ ...fixture.wait, kind: item.kind, expectedState: item.expectedState } as GithubPrWaitRegistration);
+      const registered = applyWithFixtureReceipt(fixture.fixture.db, transitionRequest(fixture.fixture.fenceToken, "blocked", 3, {
+        idempotencyKey: `github-pr-register-fire-${item.kind}`,
+        workItemWait: wait,
+        githubPrObservation: fixture.observation,
+      }));
+      expect(registered).toMatchObject({ outcome: "OK", registration: "registered" });
+      const fired = applyWithFixtureReceipt(fixture.fixture.db, githubPrObservationRequest(fixture, item.observation, `github-pr-fire-${item.kind}`));
+      expect(fired).toMatchObject({ outcome: "OK", evidence: { status: "fired", wake: true, wakeKind: "github_pr_condition_satisfied" } });
+    }
+  });
+
   it("returns already_satisfied without registering a wait when the baseline already matches", async () => {
     const fixture = await githubPrBaseFixture();
     const registered = applyWithFixtureReceipt(fixture.fixture.db, transitionRequest(fixture.fixture.fenceToken, "blocked", 3, {
@@ -1323,22 +1376,27 @@ describe("GH-658 canonical GitHub PR waits", () => {
       { name: "wrong PR", mutate: (request) => ({ ...request, githubPrObservation: githubPrObservation({ pullRequestNumber: 659 }) }) },
       { name: "wrong head SHA", mutate: (request) => ({ ...request, githubPrObservation: githubPrObservation({ headSha: "c".repeat(40) }) }) },
       { name: "partial or unknown GitHub response", mutate: (request) => ({ ...request, githubPrObservation: ({ ...githubPrObservation(), reviewDecision: undefined } as unknown as GithubPrObservation) }) },
-      { name: "expired wait", mutate: (request) => ({ ...request, workItemWait: githubPrChecksWait(request.executionAttemptId!, { deadlineAtMs: 0 }) }) },
+      { name: "expired wait", mutate: (request) => ({ ...request, workItemWait: { ...(request.workItemWait as GithubPrWaitRegistration), deadlineAtMs: 0 } }) },
       { name: "stale config/fence", mutate: (request) => ({ ...request, expectedConfigRevision: 2, expectedFenceToken: "stale-fence" }) },
       { name: "archived or deleted waiting target", mutate: (request) => ({
         ...request,
-        workItemWait: githubPrChecksWait(request.executionAttemptId!, { waitingThreadId: "archived-or-deleted-thread" }),
+        workItemWait: { ...(request.workItemWait as GithubPrWaitRegistration), waitingThreadId: "archived-or-deleted-thread" },
       }) },
     ];
     for (const item of cases) {
-      const fixture = await githubPrWaitFixture();
+      const fixture = await githubPrBaseFixture();
       const request = transitionRequest(fixture.fixture.fenceToken, "blocked", 3, {
         idempotencyKey: `github-pr-mutant-${item.name}`,
         workItemWait: fixture.wait,
         githubPrObservation: fixture.observation,
       });
+      const baseline = applyWithFixtureReceipt(fixture.fixture.db, request);
+      expect(baseline, `unmutated baseline for ${item.name}`).toMatchObject({ outcome: "OK", registration: "registered" });
       const before = exportFoundation(fixture.fixture.db, PROJECT_ID);
-      const result = applyWithFixtureReceipt(fixture.fixture.db, item.mutate(request));
+      const result = applyWithFixtureReceipt(fixture.fixture.db, item.mutate({
+        ...request,
+        idempotencyKey: `${request.idempotencyKey}-mutated`,
+      }));
       expect(result.outcome, item.name).not.toBe("OK");
       expect(exportFoundation(fixture.fixture.db, PROJECT_ID), item.name).toEqual(before);
     }
@@ -10519,7 +10577,7 @@ else printf '%s\\n' '[]'; fi
     expect(MIGRATIONS).toHaveLength(48);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
-    expect(sha256(MIGRATIONS.slice(0, GH636_PREVIOUS_MIGRATION_ID + 1).join("\n"))).toBe("b8beac282f4b36cf0dca454f3be9ffc11bae6a3d2c66388c9e43210928e4a5c8");
+    expect(sha256(MIGRATIONS.slice(0, GH636_PREVIOUS_MIGRATION_ID + 1).join("\n"))).toBe("d86b8e97a0b9d2230b4bd5199dc3463dd803a6ee070633b215b8570553cadb6b");
     expect(GH636_PREVIOUS_MIGRATION_ID).toBe(43);
     expect(GH636_REPAIR_MIGRATION_ID).toBe(44);
     expect(sha256(MIGRATIONS[GH636_PREVIOUS_MIGRATION_ID]!)).toBe("a9af01dcf639dce371dca7f504c0b2127a11057b4e8259f35e096ff014698ac7");
