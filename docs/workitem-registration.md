@@ -81,3 +81,26 @@ then calls `applyLiveAuthorizedMutation` in `server.ts`. The create resolver
 requires the current config, governor, verified actor receipt, exact repository
 target, and `expectedResourceRevision: null`; it creates the WorkItem in
 `proposed` state and returns the canonical mutation receipt.
+
+To resolve a durably fenced `delivery_ambiguous` GitHub projection, use the
+same documented CLI apply seam with the exact previously verified observation:
+
+```json
+{
+  "operationClass": "github_issue_projection",
+  "projectionKind": "github_issue",
+  "projectionRecoveryEvidence": {
+    "kind": "github_issue_unchanged",
+    "owner": "<mapped-owner>",
+    "repo": "<mapped-repo>",
+    "issueNumber": 667,
+    "externalRevision": "<last-observed-external-revision>"
+  }
+}
+```
+
+Include the normal project, actor, config, governorship, repository-target,
+resource-revision, WorkItem, and idempotency fields. The live CLI supplies the
+GitHub adapter only for this recovery request; it rereads the exact mapped
+issue and resets the ref to `pending` only when the unchanged observation proves
+the attempted write did not land. Ordinary projection apply remains fenced.

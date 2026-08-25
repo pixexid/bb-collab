@@ -16851,6 +16851,13 @@ var workItemSatisfactionEvidenceSchema = external_exports.discriminatedUnion("ki
   external_exports.object({ kind: external_exports.literal("config_revision"), configRevision: external_exports.number().int().positive(), digest: digestSchema }).strict(),
   external_exports.object({ kind: external_exports.literal("decision"), decisionId: id }).strict()
 ]);
+var projectionRecoveryEvidenceSchema = external_exports.object({
+  kind: external_exports.literal("github_issue_unchanged"),
+  owner: githubRefPartSchema,
+  repo: githubRefPartSchema,
+  issueNumber: external_exports.number().int().positive().refine(Number.isSafeInteger),
+  externalRevision: id
+}).strict();
 var pullRequestHeadShaSchema = external_exports.string().regex(/^[0-9a-f]{40}$/u);
 var reviewCandidateKindSchema = external_exports.enum(["pull-request", "local"]);
 var reviewCandidateEnvironmentSchema = external_exports.object({
@@ -17278,6 +17285,7 @@ var applyRequestSchema = external_exports.object({
   workItemUnblock: workItemBlockerSchema.optional(),
   workItemExternalEvent: workItemExternalEventSchema.optional(),
   satisfactionEvidence: workItemSatisfactionEvidenceSchema.optional(),
+  projectionRecoveryEvidence: projectionRecoveryEvidenceSchema.optional(),
   workAttempt: workAttemptSchema.optional(),
   projectionKind: external_exports.literal("github_issue").optional(),
   queueLabel: external_exports.literal("queue:dispatched").optional(),
@@ -18056,6 +18064,7 @@ function normalizeRequest(request) {
     lifecycleState: request.lifecycleState ?? void 0,
     workItemWait: request.workItemWait === void 0 ? void 0 : request.workItemWait,
     satisfactionEvidence: request.satisfactionEvidence ?? void 0,
+    projectionRecoveryEvidence: request.projectionRecoveryEvidence ?? void 0,
     workAttempt: request.workAttempt ?? void 0,
     projectionKind: request.projectionKind ?? void 0,
     roleId: request.roleId ?? void 0,
@@ -22488,7 +22497,7 @@ function revalidateProjectionContext(db, request, context) {
   }
   return { configRevision, governor, actorReceiptId, workItem, mapping };
 }
-function prepareProjection(db, request, digest2, adapter) {
+function prepareProjection(db, request, digest2, adapter, allowDeliveryAmbiguous = false) {
   return transaction(db, () => {
     const replay = checkIdempotency(db, request, digest2);
     if (replay) return replay;
@@ -22512,7 +22521,7 @@ function prepareProjection(db, request, digest2, adapter) {
       if (ref.owner !== mapping.owner || ref.repo !== mapping.repo) {
         throw refusal("EXTERNAL_REF_CONFLICT", "external ref conflicts with the exact repository mapping");
       }
-      if (ref.projection_state === "pending" && ref.issue_number === null || ref.projection_state === "delivery_ambiguous") {
+      if (ref.projection_state === "pending" && ref.issue_number === null || ref.projection_state === "delivery_ambiguous" && !allowDeliveryAmbiguous) {
         throw refusal("EXTERNAL_DELIVERY_AMBIGUOUS", "external delivery is durably fenced", { expected: 1, attempted: 0, verified: 0 });
       }
       if (ref.projection_state === "drifted") {
@@ -22565,6 +22574,89 @@ function prepareProjection(db, request, digest2, adapter) {
       desired,
       ref
     };
+  });
+}
+function recoverAmbiguousProjection(db, request, digest2, context, adapter) {
+  const evidence = request.projectionRecoveryEvidence;
+  if (evidence === void 0 || context.ref.projection_state !== "delivery_ambiguous") {
+    return refusalResult(request.projectId, {
+      code: "EXTERNAL_DELIVERY_AMBIGUOUS",
+      message: "external delivery is durably fenced",
+      expected: 1,
+      attempted: 0,
+      verified: 0
+    });
+  }
+  if (context.ref.issue_number === null || evidence.owner !== context.ref.owner || evidence.repo !== context.ref.repo || evidence.issueNumber !== context.ref.issue_number || context.ref.observed_external_revision === null || context.ref.observed_external_digest === null) {
+    return refusalResult(request.projectId, {
+      code: "EXTERNAL_RESPONSE_INVALID",
+      message: "projection recovery evidence does not name the exact previously verified issue observation",
+      expected: 1,
+      attempted: 0,
+      verified: 0
+    });
+  }
+  let snapshot2;
+  try {
+    const value = adapter.read(evidence.owner, evidence.repo, evidence.issueNumber);
+    if (value === null) return result("EXTERNAL_RESPONSE_INVALID", request.projectId, 1, 1, 0, { message: "projection recovery issue observation was not found" });
+    snapshot2 = parseSnapshot(value);
+  } catch (error48) {
+    if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
+    return result("EXTERNAL_RESPONSE_INVALID", request.projectId, 1, 1, 0, { message: "projection recovery issue observation is invalid" });
+  }
+  if (snapshot2.owner !== evidence.owner || snapshot2.repo !== evidence.repo || snapshot2.issueNumber !== evidence.issueNumber || snapshot2.externalRevision !== evidence.externalRevision || evidence.externalRevision !== context.ref.observed_external_revision) {
+    return result("EXTERNAL_RESPONSE_INVALID", request.projectId, 1, 1, 0, { message: "projection recovery observation does not match the exact external revision" });
+  }
+  const observed = observedDigest(snapshot2, context.desired);
+  if (observed !== context.ref.observed_external_digest || observed === context.desired.digest) {
+    return result("EXTERNAL_RESPONSE_INVALID", request.projectId, 1, 1, 0, { message: "projection recovery observation does not prove the attempted write did not land" });
+  }
+  return transaction(db, () => {
+    const replay = checkIdempotency(db, request, digest2);
+    if (replay) return replay;
+    const authority = revalidateProjectionContext(db, request, context);
+    const updated = db.prepare(
+      `UPDATE external_work_refs SET projection_state = 'pending', attempted_resource_revision = ?,
+       desired_digest = ?, last_idempotency_key = ?, last_request_digest = ?, updated_at_ms = ?
+       WHERE ${EXTERNAL_REF_CAS_WHERE}`
+    ).run(
+      authority.workItem.resource_revision,
+      context.desired.digest,
+      request.idempotencyKey,
+      digest2,
+      now(),
+      ...externalRefCasArgs(context.ref)
+    );
+    if (updated.changes !== 1) throw refusal("EXTERNAL_REF_CONFLICT", "external ref recovery lost its compare-and-swap race");
+    return commitMutation(
+      db,
+      request,
+      digest2,
+      authority.actorReceiptId,
+      {
+        aggregateType: "external_work_ref",
+        aggregateId: authority.workItem.work_item_id,
+        aggregateRevision: authority.workItem.resource_revision,
+        eventType: "github_issue_projection_recovered",
+        event: {
+          workItemId: authority.workItem.work_item_id,
+          provider: "github",
+          from: "delivery_ambiguous",
+          to: "pending",
+          resolution: "external_write_not_observed",
+          observation: evidence
+        }
+      },
+      { expected: 1, attempted: 1, verified: 1 },
+      {
+        currentConfigRevision: authority.configRevision,
+        currentGovernanceEpoch: authority.governor.governance_epoch,
+        currentResourceRevision: authority.workItem.resource_revision,
+        expectedResourceRevision: request.expectedResourceRevision ?? void 0,
+        evidence: { projectionState: "pending", resolution: "external_write_not_observed", observation: evidence, observedDigest: observed }
+      }
+    );
   });
 }
 function reserveExistingProjection(db, request, digest2, context) {
@@ -22726,13 +22818,14 @@ function applyGithubIssueProjection(db, request, digest2, adapter) {
   if (!adapter.available) return result("EXTERNAL_UNAVAILABLE", request.projectId, 1, 0, 0, { message: "the GitHub Issues adapter is unavailable" });
   let context;
   try {
-    const prepared = prepareProjection(db, request, digest2, adapter);
+    const prepared = prepareProjection(db, request, digest2, adapter, request.projectionRecoveryEvidence !== void 0);
     if ("outcome" in prepared) return prepared;
     context = prepared;
   } catch (error48) {
     if (error48 instanceof Refusal) return refusalResult(request.projectId, error48.data);
     return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
   }
+  if (request.projectionRecoveryEvidence !== void 0) return recoverAmbiguousProjection(db, request, digest2, context, adapter);
   let mutation;
   if (context.ref.issue_number === null) {
     mutation = {
@@ -22830,6 +22923,7 @@ function applyGithubIssueProjection(db, request, digest2, adapter) {
   }
 }
 async function applyGithubIssueProjectionAsync(db, request, digest2, adapter) {
+  if (request.projectionRecoveryEvidence !== void 0) return applyGithubIssueProjection(db, request, digest2, adapter);
   if (!adapter.readAsync || !adapter.mutateAsync) return applyGithubIssueProjection(db, request, digest2, adapter);
   try {
     const replay = checkIdempotency(db, request, digest2);
@@ -27556,7 +27650,8 @@ async function runCli(db, bb, argv, ctx, deps) {
       const rawRequest = JSON.parse(requestJson);
       const request = parseApplyRequest(rawRequest);
       if (request.projectId !== projectId) return invalidCli("--project does not match request.projectId");
-      return cliResult(await applyLiveAuthorizedMutation(bb, db, rawRequest));
+      const githubAdapter = request.operationClass === "github_issue_projection" && request.projectionRecoveryEvidence !== void 0 ? githubCliAdapterForWorkItem(db, request.projectId, request.workItemId ?? "") : null;
+      return cliResult(await applyLiveAuthorizedMutation(bb, db, rawRequest, false, "refuse-active", null, githubAdapter));
     } catch (error48) {
       return invalidCli(error48 instanceof Error ? error48.message : String(error48));
     }
