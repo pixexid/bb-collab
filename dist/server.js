@@ -16732,6 +16732,7 @@ var WORK_ITEM_CAPACITY_LIFECYCLE_STATES = ["in_progress"];
 var WORK_ITEM_CAPACITY_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
 var WORK_ITEM_IDLE_ACTIVE_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running"];
 var WORK_ITEM_IDLE_BLIND_ATTEMPT_STATES = ["dispatch_unknown"];
+var PREPARED_DISPATCH_MIN_AGE_MS = 3e4;
 var threadlessPreparedClosurePopulation = (projectId) => ({
   projectId,
   source: "bb.sdk.threads.list",
@@ -16759,11 +16760,12 @@ function parseWorkItemDispatchIntent(reasonCode) {
   }
 }
 function reconcilePreparedWorkItemDispatches(db, projectId, threads) {
+  const preparedBeforeMs = now() - PREPARED_DISPATCH_MIN_AGE_MS;
   const prepared = db.prepare(
     `SELECT execution_attempt_id, work_item_id, reason_code FROM execution_attempts
      WHERE project_id = ? AND origin = 'work_item' AND assignment_kind IN ('write', 'review')
-       AND state = 'prepared' AND thread_id IS NULL`
-  ).all(projectId);
+       AND state = 'prepared' AND thread_id IS NULL AND created_at_ms < ?`
+  ).all(projectId, preparedBeforeMs);
   const wedges = [];
   for (const attempt of prepared) {
     const intent = parseWorkItemDispatchIntent(attempt.reason_code);
