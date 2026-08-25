@@ -2,7 +2,7 @@
   "workItemId": "wi-path-carry-safety-shell-r11",
   "cloneUrl": "https://github.com/get-bb/bb.git",
   "managedBase": "1044e4577fb25331394a0e672ddf2cd56485f89f",
-  "managedHead": "a31e8143fd4cf2831ce6d4128b72a2998fb7240c",
+  "managedHead": "4f91cb2df2f8b98cd7996e4afae5d35c3b60bdcb",
   "upstreamBase": "21cb6b68b8fdffe2cd576f11c8af500f98d22c11",
   "candidateHead": "da5aabc8919865873e838e2473fc79898002f14e",
   "patchFile": "wi-path-carry-safety-shell-r11.patch.gz",
