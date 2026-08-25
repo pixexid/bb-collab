@@ -2578,7 +2578,6 @@ const roleContextRefSchema = z
     completionEventSeq: z.number().int().positive(),
   })
   .strict();
-export const OPERATOR_RECEIPT_RETIREMENT_CONDITION = "host-issued receipt get-bb/bb#1541" as const;
 export const CANONICAL_MUTATION_CLASSES = [
   "bootstrap",
   "config_revision",
