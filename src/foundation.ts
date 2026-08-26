@@ -8337,6 +8337,10 @@ function requireWorkItem(
   return row;
 }
 
+function dischargeTerminalWorkItemWait(db: SqliteDatabase, projectId: string, workItemId: string): void {
+  db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(projectId, workItemId);
+}
+
 function applyThreadlessPreparedClosure(
   db: SqliteDatabase,
   request: ApplyRequest,
@@ -8484,6 +8488,7 @@ function applyThreadlessPreparedClosure(
     currentResourceRevision: workItem.resource_revision,
     expectedResourceRevision: request.expectedResourceRevision ?? undefined,
   });
+  dischargeTerminalWorkItemWait(db, request.projectId, workItem.work_item_id);
   const evidence = closure.evidence;
   return commitMutation(
     db,
@@ -9029,7 +9034,7 @@ function applyWorkItemTransition(
   }
   if (wait !== undefined && !enteringBlocked && !swappingBlockedWait) {
     if (machineWait) throw refusal("WORK_ITEM_STATE_INVALID", "machine-evaluable blocker requires an atomic transition to blocked");
-    if (["blocked", "succeeded", "failed", "cancelled"].includes(workItem.lifecycle_state)) {
+    if (workItem.lifecycle_state === "blocked" || (wait !== null && ["succeeded", "failed", "cancelled"].includes(workItem.lifecycle_state))) {
       throw refusal("WORK_ITEM_STATE_INVALID", wait === null
         ? workItem.lifecycle_state === "blocked"
           ? "blocked work item cannot clear its machine-evaluable blocker through a wait mutation"
@@ -9370,9 +9375,6 @@ function applyWorkItemTransition(
   if (workItem.lifecycle_state === "review_pending" && activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write")) {
     throw refusal("WORK_ITEM_STATE_INVALID", "review-pending cannot carry an active writing attempt");
   }
-  if (["succeeded", "failed", "cancelled"].includes(nextState) && existingWait && workItem.lifecycle_state !== "blocked") {
-    throw refusal("WORK_ITEM_WAIT_OPEN", "resolve the work item wait before terminalizing it");
-  }
   const nextRevision = workItem.resource_revision + 1;
   const updated = db.prepare(
     `UPDATE work_items SET lifecycle_state = ?, body = ?, resource_revision = ?, updated_at_ms = ?
@@ -9384,7 +9386,9 @@ function applyWorkItemTransition(
       expectedResourceRevision: request.expectedResourceRevision ?? undefined,
     });
   }
-  if (enteringBlocked) {
+  if (["succeeded", "failed", "cancelled"].includes(nextState)) {
+    dischargeTerminalWorkItemWait(db, request.projectId, workItem.work_item_id);
+  } else if (enteringBlocked) {
     const blocker: WorkItemBlocker = machineWait!.kind === "work_item_succeeded"
       ? { kind: machineWait!.kind, workItemId: machineWait!.workItemId }
       : machineWait!.kind === "github_issue_closed"
