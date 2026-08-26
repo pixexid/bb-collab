@@ -25918,6 +25918,166 @@ function readCheckoutDivergence(checkoutRoot) {
   }
 }
 
+// src/fleet-lull-wait.ts
+var FLEET_LULL_WAIT_MAX_MS = 7 * 24 * 60 * 6e4;
+var FLEET_LULL_WAIT_KV_KEY = "fleet-lull.waits";
+var NON_TERMINAL_ATTEMPT_STATES = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
+function readFleetLullPredicate(db, excludedThreadId, now2 = Date.now()) {
+  if (!db) return { outcome: "unknown", projectIds: [], activeWorkerSeats: [], nonInertAttempts: [], liveLeases: [], reason: "canonical-store-unavailable" };
+  try {
+    const projectIds = db.prepare("SELECT project_id FROM project_config_heads ORDER BY project_id").all().map(({ project_id }) => project_id);
+    const placeholders = NON_TERMINAL_ATTEMPT_STATES.map(() => "?").join(", ");
+    const activeWorkerSeats = db.prepare(
+      `SELECT attempts.project_id, attempts.execution_attempt_id, attempts.thread_id
+       FROM project_config_heads AS projects
+       JOIN role_generation_heads AS heads ON heads.project_id = projects.project_id AND heads.role_id = 'worker'
+       JOIN role_generations AS generations
+         ON generations.project_id = heads.project_id AND generations.role_id = heads.role_id
+        AND generations.domain_id = heads.domain_id AND generations.generation = heads.current_generation
+       JOIN execution_attempts AS attempts
+         ON attempts.project_id = generations.project_id AND attempts.execution_attempt_id = generations.holder_execution_attempt_id
+        AND attempts.role_id = 'worker' AND attempts.origin = 'role_holder'
+       WHERE generations.status = 'active' AND attempts.thread_id IS NOT NULL AND attempts.thread_id <> ?
+       ORDER BY attempts.project_id, attempts.execution_attempt_id`
+    ).all(excludedThreadId);
+    const nonInertAttempts = db.prepare(
+      `SELECT attempts.project_id, attempts.execution_attempt_id, attempts.thread_id, attempts.lease_owner_thread_id
+       FROM project_config_heads AS projects
+       JOIN execution_attempts AS attempts ON attempts.project_id = projects.project_id
+       WHERE attempts.state IN (${placeholders})
+         AND NOT (attempts.thread_id = ? OR (attempts.thread_id IS NULL AND attempts.lease_owner_thread_id = ?))
+         AND (attempts.thread_id IS NOT NULL OR attempts.lease_owner_thread_id IS NOT NULL)
+       ORDER BY attempts.project_id, attempts.execution_attempt_id`
+    ).all(...NON_TERMINAL_ATTEMPT_STATES, excludedThreadId, excludedThreadId);
+    const liveLeases = db.prepare(
+      `SELECT attempts.project_id, attempts.execution_attempt_id, attempts.lease_owner_thread_id
+       FROM project_config_heads AS projects
+       JOIN execution_attempts AS attempts ON attempts.project_id = projects.project_id
+       WHERE attempts.lease_owner_thread_id IS NOT NULL
+         AND attempts.lease_owner_thread_id <> ?
+         AND (attempts.lease_expires_at_ms IS NULL OR attempts.lease_expires_at_ms > ?)
+       ORDER BY attempts.project_id, attempts.execution_attempt_id`
+    ).all(excludedThreadId, now2);
+    return {
+      outcome: activeWorkerSeats.length === 0 && nonInertAttempts.length === 0 && liveLeases.length === 0 ? "satisfied" : "unsatisfied",
+      projectIds,
+      activeWorkerSeats: activeWorkerSeats.map((row) => ({ projectId: row.project_id, executionAttemptId: row.execution_attempt_id, threadId: row.thread_id })),
+      nonInertAttempts: nonInertAttempts.map((row) => ({ projectId: row.project_id, executionAttemptId: row.execution_attempt_id, threadId: row.thread_id, leaseOwnerThreadId: row.lease_owner_thread_id })),
+      liveLeases: liveLeases.map((row) => ({ projectId: row.project_id, executionAttemptId: row.execution_attempt_id, leaseOwnerThreadId: row.lease_owner_thread_id }))
+    };
+  } catch (error48) {
+    return { outcome: "unknown", projectIds: [], activeWorkerSeats: [], nonInertAttempts: [], liveLeases: [], reason: `canonical-store-unreadable:${String(error48)}` };
+  }
+}
+function validId(value) {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= 256;
+}
+function parseState(value) {
+  if (value === void 0 || value === null) return { waits: [], fired: {} };
+  if (typeof value !== "object" || Array.isArray(value)) throw new Error("invalid fleet lull wait state");
+  const record2 = value;
+  if (!Array.isArray(record2.waits) || typeof record2.fired !== "object" || record2.fired === null || Array.isArray(record2.fired)) throw new Error("invalid fleet lull wait state");
+  const waits = record2.waits.map((candidate) => {
+    if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) throw new Error("invalid fleet lull wait");
+    const wait = candidate;
+    if (!validId(wait.waitId) || !validId(wait.projectId) || !validId(wait.waiterThreadId) || !validId(wait.excludedThreadId) || !Number.isSafeInteger(wait.deadlineAtMs)) throw new Error("invalid fleet lull wait");
+    return { waitId: wait.waitId, projectId: wait.projectId, waiterThreadId: wait.waiterThreadId, excludedThreadId: wait.excludedThreadId, deadlineAtMs: wait.deadlineAtMs };
+  });
+  const fired = {};
+  for (const [waitId, reason] of Object.entries(record2.fired)) {
+    if (!waits.some((wait) => wait.waitId === waitId) || reason !== "satisfied" && reason !== "timeout") throw new Error("invalid fleet lull fired wait");
+    fired[waitId] = reason;
+  }
+  return { waits, fired };
+}
+function createFleetLullWaker(options) {
+  let state = { waits: [], fired: {} };
+  let loaded = false;
+  let stopped = false;
+  let queue = Promise.resolve();
+  const timers = /* @__PURE__ */ new Map();
+  const enqueue = (work) => {
+    const result2 = queue.then(work);
+    queue = result2.then(() => void 0, () => void 0);
+    return result2;
+  };
+  const now2 = options.now ?? Date.now;
+  const load = async () => {
+    if (loaded) return;
+    state = parseState(await options.persistence.read());
+    loaded = true;
+  };
+  const save = () => options.persistence.write(structuredClone(state));
+  const clearTimer = (waitId) => {
+    const timer = timers.get(waitId);
+    if (timer !== void 0) clearTimeout(timer);
+    timers.delete(waitId);
+  };
+  const fire = async (wait, reason) => {
+    if (state.fired[wait.waitId]) return;
+    state.fired[wait.waitId] = reason;
+    clearTimer(wait.waitId);
+    await save();
+    await options.wake(wait, reason);
+  };
+  const evaluate = async (only) => {
+    await load();
+    const waits = only ? [only] : state.waits;
+    for (const wait of waits) {
+      if (state.fired[wait.waitId] || now2() >= wait.deadlineAtMs) {
+        if (!state.fired[wait.waitId] && now2() >= wait.deadlineAtMs) await fire(wait, "timeout");
+        continue;
+      }
+      const predicate = readFleetLullPredicate(options.db, wait.excludedThreadId, now2());
+      if (predicate.outcome === "satisfied") await fire(wait, "satisfied");
+    }
+  };
+  const armTimer = (wait) => {
+    clearTimer(wait.waitId);
+    timers.set(wait.waitId, setTimeout(() => {
+      void enqueue(async () => {
+        await load();
+        const current = state.waits.find((candidate) => candidate.waitId === wait.waitId);
+        if (current && !state.fired[current.waitId]) await fire(current, "timeout");
+      }).catch(() => void 0);
+    }, Math.max(1, wait.deadlineAtMs - now2())));
+  };
+  return {
+    recover: () => enqueue(async () => {
+      await load();
+      if (stopped) return;
+      for (const wait of state.waits) if (!state.fired[wait.waitId]) armTimer(wait);
+      await evaluate();
+    }),
+    register: (input) => enqueue(async () => {
+      await load();
+      if (stopped) return { outcome: "refused", message: "fleet lull waker is stopped" };
+      if (!validId(input.waitId) || !validId(input.projectId) || !validId(input.waiterThreadId) || !validId(input.excludedThreadId)) return { outcome: "refused", message: "fleet lull wait identity is required" };
+      if (input.waiterThreadId !== input.excludedThreadId) return { outcome: "refused", message: "waiterThreadId and excludedThreadId must name the calling thread" };
+      if (!Number.isSafeInteger(input.deadlineAtMs) || input.deadlineAtMs <= now2() || input.deadlineAtMs > now2() + FLEET_LULL_WAIT_MAX_MS) return { outcome: "refused", message: `fleet lull wait deadline must be in the next ${FLEET_LULL_WAIT_MAX_MS}ms` };
+      if (options.validateWaiter && !await options.validateWaiter(input)) return { outcome: "refused", message: "waiter thread is unknown, foreign, archived, deleted, or not active/idle" };
+      const existing = state.waits.find((wait) => wait.waitId === input.waitId);
+      if (existing) {
+        if (JSON.stringify(existing) !== JSON.stringify(input)) return { outcome: "refused", message: "waitId is already bound to a different fleet lull wait" };
+        if (state.fired[input.waitId]) return { outcome: "refused", message: "waitId was already consumed by a fleet lull wake" };
+        return { outcome: "registered", wait: existing, replay: true };
+      }
+      state.waits.push(input);
+      await save();
+      armTimer(input);
+      await evaluate(input);
+      return state.fired[input.waitId] === "satisfied" ? { outcome: "already_satisfied", wait: input, replay: false } : { outcome: "registered", wait: input, replay: false };
+    }),
+    signal: () => enqueue(async () => {
+      if (!stopped) await evaluate();
+    }),
+    stop: () => {
+      stopped = true;
+      for (const waitId of timers.keys()) clearTimer(waitId);
+    }
+  };
+}
+
 // server.ts
 import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync4, rmSync as rmSync2, statSync as statSync4, writeFileSync as writeFileSync2 } from "node:fs";
 import { execFile as execFile2, spawnSync as spawnSync3 } from "node:child_process";
@@ -26605,6 +26765,14 @@ var AUTOMATED_TELL_IDLE_WAIT_MS = 3e4;
 var ROLE_QUEUE_DECISION_BOUND_MS = ROLE_QUEUE_CACHE_MS + 2 * ROLE_QUEUE_REFRESH_TIMEOUT_MS + 2 * ROLE_QUEUE_OBSERVATION_MS + ROLE_QUEUE_IDLE_THRESHOLD_MS + AUTOMATED_TELL_IDLE_WAIT_MS;
 var automatedTellQueues = /* @__PURE__ */ new Map();
 var operatorRepliesInFlight = /* @__PURE__ */ new Set();
+var canonicalMutationListeners = /* @__PURE__ */ new Set();
+function onCanonicalMutation(listener) {
+  canonicalMutationListeners.add(listener);
+  return () => canonicalMutationListeners.delete(listener);
+}
+function signalCanonicalMutation() {
+  for (const listener of canonicalMutationListeners) listener();
+}
 var projectIdSchema = external_exports.string().trim().min(1).max(256);
 var mutationReceiptSchema = external_exports.object({
   projectId: projectIdSchema,
@@ -26701,6 +26869,18 @@ var registeredWaitInputSchema = external_exports.object({
 var registeredWaitSchema = registeredWaitInputSchema.extend({
   declaredAtMs: external_exports.number().int().nonnegative()
 }).strict();
+var fleetLullWaitInputSchema = external_exports.object({
+  projectId: projectIdSchema,
+  waitId: sidebarThreadIdSchema,
+  waiterThreadId: sidebarThreadIdSchema,
+  excludedThreadId: sidebarThreadIdSchema,
+  deadlineAtMs: external_exports.number().int().positive()
+}).strict();
+var fleetLullWaitSchema = external_exports.discriminatedUnion("outcome", [
+  external_exports.object({ outcome: external_exports.literal("registered"), wait: fleetLullWaitInputSchema, replay: external_exports.boolean() }).strict(),
+  external_exports.object({ outcome: external_exports.literal("already_satisfied"), wait: fleetLullWaitInputSchema, replay: external_exports.boolean() }).strict(),
+  external_exports.object({ outcome: external_exports.literal("refused"), message: external_exports.string() }).strict()
+]);
 var registerExternalWaitInputSchema = external_exports.object({
   request: applyRequestSchema
 }).strict();
@@ -26842,6 +27022,10 @@ var rpcContract = defineRpcContract({
   registerWait: {
     input: registeredWaitInputSchema,
     output: registeredWaitSchema
+  },
+  registerFleetLullWait: {
+    input: fleetLullWaitInputSchema,
+    output: fleetLullWaitSchema
   },
   doctor: {
     input: external_exports.object({ projectId: projectIdSchema }).strict(),
@@ -27934,6 +28118,7 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
     evidenceReader = resolved;
   }
   const result2 = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader ?? (parsed.success ? projectGithubIssueReader(db, parsed.data.projectId) : readGithubIssueForBackfill), evidenceReader);
+  if (result2.outcome === "OK") signalCanonicalMutation();
   await deliverSucceededRoleGenerationBrief(bb, db, input, result2);
   return result2;
 }
@@ -27961,6 +28146,7 @@ async function applyLiveAuthorizedMutationAsync(bb, db, input, allowCachedConsum
     evidenceReader = resolved;
   }
   const result2 = await applyAuthorizedMutationAsync(db, input, githubAdapter, reader, null, null, githubIssueReader ?? (parsed.success ? projectGithubIssueReader(db, parsed.data.projectId) : readGithubIssueForBackfill), evidenceReader);
+  if (result2.outcome === "OK") signalCanonicalMutation();
   await deliverSucceededRoleGenerationBrief(bb, db, input, result2);
   return result2;
 }
@@ -28427,8 +28613,8 @@ async function reportProjectWorktreeCleanup(bb, projectId, cleanup = cleanupGitW
 async function runCli(db, bb, argv, ctx, deps) {
   const command = argv[0];
   const args = argv.slice(1);
-  if (!command || !["doctor", "export", "apply", "register-project", "dispatch-lane", "github-issue-backfill", "archive-sweep", "worktree-cleanup", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
-    return invalidCli("expected doctor, export, apply, register-project, dispatch-lane, github-issue-backfill, archive-sweep, worktree-cleanup, cached-consumer-rollout, role-list, wait-register, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
+  if (!command || !["doctor", "export", "apply", "register-project", "dispatch-lane", "github-issue-backfill", "archive-sweep", "worktree-cleanup", "cached-consumer-rollout", "role-list", "wait-register", "wait-lull", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "send-to-operator", "inbox"].includes(command)) {
+    return invalidCli("expected doctor, export, apply, register-project, dispatch-lane, github-issue-backfill, archive-sweep, worktree-cleanup, cached-consumer-rollout, role-list, wait-register, wait-lull, wait-list, wait-validator, stall-guard, fleet-watchdog, send-to-operator, or inbox");
   }
   if (command === "wait-validator") {
     const unknown3 = args.find((arg) => arg !== "--cycle");
@@ -28650,6 +28836,39 @@ async function runCli(db, bb, argv, ctx, deps) {
       evidence: { wait: result2.wait }
     });
   }
+  if (command === "wait-lull") {
+    const unknown3 = unexpectedFlags(args, ["--project", "--request"]);
+    if (unknown3) return invalidCli(`unexpected flag ${unknown3}`);
+    const requestJson = parseFlag(args, "--request");
+    if (!requestJson) return invalidCli("--request JSON is required");
+    let request;
+    try {
+      request = JSON.parse(requestJson);
+    } catch (error48) {
+      return invalidCli(error48 instanceof Error ? error48.message : String(error48));
+    }
+    const parsed = fleetLullWaitInputSchema.safeParse(request);
+    if (!parsed.success) return invalidCli(parsed.error.message);
+    if (parsed.data.projectId !== projectId) return invalidCli("--project must match request.projectId");
+    if (ctx?.threadId !== void 0 && (parsed.data.waiterThreadId !== ctx.threadId || parsed.data.excludedThreadId !== ctx.threadId)) {
+      return invalidCli("waiterThreadId and excludedThreadId must match the calling thread");
+    }
+    try {
+      const result2 = await deps.registerFleetLullWait(parsed.data);
+      if (result2.outcome === "refused") return cliResult({ outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message: result2.message });
+      return cliResult({
+        outcome: "OK",
+        subject: projectId,
+        expected: 1,
+        attempted: 1,
+        verified: 1,
+        message: result2.outcome === "already_satisfied" ? "fleet lull already satisfied; wake delivered" : result2.replay ? "fleet lull wait replayed idempotently" : "fleet lull wait registered",
+        evidence: result2
+      });
+    } catch (error48) {
+      return cliResult({ outcome: "INTERNAL_ERROR", subject: projectId, expected: 1, attempted: 0, verified: 0, message: error48 instanceof Error ? error48.message : String(error48) });
+    }
+  }
   if (command === "wait-list") {
     const unknown3 = unexpectedFlags(args, ["--project"]);
     if (unknown3) return invalidCli(`unexpected flag ${unknown3}`);
@@ -28812,6 +29031,40 @@ async function plugin(bb, options = {}) {
     bb.log.error(`canonical store unavailable: ${String(error48)}`);
     db = null;
   }
+  const fleetLullWaker = createFleetLullWaker({
+    db,
+    persistence: {
+      read: () => bb.storage.kv.get(FLEET_LULL_WAIT_KV_KEY),
+      write: (state) => bb.storage.kv.set(FLEET_LULL_WAIT_KV_KEY, state)
+    },
+    validateWaiter: async (wait) => {
+      try {
+        const thread = await bb.sdk.threads.get({ threadId: wait.waiterThreadId });
+        return thread.id === wait.waiterThreadId && thread.projectId === wait.projectId && thread.archivedAt === null && thread.deletedAt === null && ["active", "idle"].includes(thread.status);
+      } catch {
+        return false;
+      }
+    },
+    wake: async (wait, reason) => {
+      const thread = await bb.sdk.threads.get({ threadId: wait.waiterThreadId });
+      if (thread.id !== wait.waiterThreadId || thread.projectId !== wait.projectId || thread.archivedAt !== null || thread.deletedAt !== null) {
+        throw new Error("fleet lull wake target is foreign, archived, or deleted");
+      }
+      const text = reason === "satisfied" ? "All-tenant lull satisfied by a native state-change event. Re-read the deploy gate and continue if it still passes." : "All-tenant lull wait timed out. The predicate is not known to be satisfied; do not treat this timeout as a quiet-fleet result.";
+      await sendWhenThreadReady(bb, {
+        threadId: wait.waiterThreadId,
+        mode: "queue-if-active",
+        input: [{ type: "text", visibility: "agent-only", text, mentions: [] }]
+      }, wait.projectId);
+      bb.realtime.publish("fleet-lull", { projectId: wait.projectId, waitId: wait.waitId, outcome: reason });
+    }
+  });
+  const unregisterCanonicalMutation = onCanonicalMutation(() => {
+    void fleetLullWaker.signal().catch((error48) => bb.log.warn(`fleet lull wake evaluation failed: ${String(error48)}`));
+  });
+  bb.onDispose(unregisterCanonicalMutation);
+  bb.onDispose(fleetLullWaker.stop);
+  await fleetLullWaker.recover().catch((error48) => bb.log.warn(`fleet lull wait recovery failed: ${String(error48)}`));
   const recoveryInFlight = /* @__PURE__ */ new Set();
   const RECOVERY_UNRECOVERABLE = "unrecoverable";
   const withRecoveryTimeout = async (label, operation) => {
@@ -29990,18 +30243,24 @@ ${thread.titleFallback ?? ""}`);
     const { id: id2, status } = threadEventStatus(payload);
     return watcher.observe(id2, status);
   };
+  const signalFleetLull = () => {
+    void fleetLullWaker.signal().catch((error48) => bb.log.warn(`fleet lull wake evaluation failed: ${String(error48)}`));
+  };
   const observeCapacityAfter = async (payload) => {
     await observe(payload);
     if (payload.thread.parentThreadId != null) await idleFleetDetector.observeCapacity(payload.thread.projectId);
   };
   bb.events.on("thread.active", async (payload) => {
+    signalFleetLull();
     await observeCapacityAfter(payload).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`));
   });
   bb.events.on("thread.idle", async (payload) => {
+    signalFleetLull();
     idleFleetDetector.arm({ projectId: payload.thread.projectId, threadId: payload.thread.id, idleEpisode: String(payload.thread.updatedAt) });
     await observeCapacityAfter(payload).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`));
   });
   bb.events.on("thread.failed", async (payload) => {
+    signalFleetLull();
     await observeCapacityAfter(payload).catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`));
     const { id: id2, status } = threadEventStatus(payload);
     if (status === "error") {
@@ -30015,18 +30274,21 @@ ${thread.titleFallback ?? ""}`);
     }
   });
   bb.events.on("thread.archived", async (payload) => {
+    signalFleetLull();
     await (async () => {
       await watcher.observe(payload.thread.id, payload.thread.status, false, true);
       if (payload.thread.parentThreadId != null) await idleFleetDetector.observeCapacity(payload.thread.projectId);
     })().catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`));
   });
   bb.events.on("thread.deleted", async (payload) => {
+    signalFleetLull();
     await (async () => {
       await watcher.observe(payload.thread.id, payload.thread.status, false, true);
       if (payload.thread.parentThreadId != null) await idleFleetDetector.observeCapacity(payload.thread.projectId);
     })().catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`));
   });
   const unsubscribe = subscribeToThreadChanges(bb.sdk, async (threadId, status, archived = false, projectId, parentThreadId) => {
+    signalFleetLull();
     await watcher.observe(threadId, status, void 0, archived);
     if (projectId && parentThreadId != null) await idleFleetDetector.observeCapacity(projectId);
   });
@@ -31245,6 +31507,7 @@ ${thread.titleFallback ?? ""}`);
     return views;
   };
   bb.events.on("thread.created", async ({ thread }) => {
+    signalFleetLull();
     try {
       await sendRoleBrief(bb, db, thread.projectId, thread.id, roleForThread(db, thread.projectId, thread.id));
     } catch (error48) {
@@ -31260,6 +31523,7 @@ ${thread.titleFallback ?? ""}`);
       input,
       ctxThreadId
     }),
+    registerFleetLullWait: (input) => fleetLullWaker.register(input),
     listWaitsForCli: async () => {
       await waitRegistry.recover();
       return waitRegistry.list().map((wait) => ({ ...wait, state: waitRegistry.state(wait.waitId) }));
@@ -31290,6 +31554,9 @@ ${thread.titleFallback ?? ""}`);
       const wait = { ...input, declaredAtMs: Date.now() };
       await watcher.registerWait(wait);
       return wait;
+    },
+    async registerFleetLullWait(input) {
+      return fleetLullWaker.register(input);
     },
     async doctor(input) {
       return doctor(db, bb.sdk, input.projectId, readDiagnosticDivergence());
@@ -31411,6 +31678,11 @@ ${thread.titleFallback ?? ""}`);
         name: "wait-register",
         summary: "Register one bounded durable wait (deadline mandatory, fail closed)",
         usage: "bb collab wait-register --project PROJECT_ID --request JSON"
+      },
+      {
+        name: "wait-lull",
+        summary: "Register an event-driven all-tenant lull wait",
+        usage: "bb collab wait-lull --project PROJECT_ID --request JSON"
       },
       { name: "wait-list", summary: "List registered waits (read-only)", usage: "bb collab wait-list --project PROJECT_ID" },
       {
