@@ -25803,13 +25803,14 @@ function githubPrGroupKey(wait) {
 }
 function githubPrGhPath() {
   const configured = process.env.BB_COLLAB_GH_PATH;
-  if (configured !== void 0) return Promise.resolve(isAbsolute3(configured) ? configured : null);
-  return new Promise((resolve3) => {
-    execFile2("which", ["gh"], { encoding: "utf8", timeout: 2e3 }, (error48, stdout) => {
-      const path = error48 ? null : stdout.trim();
-      resolve3(path && isAbsolute3(path) ? path : null);
-    });
-  });
+  if (configured !== void 0) return isAbsolute3(configured) ? configured : null;
+  try {
+    const result2 = spawnSync2("which", ["gh"], { encoding: "utf8", timeout: 2e3 });
+    const path = result2.error || result2.status !== 0 ? null : result2.stdout.trim();
+    return path && isAbsolute3(path) ? path : null;
+  } catch {
+    return null;
+  }
 }
 var fleetWatchdogCompositeKey = (...parts) => JSON.stringify(parts);
 var fleetWatchdogIssueReopenedKey = (projectId, workItemId, externalRevision) => `fleet-watchdog:issue-reopened:${fleetWatchdogCompositeKey(projectId, workItemId, externalRevision)}`;
@@ -25926,9 +25927,10 @@ function githubCommandEnvironment(connectorHost) {
 function githubJson(args, connectorHost) {
   try {
     const env = githubCommandEnvironment(connectorHost);
-    if (!env) return null;
+    const ghPath = githubPrGhPath();
+    if (!env || !ghPath) return null;
     const options = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1e4, killSignal: "SIGKILL", detached: true, env };
-    const result2 = spawnSync2("gh", args, options);
+    const result2 = spawnSync2(ghPath, args, options);
     if (typeof result2.pid === "number" && result2.pid > 0) {
       try {
         process.kill(-result2.pid, "SIGKILL");
@@ -25944,9 +25946,10 @@ function githubJson(args, connectorHost) {
 }
 function githubJsonAsync(args, connectorHost) {
   const env = githubCommandEnvironment(connectorHost);
-  if (!env) return Promise.resolve(null);
+  const ghPath = githubPrGhPath();
+  if (!env || !ghPath) return Promise.resolve(null);
   return new Promise((resolve3) => {
-    execFile2("gh", args, { encoding: "utf8", timeout: ROLE_QUEUE_REFRESH_TIMEOUT_MS, killSignal: "SIGKILL", env }, (error48, stdout) => {
+    execFile2(ghPath, args, { encoding: "utf8", timeout: ROLE_QUEUE_REFRESH_TIMEOUT_MS, killSignal: "SIGKILL", env }, (error48, stdout) => {
       if (error48) {
         resolve3(null);
         return;
@@ -28754,7 +28757,7 @@ async function plugin(bb, options = {}) {
         group.waits.push(wait);
         groups.set(key, group);
       }
-      const ghPath = await githubPrGhPath();
+      const ghPath = githubPrGhPath();
       const now2 = Date.now();
       for (const group of groups.values()) {
         const prior = githubPrBackoff.get(group.key);

@@ -181,15 +181,16 @@ function githubPrGroupKey(wait: Pick<GithubPrPendingWait, "projectId" | "repoTar
   return JSON.stringify([wait.projectId, wait.repoTargetId, wait.owner, wait.repo, wait.prNumber]);
 }
 
-function githubPrGhPath(): Promise<string | null> {
+function githubPrGhPath(): string | null {
   const configured = process.env.BB_COLLAB_GH_PATH;
-  if (configured !== undefined) return Promise.resolve(isAbsolute(configured) ? configured : null);
-  return new Promise((resolve) => {
-    execFile("which", ["gh"], { encoding: "utf8", timeout: 2_000 }, (error, stdout) => {
-      const path = error ? null : stdout.trim();
-      resolve(path && isAbsolute(path) ? path : null);
-    });
-  });
+  if (configured !== undefined) return isAbsolute(configured) ? configured : null;
+  try {
+    const result = spawnSync("which", ["gh"], { encoding: "utf8", timeout: 2_000 });
+    const path = result.error || result.status !== 0 ? null : result.stdout.trim();
+    return path && isAbsolute(path) ? path : null;
+  } catch {
+    return null;
+  }
 }
 
 type LaneRecoveryTarget = { project_id: string; thread_id: string; execution_attempt_id: string };
@@ -329,9 +330,10 @@ function githubCommandEnvironment(connectorHost: string): NodeJS.ProcessEnv | nu
 function githubJson(args: string[], connectorHost: string): unknown | null {
   try {
     const env = githubCommandEnvironment(connectorHost);
-    if (!env) return null;
+    const ghPath = githubPrGhPath();
+    if (!env || !ghPath) return null;
     const options: SpawnSyncOptionsWithStringEncoding & { detached: true } = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000, killSignal: "SIGKILL", detached: true, env };
-    const result = spawnSync("gh", args, options);
+    const result = spawnSync(ghPath, args, options);
     if (typeof result.pid === "number" && result.pid > 0) {
       try {
         process.kill(-result.pid, "SIGKILL");
@@ -348,9 +350,10 @@ function githubJson(args: string[], connectorHost: string): unknown | null {
 
 function githubJsonAsync(args: string[], connectorHost: string): Promise<unknown | null> {
   const env = githubCommandEnvironment(connectorHost);
-  if (!env) return Promise.resolve(null);
+  const ghPath = githubPrGhPath();
+  if (!env || !ghPath) return Promise.resolve(null);
   return new Promise((resolve) => {
-    execFile("gh", args, { encoding: "utf8", timeout: ROLE_QUEUE_REFRESH_TIMEOUT_MS, killSignal: "SIGKILL", env }, (error, stdout) => {
+    execFile(ghPath, args, { encoding: "utf8", timeout: ROLE_QUEUE_REFRESH_TIMEOUT_MS, killSignal: "SIGKILL", env }, (error, stdout) => {
       if (error) {
         resolve(null);
         return;
@@ -3673,7 +3676,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         group.waits.push(wait);
         groups.set(key, group);
       }
-      const ghPath = await githubPrGhPath();
+      const ghPath = githubPrGhPath();
       const now = Date.now();
       for (const group of groups.values()) {
         const prior = githubPrBackoff.get(group.key);

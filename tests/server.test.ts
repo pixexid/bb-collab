@@ -1450,9 +1450,7 @@ describe("GH-658 scheduled PR observer integration", () => {
     const stateFile = join(stateDir, "changed");
     const callsFile = join(stateDir, "calls");
     const gh = installPullRequestGh(stateFile, callsFile);
-    const originalPath = process.env.PATH;
     const originalGhPath = process.env.BB_COLLAB_GH_PATH;
-    process.env.PATH = gh.bin + ":" + (originalPath ?? "");
     process.env.BB_COLLAB_GH_PATH = gh.gh;
     try {
       const fixture = await githubPrWaitFixture();
@@ -1501,8 +1499,6 @@ describe("GH-658 scheduled PR observer integration", () => {
       expect(sent).toHaveLength(1);
       expect((reloadedDb.prepare("SELECT COUNT(*) AS count FROM state_events WHERE event_type = 'github_pr_observation_recorded'").get() as { count: number }).count).toBe(eventCount);
     } finally {
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
       if (originalGhPath === undefined) delete process.env.BB_COLLAB_GH_PATH;
       else process.env.BB_COLLAB_GH_PATH = originalGhPath;
       gh.cleanup();
@@ -1516,9 +1512,7 @@ describe("GH-658 scheduled PR observer integration", () => {
     writeFileSync(stateFile, "changed");
     const callsFile = join(stateDir, "calls");
     const gh = installPullRequestGh(stateFile, callsFile);
-    const originalPath = process.env.PATH;
     const originalGhPath = process.env.BB_COLLAB_GH_PATH;
-    process.env.PATH = gh.bin + ":" + (originalPath ?? "");
     process.env.BB_COLLAB_GH_PATH = gh.gh;
     try {
       const ambiguous = await githubPrWaitFixture();
@@ -1555,8 +1549,6 @@ describe("GH-658 scheduled PR observer integration", () => {
         message: expect.stringContaining("reason=waiting-seat-not-current"),
       }));
     } finally {
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
       if (originalGhPath === undefined) delete process.env.BB_COLLAB_GH_PATH;
       else process.env.BB_COLLAB_GH_PATH = originalGhPath;
       gh.cleanup();
@@ -1570,9 +1562,7 @@ describe("GH-658 scheduled PR observer integration", () => {
     writeFileSync(stateFile, "changed");
     const callsFile = join(stateDir, "calls");
     const gh = installPullRequestGh(stateFile, callsFile, true);
-    const originalPath = process.env.PATH;
     const originalGhPath = process.env.BB_COLLAB_GH_PATH;
-    process.env.PATH = gh.bin + ":" + (originalPath ?? "");
     process.env.BB_COLLAB_GH_PATH = gh.gh;
     try {
       const fixture = await githubPrWaitFixture();
@@ -1585,8 +1575,6 @@ describe("GH-658 scheduled PR observer integration", () => {
         message: expect.stringMatching(/^github-pr observer coverage=degraded .* reason=gh_unavailable/u),
       }));
     } finally {
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
       if (originalGhPath === undefined) delete process.env.BB_COLLAB_GH_PATH;
       else process.env.BB_COLLAB_GH_PATH = originalGhPath;
       gh.cleanup();
@@ -4905,8 +4893,8 @@ else
 fi
 `);
     chmodSync(gh, 0o755);
-    const originalPath = process.env.PATH;
-    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const originalGhPath = process.env.BB_COLLAB_GH_PATH;
+    process.env.BB_COLLAB_GH_PATH = gh;
     let service: ReturnType<Awaited<ReturnType<typeof fleetWatchdogFixture>>["host"]["harness"]["runService"]> | undefined;
     try {
       const fixture = await fleetWatchdogFixture(0, true);
@@ -4961,8 +4949,8 @@ fi
       service?.controller.abort();
       await service?.done;
       clock.mockRestore();
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
+      if (originalGhPath === undefined) delete process.env.BB_COLLAB_GH_PATH;
+      else process.env.BB_COLLAB_GH_PATH = originalGhPath;
       rmSync(bin, { recursive: true, force: true });
     }
   });
