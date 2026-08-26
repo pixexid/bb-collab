@@ -31,6 +31,8 @@ import {
   applyAuthorizedMutation,
   applyAuthorizedMutationAsync,
   applyRequestSchema,
+  buildTerminalReport,
+  checkMutationIdempotency,
   databaseIsReady,
   doctor,
   configuredDomains,
@@ -55,6 +57,7 @@ import {
   workItemCapacityLaneEvidence,
   parseWorkItemDispatchIntent,
   threadlessPreparedClosurePopulation,
+  threadlessPreparedReplayProbeDigest,
   reconcilePreparedWorkItemDispatches,
   type ApplyRequest,
   type FoundationCode,
@@ -1185,7 +1188,17 @@ const threadlessPreparedClosureInputSchema = z.object({
   request: applyRequestSchema,
   correctionId: z.string().trim().min(1).max(256),
   dispatchIntentIdempotencyKey: z.string().trim().min(1).max(256),
-  replayRequestDigest: z.string().regex(/^[0-9a-f]{64}$/u),
+  replayRequestDigest: z.string().regex(/^[0-9a-f]{64}$/u).optional(),
+}).strict();
+const terminalReportBuilderInputSchema = z.object({
+  projectId: projectIdSchema,
+  workItemId: sidebarThreadIdSchema,
+  executionAttemptId: sidebarThreadIdSchema,
+  outcome: z.enum(["DONE", "BLOCKED"]),
+  reasonCode: sidebarThreadIdSchema,
+  nativeEventId: sidebarThreadIdSchema,
+  nativeEventSeq: z.number().int().positive(),
+  nativeTurnId: sidebarThreadIdSchema,
 }).strict();
 const dispatchEnvironmentSchema = z.union([
   z.object({ type: z.literal("project-default") }).strict(),
@@ -1839,7 +1852,7 @@ async function closeThreadlessPreparedAttempt(
 ): Promise<FoundationResult> {
   const parsed = threadlessPreparedClosureInputSchema.safeParse(input);
   if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "threadless-prepared-closure", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
-  const { request, correctionId, dispatchIntentIdempotencyKey, replayRequestDigest } = parsed.data;
+  const { request, correctionId, dispatchIntentIdempotencyKey } = parsed.data;
   if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
   const existing = db.prepare(
     "SELECT request_digest, outcome_json, committed_event_sequence, operation_class FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?",
@@ -1901,9 +1914,15 @@ async function closeThreadlessPreparedAttempt(
   const originalReceipt = db.prepare(
     "SELECT request_digest, committed_event_sequence FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?",
   ).get(request.projectId, dispatchIntentIdempotencyKey) as { request_digest: string; committed_event_sequence: number } | undefined;
-  if (!originalReceipt || originalReceipt.committed_event_sequence !== preparation.event_sequence || originalReceipt.request_digest === replayRequestDigest) {
-    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure requires a distinct recorded replay-conflict digest" };
+  if (!originalReceipt || originalReceipt.committed_event_sequence !== preparation.event_sequence) {
+    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure requires the exact durable dispatch intent receipt" };
   }
+  const replayRequestDigest = threadlessPreparedReplayProbeDigest({
+    projectId: request.projectId,
+    workItemId: request.workItemId,
+    executionAttemptId: request.executionAttemptId,
+    idempotencyKey: dispatchIntentIdempotencyKey,
+  });
   return serializeDispatchRecovery(request, async () => {
     let threads: DispatchThread[];
     try {
@@ -2220,6 +2239,8 @@ function nativeEventData(event: LiveThreadEvent): Record<string, unknown> {
   return event.data as Record<string, unknown>;
 }
 
+type LiveTerminalIdentity = Pick<NonNullable<ApplyRequest["terminalReport"]>, "nativeEventId" | "nativeEventSeq" | "nativeTurnId">;
+
 function liveTerminalReader(
   sdk: BbPluginApi["sdk"],
   db: SqliteDatabase,
@@ -2227,6 +2248,19 @@ function liveTerminalReader(
 ): Promise<ExecutionAttemptEvidenceReader | FoundationResult> {
   const report = request.terminalReport;
   if (!report || !request.workItemId || !request.executionAttemptId) return Promise.resolve(evidenceUnavailable(request.projectId, "terminal report identity is unavailable"));
+  return liveTerminalEvidenceReader(sdk, db, {
+    projectId: request.projectId,
+    workItemId: request.workItemId,
+    executionAttemptId: request.executionAttemptId,
+  }, report);
+}
+
+function liveTerminalEvidenceReader(
+  sdk: BbPluginApi["sdk"],
+  db: SqliteDatabase,
+  request: { projectId: string; workItemId: string; executionAttemptId: string },
+  report: LiveTerminalIdentity,
+): Promise<ExecutionAttemptEvidenceReader | FoundationResult> {
   const workItemId = request.workItemId;
   const executionAttemptId = request.executionAttemptId;
   const attempt = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(request.projectId, request.executionAttemptId) as Record<string, unknown> | undefined;
@@ -2357,6 +2391,28 @@ function liveTerminalReader(
       return evidenceUnavailable(request.projectId, `authoritative terminal evidence unavailable: ${String(error)}`);
     }
   })();
+}
+
+async function buildLiveTerminalReport(
+  bb: BbPluginApi,
+  db: SqliteDatabase | null,
+  input: z.infer<typeof terminalReportBuilderInputSchema>,
+): Promise<unknown> {
+  if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: input.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" } satisfies FoundationResult;
+  const resolved = await liveTerminalEvidenceReader(bb.sdk, db, input, {
+    nativeEventId: input.nativeEventId,
+    nativeEventSeq: input.nativeEventSeq,
+    nativeTurnId: input.nativeTurnId,
+  });
+  if ("outcome" in resolved) return resolved;
+  return buildTerminalReport({ evidence: resolved.terminal({
+    projectId: input.projectId,
+    workItemId: input.workItemId,
+    executionAttemptId: input.executionAttemptId,
+    nativeEventId: input.nativeEventId,
+    nativeEventSeq: input.nativeEventSeq,
+    nativeTurnId: input.nativeTurnId,
+  }), outcome: input.outcome, reasonCode: input.reasonCode });
 }
 
 async function liveZeroRealWriterGuard(
@@ -2520,6 +2576,18 @@ async function applyLiveAuthorizedMutation(
   const parsed = applyRequestSchema.safeParse(input);
   if (parsed.success && parsed.data.threadlessPreparedClosure !== undefined && !allowThreadlessPreparedClosure) {
     return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less prepared closure is accepted only through the governed live inventory seam" };
+  }
+  if (parsed.success && db) {
+    let request: ApplyRequest | null = null;
+    try {
+      request = parseApplyRequest(input);
+    } catch {
+      // Preserve the existing INVALID_INPUT result for requests rejected by the strict projection parser.
+    }
+    if (request) {
+      const replay = checkMutationIdempotency(db, request);
+      if (replay) return replay;
+    }
   }
   if (parsed.success && terminalizationPolicy === "stop-active") {
     const authorized = applyAuthorizedMutation(db, input, githubAdapter, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, null, true);
@@ -6345,6 +6413,16 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   });
 
   bb.agents.registerTool({
+    name: "build_terminal_report",
+    description: "Build a terminal report from the exact native completion and canonical attempt.",
+    instructions: "Use the returned JSON as terminalReport in the execution_attempt_terminal_report request. The builder supplies native digests, the native environment, evidence, and portable timestamps; do not hand-roll them.",
+    parameters: terminalReportBuilderInputSchema,
+    async execute(input, context) {
+      if (input.projectId !== context.projectId) throw new Error("projectId must exactly match the current thread project");
+      return JSON.stringify(await buildLiveTerminalReport(bb, db, input));
+    },
+  });
+  bb.agents.registerTool({
     name: "dispatch_lane",
     description: "Dispatch one writing lane through the canonical registration seam.",
     instructions: "Use this instead of spawning a lane directly. The request projectId must match the current thread project.",
@@ -6390,7 +6468,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return registration === "already_satisfied" ? "already_satisfied" : registration === "registered" ? "registered" : "refused";
     },
   });
-  bb.agents.configure(() => ({ tools: ["dispatch_lane", "close_threadless_prepared_attempt", "send_to_operator", "register_external_wait"], skills: [] }));
+  bb.agents.configure(() => ({ tools: ["build_terminal_report", "dispatch_lane", "close_threadless_prepared_attempt", "send_to_operator", "register_external_wait"], skills: [] }));
 
   bb.cli.register({
     name: "collab",

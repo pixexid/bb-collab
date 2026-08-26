@@ -58,6 +58,7 @@ import {
   schemaDigest,
   sha256,
   threadlessPreparedClosurePopulation,
+  threadlessPreparedReplayProbeDigest,
   workItemReconciliationIssues,
   type ApplyRequest,
   type ExportFilePayload,
@@ -3374,7 +3375,7 @@ else printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue:startable"}]}]]'; 
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["idle-fleet-detector", "lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "fleet-watchdog", "worktree-cleanup", "thread-archive-sweep"]);
     expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "closeThreadlessPreparedAttempt", "dispatchLane", "doctor", "export", "registerProject", "registerWait", "roleBrief", "v1-inbox-archive", "v1-inbox-mark-read", "v1-inbox-read", "v1-inbox-reply", "v1-lanes"]);
-    expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["dispatch_lane", "close_threadless_prepared_attempt", "send_to_operator", "register_external_wait"]);
+    expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["build_terminal_report", "dispatch_lane", "close_threadless_prepared_attempt", "send_to_operator", "register_external_wait"]);
   });
 
   it("evaluates a GitHub blocker through the CLI apply reader", async () => {
@@ -7588,14 +7589,13 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       PROJECT_ID,
       attempt.execution_attempt_id,
     );
-    const replayRequestDigest = mutationRequestDigest(parseApplyRequest({ ...legacyRequest, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}:title=changed` }));
     let inventoryReads = 0;
     fixture.host.harness.sdk.stub("threads.list", (async () => { inventoryReads += 1; return []; }) as never);
     const input = {
       request: { ...request, idempotencyKey: "gh659-threadless-close", lifecycleState: undefined, workAttempt: undefined, reasonCode: undefined, executionAttemptId: attempt.execution_attempt_id, expectedResourceRevision: 3 },
       correctionId: "gh659-correction-1",
       dispatchIntentIdempotencyKey: legacyRequest.idempotencyKey,
-      replayRequestDigest,
+      replayRequestDigest: "f".repeat(64),
     };
     input.request.expectedResourceRevision = 4;
     const first = JSON.parse(await fixture.host.harness.callAgentTool("close_threadless_prepared_attempt", input, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
@@ -7606,11 +7606,33 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(fixture.db.prepare("SELECT event_type, event_json FROM state_events WHERE project_id = ? ORDER BY event_sequence DESC LIMIT 1").get(PROJECT_ID)).toMatchObject({ event_type: "work_item_threadless_prepared_closure" });
     const closureEvent = fixture.db.prepare("SELECT event_json FROM state_events WHERE project_id = ? ORDER BY event_sequence DESC LIMIT 1").get(PROJECT_ID) as { event_json: string };
     expect(JSON.parse(closureEvent.event_json).correction.evidence[4].population).toEqual(threadlessPreparedClosurePopulation(PROJECT_ID));
+    expect(JSON.parse(closureEvent.event_json).correction.evidence[2].requestDigest).toBe(threadlessPreparedReplayProbeDigest({
+      projectId: PROJECT_ID,
+      workItemId: WORK_ITEM_ID,
+      executionAttemptId: attempt.execution_attempt_id,
+      idempotencyKey: legacyRequest.idempotencyKey,
+    }));
+    expect(JSON.parse(closureEvent.event_json).correction.evidence[2].requestDigest).not.toBe("f".repeat(64));
     expect(inventoryReads).toBe(4);
     const eventCount = (fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { count: number }).count;
     const second = JSON.parse(await fixture.host.harness.callAgentTool("close_threadless_prepared_attempt", input, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
     expect(second).toMatchObject({ outcome: "OK" });
     expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: eventCount });
+  });
+
+  it("records a real replay conflict before the threadless transition guard", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const { threadId: _threadId, ...preparedAttempt } = request.workAttempt!;
+    const prepared = { ...request, workAttempt: preparedAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+    expect(applyWithFixtureReceipt(fixture.db, prepared)).toMatchObject({ outcome: "OK" });
+    const conflict = await fixture.host.harness.callRpc("apply", {
+      ...prepared,
+      reasonCode: `${prepared.reasonCode}:title=changed`,
+    });
+    expect(conflict).toMatchObject({ outcome: "IDEMPOTENCY_KEY_CONFLICT", attempted: 0, verified: 0 });
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ state: "prepared" });
   });
 
   it.each([
@@ -17652,46 +17674,20 @@ exit 1
       host.harness.sdk.stub("threads.events.list", (async ({ afterSeq }: { afterSeq?: string }) => events.filter((event) => afterSeq === undefined || event.seq > Number(afterSeq))) as never);
       host.harness.sdk.stub("environments.get", (async () => ({ id: environmentId, projectId: PROJECT_ID })) as never);
       host.harness.sdk.stub("environments.status", (async () => ({ outcome: "available", workspace: { checkout, workingTree } })) as never);
-      mutate(events, host);
-      const workItem = db.prepare("SELECT * FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID) as Record<string, unknown>;
-      const profile = { ...ROLE_PROFILE };
-      const nativeReceipt = { projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: attempt.execution_attempt_id, threadId, turnId, requestEvent: { id: "gh643-request", seq: 10 }, acceptedEvent: { id: "gh643-accepted", seq: 30 }, startedEvent: { id: "gh643-started", seq: 20 }, completionEvent: { id: "gh643-completed", seq: 40, providerThreadId, status: "completed" } };
-      const candidateObservation = { projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: attempt.execution_attempt_id, repoTargetId: workItem.repo_target_id, resourceRevision: workItem.resource_revision, environmentId, branchName: checkout.branchName, baseSha: BASE_SHA, candidateSha: CANDIDATE_SHA, checkout, workingTree };
-      const actualProfileDigest = sha256(canonicalJson(profile));
-      const nativeReceiptDigest = sha256(canonicalJson(nativeReceipt));
-      const candidateObservationDigest = sha256(canonicalJson(candidateObservation));
-      const report = {
-        receiptVersion: 1 as const,
-        outcome: "DONE" as const,
+      const report = JSON.parse(await host.harness.callAgentTool("build_terminal_report", {
         projectId: PROJECT_ID,
-        assignmentId: (attempt.assignment_id as string | null) ?? null,
-        executionAttemptId: String(attempt.execution_attempt_id),
         workItemId: WORK_ITEM_ID,
-        roleId: (attempt.role_id as "director" | "project-orchestrator" | "worker" | "independent-reviewer" | null) ?? null,
-        roleGeneration: (attempt.role_generation as number | null) ?? null,
-        repoTargetId: String(workItem.repo_target_id),
-        environmentId,
-        threadId,
-        branchName: checkout.branchName,
-        baseSha: BASE_SHA,
-        candidateSha: CANDIDATE_SHA,
-        nativeReceiptDigest,
-        actualProfileDigest,
-        candidateObservationDigest,
+        executionAttemptId: attempt.execution_attempt_id,
+        outcome: "DONE",
         reasonCode: "gh643-test",
         nativeEventId: "gh643-completed",
         nativeEventSeq: 40,
         nativeTurnId: turnId,
-        evidence: [
-          { kind: "native-completion", digest: sha256(canonicalJson({ id: "gh643-completed", seq: 40, threadId, turnId, status: "completed" })), ref: "gh643-completed" },
-          { kind: "native-profile", digest: actualProfileDigest, ref: "gh643-request" },
-          { kind: "native-candidate", digest: candidateObservationDigest, ref: environmentId },
-        ],
-        reportedAtMs: 41,
-        receiptEventId: "gh643-report",
-        receiptEventSeq: 41,
-        receivedAtMs: 42,
-      };
+      }, { projectId: PROJECT_ID, threadId }) as string);
+      expect(report).toMatchObject({ environmentId, nativeEventId: "gh643-completed", receiptEventId: "gh643-completed" });
+      expect(Number.isSafeInteger(report.reportedAtMs)).toBe(true);
+      expect(Number.isSafeInteger(report.receivedAtMs)).toBe(true);
+      mutate(events, host);
       return { host, db, fenceToken, attempt, report };
     };
 
