@@ -7627,12 +7627,69 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     const { threadId: _threadId, ...preparedAttempt } = request.workAttempt!;
     const prepared = { ...request, workAttempt: preparedAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
     expect(applyWithFixtureReceipt(fixture.db, prepared)).toMatchObject({ outcome: "OK" });
+    const preparedAttemptId = (fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state = 'prepared'").get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string }).execution_attempt_id;
     const conflict = await fixture.host.harness.callRpc("apply", {
       ...prepared,
+      lifecycleState: "failed",
+      workAttempt: undefined,
+      executionAttemptId: preparedAttemptId,
       reasonCode: `${prepared.reasonCode}:title=changed`,
     });
     expect(conflict).toMatchObject({ outcome: "IDEMPOTENCY_KEY_CONFLICT", attempted: 0, verified: 0 });
     expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ state: "prepared" });
+  });
+
+  it("distinguishes a replay probe that did not conflict", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const { threadId: _threadId, ...preparedAttempt } = request.workAttempt!;
+    const prepared = { ...request, workAttempt: preparedAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+    expect(applyWithFixtureReceipt(fixture.db, prepared)).toMatchObject({ outcome: "OK" });
+    const attemptId = (fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state = 'prepared'").get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string }).execution_attempt_id;
+    const replayRequestDigest = threadlessPreparedReplayProbeDigest({ projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: attemptId, idempotencyKey: prepared.idempotencyKey });
+    fixture.db.prepare("UPDATE mutation_receipts SET request_digest = ? WHERE project_id = ? AND idempotency_key = ?").run(replayRequestDigest, PROJECT_ID, prepared.idempotencyKey);
+    fixture.host.harness.sdk.stub("threads.list", (async () => []) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("close_threadless_prepared_attempt", {
+      request: { ...request, idempotencyKey: "replay-probe-no-conflict", lifecycleState: undefined, workAttempt: undefined, reasonCode: undefined, executionAttemptId: attemptId, expectedResourceRevision: 3 },
+      correctionId: "replay-probe-no-conflict-correction",
+      dispatchIntentIdempotencyKey: prepared.idempotencyKey,
+      replayRequestDigest: "f".repeat(64),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", message: expect.stringContaining("replay probe did not conflict") });
+  });
+
+  it("distinguishes an unavailable replay-probe store", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const { threadId: _threadId, ...preparedAttempt } = request.workAttempt!;
+    const prepared = { ...request, workAttempt: preparedAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+    expect(applyWithFixtureReceipt(fixture.db, prepared)).toMatchObject({ outcome: "OK" });
+    const attemptId = (fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state = 'prepared'").get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string }).execution_attempt_id;
+    const originalPrepare = fixture.db.prepare.bind(fixture.db);
+    const prepare = vi.spyOn(fixture.db, "prepare").mockImplementation(((sql: string) => {
+      if (sql === "SELECT request_digest, outcome_json FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?") {
+        const statement = originalPrepare(sql);
+        return { get: (...args: unknown[]) => {
+          if (args[1] === prepared.idempotencyKey) throw new Error("SQLITE_BUSY");
+          return statement.get(...args);
+        } } as never;
+      }
+      return originalPrepare(sql);
+    }) as never);
+    try {
+      fixture.host.harness.sdk.stub("threads.list", (async () => []) as never);
+      const result = JSON.parse(await fixture.host.harness.callAgentTool("close_threadless_prepared_attempt", {
+        request: { ...request, idempotencyKey: "replay-probe-store-unavailable", lifecycleState: undefined, workAttempt: undefined, reasonCode: undefined, executionAttemptId: attemptId, expectedResourceRevision: 3 },
+        correctionId: "replay-probe-store-unavailable-correction",
+        dispatchIntentIdempotencyKey: prepared.idempotencyKey,
+        replayRequestDigest: "f".repeat(64),
+      }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+      expect(result).toMatchObject({ outcome: "CANONICAL_STORE_UNAVAILABLE", message: expect.stringContaining("could not read the durable idempotency receipt") });
+    } finally {
+      prepare.mockRestore();
+    }
   });
 
   it.each([
@@ -17674,7 +17731,7 @@ exit 1
       host.harness.sdk.stub("threads.events.list", (async ({ afterSeq }: { afterSeq?: string }) => events.filter((event) => afterSeq === undefined || event.seq > Number(afterSeq))) as never);
       host.harness.sdk.stub("environments.get", (async () => ({ id: environmentId, projectId: PROJECT_ID })) as never);
       host.harness.sdk.stub("environments.status", (async () => ({ outcome: "available", workspace: { checkout, workingTree } })) as never);
-      const report = JSON.parse(await host.harness.callAgentTool("build_terminal_report", {
+      const builderInput = {
         projectId: PROJECT_ID,
         workItemId: WORK_ITEM_ID,
         executionAttemptId: attempt.execution_attempt_id,
@@ -17683,10 +17740,15 @@ exit 1
         nativeEventId: "gh643-completed",
         nativeEventSeq: 40,
         nativeTurnId: turnId,
-      }, { projectId: PROJECT_ID, threadId }) as string);
-      expect(report).toMatchObject({ environmentId, nativeEventId: "gh643-completed", receiptEventId: "gh643-completed" });
-      expect(Number.isSafeInteger(report.reportedAtMs)).toBe(true);
-      expect(Number.isSafeInteger(report.receivedAtMs)).toBe(true);
+      };
+      const report = JSON.parse(await host.harness.callAgentTool("build_terminal_report", builderInput, { projectId: PROJECT_ID, threadId }) as string);
+      expect(report).toMatchObject({ environmentId, nativeEventId: "gh643-completed" });
+      expect(report).not.toHaveProperty("reportedAtMs");
+      expect(report).not.toHaveProperty("receiptEventId");
+      expect(report).not.toHaveProperty("receiptEventSeq");
+      expect(report).not.toHaveProperty("receivedAtMs");
+      const foreignReport = JSON.parse(await host.harness.callAgentTool("build_terminal_report", builderInput, { projectId: PROJECT_ID, threadId: "foreign-same-project-worker" }) as string);
+      expect(foreignReport).toMatchObject({ outcome: "TERMINAL_REPORT_AMBIGUOUS", attempted: 0, verified: 0 });
       mutate(events, host);
       return { host, db, fenceToken, attempt, report };
     };

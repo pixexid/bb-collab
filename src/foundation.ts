@@ -2816,10 +2816,10 @@ const terminalReportSchema = z
     nativeEventSeq: z.number().int().positive(),
     nativeTurnId: id,
     evidence: z.array(terminalEvidenceSchema).min(1).max(64),
-    reportedAtMs: z.number().int().nonnegative(),
-    receiptEventId: id,
-    receiptEventSeq: z.number().int().positive(),
-    receivedAtMs: z.number().int().nonnegative(),
+    reportedAtMs: z.number().int().nonnegative().optional(),
+    receiptEventId: id.optional(),
+    receiptEventSeq: z.number().int().positive().optional(),
+    receivedAtMs: z.number().int().nonnegative().optional(),
   })
   .strict();
 const interruptionEvidenceSchema = z
@@ -3261,11 +3261,7 @@ export function buildTerminalReport(input: {
   evidence: AuthoritativeTerminalEvidence;
   outcome: "DONE" | "BLOCKED";
   reasonCode: string;
-  reportedAtMs?: number;
-  receivedAtMs?: number;
 }): TerminalReport {
-  const reportedAtMs = input.reportedAtMs ?? now();
-  const receivedAtMs = input.receivedAtMs ?? now();
   return {
     receiptVersion: 1,
     outcome: input.outcome,
@@ -3289,10 +3285,6 @@ export function buildTerminalReport(input: {
     nativeEventSeq: input.evidence.nativeEventSeq,
     nativeTurnId: input.evidence.nativeTurnId,
     evidence: input.evidence.evidence,
-    reportedAtMs,
-    receiptEventId: input.evidence.nativeEventId,
-    receiptEventSeq: input.evidence.nativeEventSeq,
-    receivedAtMs,
   };
 }
 
@@ -8524,13 +8516,12 @@ function applyThreadlessPreparedClosure(
       throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure replay probe did not conflict");
     }
   } catch (error) {
-    if (!isRefusal(error) || error.data.code !== "IDEMPOTENCY_KEY_CONFLICT") {
-      throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure replay probe did not produce a recorded conflict");
-    }
+    if (!isRefusal(error)) throw refusal("CANONICAL_STORE_UNAVAILABLE", "thread-less closure replay probe could not read the durable idempotency receipt");
+    if (error.data.code !== "IDEMPOTENCY_KEY_CONFLICT") throw error;
     replayConflictObserved = true;
   }
   if (!replayConflictObserved) {
-    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure replay probe did not produce a recorded conflict");
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure replay probe did not conflict");
   }
   const expectedDispatchRefusal = sha256(canonicalJson({
     kind: "dispatch_refusal",

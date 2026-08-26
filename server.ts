@@ -2397,8 +2397,15 @@ async function buildLiveTerminalReport(
   bb: BbPluginApi,
   db: SqliteDatabase | null,
   input: z.infer<typeof terminalReportBuilderInputSchema>,
+  callerThreadId: string,
 ): Promise<unknown> {
   if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: input.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" } satisfies FoundationResult;
+  const attempt = db.prepare(
+    "SELECT thread_id FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ? AND work_item_id = ?",
+  ).get(input.projectId, input.executionAttemptId, input.workItemId) as { thread_id: string | null } | undefined;
+  if (!attempt || attempt.thread_id !== callerThreadId) {
+    return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: input.projectId, expected: 1, attempted: 0, verified: 0, message: "terminal report builder caller thread does not match the canonical attempt" } satisfies FoundationResult;
+  }
   const resolved = await liveTerminalEvidenceReader(bb.sdk, db, input, {
     nativeEventId: input.nativeEventId,
     nativeEventSeq: input.nativeEventSeq,
@@ -6415,11 +6422,11 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   bb.agents.registerTool({
     name: "build_terminal_report",
     description: "Build a terminal report from the exact native completion and canonical attempt.",
-    instructions: "Use the returned JSON as terminalReport in the execution_attempt_terminal_report request. The builder supplies native digests, the native environment, evidence, and portable timestamps; do not hand-roll them.",
+    instructions: "Use the returned JSON as terminalReport in the execution_attempt_terminal_report request. The builder supplies the native environment, authoritative digests, and evidence; submission owns receipt timing and identity.",
     parameters: terminalReportBuilderInputSchema,
     async execute(input, context) {
       if (input.projectId !== context.projectId) throw new Error("projectId must exactly match the current thread project");
-      return JSON.stringify(await buildLiveTerminalReport(bb, db, input));
+      return JSON.stringify(await buildLiveTerminalReport(bb, db, input, context.threadId));
     },
   });
   bb.agents.registerTool({

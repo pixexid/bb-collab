@@ -17383,10 +17383,10 @@ var terminalReportSchema = external_exports.object({
   nativeEventSeq: external_exports.number().int().positive(),
   nativeTurnId: id,
   evidence: external_exports.array(terminalEvidenceSchema).min(1).max(64),
-  reportedAtMs: external_exports.number().int().nonnegative(),
-  receiptEventId: id,
-  receiptEventSeq: external_exports.number().int().positive(),
-  receivedAtMs: external_exports.number().int().nonnegative()
+  reportedAtMs: external_exports.number().int().nonnegative().optional(),
+  receiptEventId: id.optional(),
+  receiptEventSeq: external_exports.number().int().positive().optional(),
+  receivedAtMs: external_exports.number().int().nonnegative().optional()
 }).strict();
 var interruptionEvidenceSchema = external_exports.object({
   projectId: id,
@@ -17562,8 +17562,6 @@ function threadlessPreparedReplayProbeDigest(input) {
   }));
 }
 function buildTerminalReport(input) {
-  const reportedAtMs = input.reportedAtMs ?? now();
-  const receivedAtMs = input.receivedAtMs ?? now();
   return {
     receiptVersion: 1,
     outcome: input.outcome,
@@ -17586,11 +17584,7 @@ function buildTerminalReport(input) {
     nativeEventId: input.evidence.nativeEventId,
     nativeEventSeq: input.evidence.nativeEventSeq,
     nativeTurnId: input.evidence.nativeTurnId,
-    evidence: input.evidence.evidence,
-    reportedAtMs,
-    receiptEventId: input.evidence.nativeEventId,
-    receiptEventSeq: input.evidence.nativeEventSeq,
-    receivedAtMs
+    evidence: input.evidence.evidence
   };
 }
 function stringField(value) {
@@ -21682,13 +21676,12 @@ function applyThreadlessPreparedClosure(db, request, digest2) {
       throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure replay probe did not conflict");
     }
   } catch (error48) {
-    if (!isRefusal(error48) || error48.data.code !== "IDEMPOTENCY_KEY_CONFLICT") {
-      throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure replay probe did not produce a recorded conflict");
-    }
+    if (!isRefusal(error48)) throw refusal("CANONICAL_STORE_UNAVAILABLE", "thread-less closure replay probe could not read the durable idempotency receipt");
+    if (error48.data.code !== "IDEMPOTENCY_KEY_CONFLICT") throw error48;
     replayConflictObserved = true;
   }
   if (!replayConflictObserved) {
-    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure replay probe did not produce a recorded conflict");
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure replay probe did not conflict");
   }
   const expectedDispatchRefusal = sha256(canonicalJson({
     kind: "dispatch_refusal",
@@ -27869,8 +27862,14 @@ function liveTerminalEvidenceReader(sdk, db, request, report) {
     }
   })();
 }
-async function buildLiveTerminalReport(bb, db, input) {
+async function buildLiveTerminalReport(bb, db, input, callerThreadId) {
   if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: input.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
+  const attempt = db.prepare(
+    "SELECT thread_id FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ? AND work_item_id = ?"
+  ).get(input.projectId, input.executionAttemptId, input.workItemId);
+  if (!attempt || attempt.thread_id !== callerThreadId) {
+    return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: input.projectId, expected: 1, attempted: 0, verified: 0, message: "terminal report builder caller thread does not match the canonical attempt" };
+  }
   const resolved = await liveTerminalEvidenceReader(bb.sdk, db, input, {
     nativeEventId: input.nativeEventId,
     nativeEventSeq: input.nativeEventSeq,
@@ -31461,11 +31460,11 @@ ${thread.titleFallback ?? ""}`);
   bb.agents.registerTool({
     name: "build_terminal_report",
     description: "Build a terminal report from the exact native completion and canonical attempt.",
-    instructions: "Use the returned JSON as terminalReport in the execution_attempt_terminal_report request. The builder supplies native digests, the native environment, evidence, and portable timestamps; do not hand-roll them.",
+    instructions: "Use the returned JSON as terminalReport in the execution_attempt_terminal_report request. The builder supplies the native environment, authoritative digests, and evidence; submission owns receipt timing and identity.",
     parameters: terminalReportBuilderInputSchema,
     async execute(input, context) {
       if (input.projectId !== context.projectId) throw new Error("projectId must exactly match the current thread project");
-      return JSON.stringify(await buildLiveTerminalReport(bb, db, input));
+      return JSON.stringify(await buildLiveTerminalReport(bb, db, input, context.threadId));
     }
   });
   bb.agents.registerTool({
