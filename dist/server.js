@@ -21515,6 +21515,9 @@ function requireWorkItem(db, request, configRevision, expectedRevision = request
   }
   return row;
 }
+function dischargeTerminalWorkItemWait(db, projectId, workItemId) {
+  db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(projectId, workItemId);
+}
 function applyThreadlessPreparedClosure(db, request, digest2) {
   const closure = request.threadlessPreparedClosure;
   if (!closure || request.lifecycleState !== "failed" || !request.executionAttemptId || request.workAttempt !== void 0 || request.workItemWait !== void 0 || request.workItemUnblock !== void 0 || request.workItemExternalEvent !== void 0) {
@@ -21652,6 +21655,7 @@ function applyThreadlessPreparedClosure(db, request, digest2) {
     currentResourceRevision: workItem.resource_revision,
     expectedResourceRevision: request.expectedResourceRevision ?? void 0
   });
+  dischargeTerminalWorkItemWait(db, request.projectId, workItem.work_item_id);
   const evidence = closure.evidence;
   return commitMutation(
     db,
@@ -22471,7 +22475,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
     });
   }
   if (["succeeded", "failed", "cancelled"].includes(nextState)) {
-    db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(request.projectId, workItem.work_item_id);
+    dischargeTerminalWorkItemWait(db, request.projectId, workItem.work_item_id);
   } else if (enteringBlocked) {
     const blocker = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : machineWait.kind === "github_issue_closed" ? { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber } : machineWait;
     if (isGithubPrWait(machineWait)) {

@@ -7238,6 +7238,9 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     const legacyRequest = { ...request, workAttempt: preparedAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
     expect(applyWithFixtureReceipt(fixture.db, legacyRequest)).toMatchObject({ outcome: "OK" });
     const attempt = fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string };
+    expect(applyWithFixtureReceipt(fixture.db, workItemWaitRequest(fixture.fenceToken, 3, {
+      kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat",
+    }))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
     fixture.db.prepare("UPDATE execution_attempts SET reason_code = ? WHERE project_id = ? AND execution_attempt_id = ?").run(
       `work_item_dispatch_intent:${legacyRequest.idempotencyKey}`,
       PROJECT_ID,
@@ -7252,9 +7255,11 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       dispatchIntentIdempotencyKey: legacyRequest.idempotencyKey,
       replayRequestDigest,
     };
+    input.request.expectedResourceRevision = 4;
     const first = JSON.parse(await fixture.host.harness.callAgentTool("close_threadless_prepared_attempt", input, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
-    expect(first).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    expect(first).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
     expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "failed" });
+    expect(fixture.db.prepare("SELECT 1 FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toBeUndefined();
     expect(fixture.db.prepare("SELECT state, thread_id, terminalization_class FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(PROJECT_ID, attempt.execution_attempt_id)).toEqual({ state: "failed", thread_id: null, terminalization_class: "threadless-prepared-closure" });
     expect(fixture.db.prepare("SELECT event_type, event_json FROM state_events WHERE project_id = ? ORDER BY event_sequence DESC LIMIT 1").get(PROJECT_ID)).toMatchObject({ event_type: "work_item_threadless_prepared_closure" });
     const closureEvent = fixture.db.prepare("SELECT event_json FROM state_events WHERE project_id = ? ORDER BY event_sequence DESC LIMIT 1").get(PROJECT_ID) as { event_json: string };

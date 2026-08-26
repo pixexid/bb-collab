@@ -8337,6 +8337,10 @@ function requireWorkItem(
   return row;
 }
 
+function dischargeTerminalWorkItemWait(db: SqliteDatabase, projectId: string, workItemId: string): void {
+  db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(projectId, workItemId);
+}
+
 function applyThreadlessPreparedClosure(
   db: SqliteDatabase,
   request: ApplyRequest,
@@ -8484,6 +8488,7 @@ function applyThreadlessPreparedClosure(
     currentResourceRevision: workItem.resource_revision,
     expectedResourceRevision: request.expectedResourceRevision ?? undefined,
   });
+  dischargeTerminalWorkItemWait(db, request.projectId, workItem.work_item_id);
   const evidence = closure.evidence;
   return commitMutation(
     db,
@@ -9382,7 +9387,7 @@ function applyWorkItemTransition(
     });
   }
   if (["succeeded", "failed", "cancelled"].includes(nextState)) {
-    db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(request.projectId, workItem.work_item_id);
+    dischargeTerminalWorkItemWait(db, request.projectId, workItem.work_item_id);
   } else if (enteringBlocked) {
     const blocker: WorkItemBlocker = machineWait!.kind === "work_item_succeeded"
       ? { kind: machineWait!.kind, workItemId: machineWait!.workItemId }
