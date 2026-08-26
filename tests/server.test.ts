@@ -5101,8 +5101,8 @@ printf 'call\n' >> '${calls}'
 printf '%s\n' '[[{"number":205,"labels":[{"name":"queue:startable"}]}]]'
 `);
     chmodSync(gh, 0o755);
-    const originalPath = process.env.PATH;
-    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const originalGhPath = process.env.BB_COLLAB_GH_PATH;
+    process.env.BB_COLLAB_GH_PATH = gh;
     let acceptedService: ReturnType<Awaited<ReturnType<typeof fleetWatchdogFixture>>["host"]["harness"]["runService"]> | undefined;
     let rejectedService: ReturnType<Awaited<ReturnType<typeof fleetWatchdogFixture>>["host"]["harness"]["runService"]> | undefined;
     try {
@@ -5130,8 +5130,8 @@ printf '%s\n' '[[{"number":205,"labels":[{"name":"queue:startable"}]}]]'
       await acceptedService?.done;
       rejectedService?.controller.abort();
       await rejectedService?.done;
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
+      if (originalGhPath === undefined) delete process.env.BB_COLLAB_GH_PATH;
+      else process.env.BB_COLLAB_GH_PATH = originalGhPath;
       rmSync(bin, { recursive: true, force: true });
     }
   });
