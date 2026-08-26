@@ -26381,9 +26381,13 @@ async function readGithubIssueBriefAsync(db, projectId, workItemId) {
     };
   };
   let issue2 = null;
+  let freshnessAttempts = 0;
+  const mismatchedExternalRevisions = [];
   for (let attempt = 1; attempt <= freshnessReadAttempts; attempt += 1) {
+    freshnessAttempts = attempt;
     issue2 = await readIssue();
     if (issue2.externalRevision === target.projection.observedExternalRevision) break;
+    mismatchedExternalRevisions.push(issue2.externalRevision);
     if (attempt < freshnessReadAttempts) await new Promise((resolve3) => setTimeout(resolve3, freshnessReadDelayMs));
   }
   if (!issue2 || issue2.externalRevision !== target.projection.observedExternalRevision) {
@@ -26436,7 +26440,7 @@ async function readGithubIssueBriefAsync(db, projectId, workItemId) {
   try {
     currentTarget = githubIssueBriefTarget(db, projectId, workItemId);
   } catch (error48) {
-    throw briefFailure("projection-target-read", error48);
+    throw briefFailure("projection-target-reread-after-initial-read", error48);
   }
   if (!currentTarget || JSON.stringify(currentTarget) !== JSON.stringify(target)) {
     throw briefFailure("projection-moved-during-composition", "the canonical projection target changed during the bounded brief read");
@@ -26461,7 +26465,15 @@ async function readGithubIssueBriefAsync(db, projectId, workItemId) {
   } catch (error48) {
     throw briefFailure("brief-binding", error48);
   }
-  return { brief, source };
+  return {
+    brief,
+    source,
+    freshness: {
+      expectedExternalRevision: target.projection.observedExternalRevision ?? "null",
+      attempts: freshnessAttempts,
+      mismatchedExternalRevisions
+    }
+  };
 }
 function appendGithubIssueBrief(spawn, brief) {
   if (typeof spawn.prompt === "string") return { ...spawn, prompt: `${spawn.prompt}
@@ -27163,6 +27175,7 @@ async function dispatchLane(bb, db, input) {
     return { outcome: "EXTERNAL_REF_CONFLICT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub pending binding does not match its exact repository-target mapping" };
   }
   let initialBrief = null;
+  let briefFreshnessEvidence = [];
   const dispatchParentThreadId = spawnShape.data.parentThreadId;
   const dispatchTitle = String(spawnShape.data.title ?? "lane");
   const { threadId: _threadId, ...intentAttempt } = request.workAttempt;
@@ -27177,6 +27190,16 @@ async function dispatchLane(bb, db, input) {
   if (intent.outcome !== "OK") return intent;
   return serializeDispatchRecovery(request, async () => {
     let dispatchSpawn = preparedDispatchSpawn;
+    const withBriefFreshnessEvidence = (result2) => {
+      const recovered = briefFreshnessEvidence.filter((evidence) => evidence.mismatchedExternalRevisions.length > 0);
+      if (result2.outcome !== "OK" || recovered.length === 0) return result2;
+      const existingEvidence = result2.evidence && typeof result2.evidence === "object" && !Array.isArray(result2.evidence) ? result2.evidence : {};
+      return {
+        ...result2,
+        message: `${result2.message ?? "dispatch complete"}; brief freshness mismatch recovered (attempts=${recovered.map((evidence) => evidence.attempts).join(",")})`,
+        evidence: { ...existingEvidence, briefFreshness: recovered }
+      };
+    };
     if (briefTarget) {
       const currentWorkItem = db?.prepare(
         "SELECT resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?"
@@ -27206,13 +27229,16 @@ async function dispatchLane(bb, db, input) {
       }, false, "refuse-active", projectGithubIssueReader(db, request.projectId), githubAdapter);
       if (projection.outcome !== "OK") return projection;
       try {
-        initialBrief = (await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "")).brief;
+        const initialRead = await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "");
+        initialBrief = initialRead.brief;
+        briefFreshnessEvidence.push(initialRead.freshness);
       } catch (error48) {
         return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `cause=initial-brief-read; ${String(error48)}` };
       }
       let latestRead;
       try {
         latestRead = await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "");
+        briefFreshnessEvidence.push(latestRead.freshness);
       } catch (error48) {
         return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `cause=freshness-reread; ${String(error48)}` };
       }
@@ -27235,14 +27261,14 @@ async function dispatchLane(bb, db, input) {
           return dispatchRecoveryRefusal(request.projectId, "native spawn returned without a uniquely recoverable prepared intent");
         }
         if (spawnedThread.projectId !== request.projectId || spawnedThread.parentThreadId !== prepared.parentThreadId || spawnedThread.title !== `${dispatchTitle} [dispatch:${request.idempotencyKey}]`) {
-          return reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, false, configProof);
+          return withBriefFreshnessEvidence(await reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, false, configProof));
         }
-        return finalizeDispatchIntent(bb, db, request, prepared, spawnedThread.id, configProof);
+        return withBriefFreshnessEvidence(await finalizeDispatchIntent(bb, db, request, prepared, spawnedThread.id, configProof));
       } catch {
-        return reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, true, configProof);
+        return withBriefFreshnessEvidence(await reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, true, configProof));
       }
     }
-    return reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, true, configProof);
+    return withBriefFreshnessEvidence(await reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, true, configProof));
   });
 }
 function preparedDispatchIntent(db, request) {

@@ -933,7 +933,7 @@ async function currentGithubBriefDispatch(projectId = PROJECT_ID, connectorHost 
   };
 }
 
-function installGithubBriefGh(snapshot: { title: string; body: string; state: "open" | "closed"; labels: readonly string[]; externalRevision: string }, options: { transitionSnapshot?: typeof snapshot; incomplete?: boolean; mutationFailure?: boolean; slowConnectorHost?: string; responseUrl?: string; issueNumber?: number; issueFailureAfterCommentPage1?: boolean; issueInvalidAfterCommentPage1?: boolean; issueFreshnessMismatchAfterCommentPage1?: boolean; commentPage1Failure?: boolean; commentPage2Invalid?: boolean } = {}) {
+function installGithubBriefGh(snapshot: { title: string; body: string; state: "open" | "closed"; labels: readonly string[]; externalRevision: string }, options: { transitionSnapshot?: typeof snapshot; incomplete?: boolean; mutationFailure?: boolean; slowConnectorHost?: string; responseUrl?: string; issueNumber?: number; issueFailureAfterCommentPage1?: boolean; issueInvalidAfterCommentPage1?: boolean; issueFreshnessMismatchAfterCommentPage1?: boolean; issueUnmaintainedAfterProjection?: boolean; commentPage1Failure?: boolean; commentPage2Invalid?: boolean; pauseAfterCommentPage1?: boolean } = {}) {
   const bin = mkdtempSync(join(tmpdir(), "bb-collab-github-brief-"));
   const gh = join(bin, "gh");
   const calls = join(bin, "calls");
@@ -942,10 +942,16 @@ function installGithubBriefGh(snapshot: { title: string; body: string; state: "o
   const slowStarted = join(bin, "slow-started");
   const slowFinished = join(bin, "slow-finished");
   const commentPage1Seen = join(bin, "comment-page-1-seen");
+  const commentPage1Started = join(bin, "comment-page-1-started");
+  const freshnessMismatchSeen = join(bin, "freshness-mismatch-seen");
+  const projectionReadSeen = join(bin, "projection-read-seen");
+  const projectionReadSecondSeen = join(bin, "projection-read-second-seen");
+  const compositionFailureSeen = join(bin, "composition-failure-seen");
   const issueNumber = options.issueNumber ?? 1;
   const issue = JSON.stringify({ number: issueNumber, title: snapshot.title, body: snapshot.body, state: snapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: snapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: snapshot.labels.map((name) => ({ name })), updatedAt: snapshot.externalRevision, url: options.responseUrl ?? `https://__GH_HOST__/example/project/issues/${issueNumber}` });
   const transitionSnapshot = options.transitionSnapshot ?? snapshot;
   const transitionedIssue = JSON.stringify({ number: issueNumber, title: transitionSnapshot.title, body: transitionSnapshot.body, state: transitionSnapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: transitionSnapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: transitionSnapshot.labels.map((name) => ({ name })), updatedAt: transitionSnapshot.externalRevision, url: options.responseUrl ?? `https://__GH_HOST__/example/project/issues/${issueNumber}` });
+  const unmaintainedIssue = JSON.stringify({ number: issueNumber, title: transitionSnapshot.title, body: "Schema-valid body without the maintained marker.", state: transitionSnapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: transitionSnapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: transitionSnapshot.labels.map((name) => ({ name })), updatedAt: transitionSnapshot.externalRevision, url: options.responseUrl ?? `https://__GH_HOST__/example/project/issues/${issueNumber}` });
   const allComments = Array.from({ length: 48 }, (_, index) => ({ id: 48 - index, body: `comment-${48 - index}`, updated_at: `comment-revision-${48 - index}` }));
   const recent = JSON.stringify(allComments.slice(0, 8));
   const older = JSON.stringify(options.incomplete ? { not: "comments" } : allComments.slice(8, 16));
@@ -960,9 +966,19 @@ connector_host="\${GH_HOST:-default}"
 if [ "$connector_host" = '${options.slowConnectorHost ?? ""}' ]; then touch '${slowStarted}'; sleep 2; touch '${slowFinished}'; fi
 if [ "$connector_host" = '${options.slowConnectorHost ?? ""}' ]; then state_file='${slowTransitioned}'; else state_file='${fastTransitioned}'; fi
 if [ "$1" = issue ]; then
+  if [ -n '${options.issueUnmaintainedAfterProjection ? "yes" : ""}' ] && [ -f "$state_file" ] && [ ! -f '${projectionReadSeen}' ]; then
+    touch '${projectionReadSeen}'
+  elif [ -n '${options.issueUnmaintainedAfterProjection ? "yes" : ""}' ] && [ -f "$state_file" ] && [ ! -f '${projectionReadSecondSeen}' ]; then
+    touch '${projectionReadSecondSeen}'
+  elif [ -n '${options.issueUnmaintainedAfterProjection ? "yes" : ""}' ] && [ -f "$state_file" ] && [ -f '${projectionReadSecondSeen}' ] && [ ! -f '${compositionFailureSeen}' ]; then
+    touch '${compositionFailureSeen}'
+    printf '%s\\n' '${unmaintainedIssue}' | sed "s/__GH_HOST__/$connector_host/g"
+    exit 0
+  fi
   if [ -n '${options.issueFailureAfterCommentPage1 ? "yes" : ""}' ] && [ -f '${commentPage1Seen}' ]; then printf '%s\\n' 'token=ghs_fixture_secret issue body unavailable' >&2; exit 17; fi
   if [ -n '${options.issueInvalidAfterCommentPage1 ? "yes" : ""}' ] && [ -f '${commentPage1Seen}' ]; then printf '%s\\n' '{"not":"an issue"}'; exit 0; fi
-  if [ -n '${options.issueFreshnessMismatchAfterCommentPage1 ? "yes" : ""}' ] && [ -f '${commentPage1Seen}' ]; then
+  if [ -n '${options.issueFreshnessMismatchAfterCommentPage1 ? "yes" : ""}' ] && [ ! -f '${freshnessMismatchSeen}' ] && [ -f '${commentPage1Seen}' ]; then
+    touch '${freshnessMismatchSeen}'
     printf '%s\\n' '${transitionedIssue}' | sed "s/__GH_HOST__/$connector_host/g; s/\\"updatedAt\\":\\"[^\\"]*\\"/\\"updatedAt\\":\\"fixture-mismatch\\"/"
     exit 0
   fi
@@ -975,7 +991,7 @@ if [ "$1" = api ]; then
       ${options.mutationFailure ? "exit 12" : `touch "$state_file"; printf '%s\\n' '{"number":${issueNumber},"html_url":"https://__GH_HOST__/example/project/issues/${issueNumber}"}' | sed "s/__GH_HOST__/$connector_host/g"`}
       exit 0 ;;
     *--paginate*) exit 12 ;;
-    *page=1*) touch '${commentPage1Seen}'; ${options.commentPage1Failure ? "printf '%s\\n' 'comment page 1 unavailable' >&2; exit 18" : `printf '%s\\n' '${recent}'; exit 0`} ;;
+    *page=1*) touch '${commentPage1Seen}'${options.pauseAfterCommentPage1 ? `; touch '${commentPage1Started}'; sleep 1` : ""}; ${options.commentPage1Failure ? "printf '%s\\n' 'comment page 1 unavailable' >&2; exit 18" : `printf '%s\\n' '${recent}'; exit 0`} ;;
     *page=2*) ${options.commentPage2Invalid ? "printf '%s\\n' '{\"not\":\"comments\"}'; exit 0" : `printf '%s\\n' '${older}'; exit 0`} ;;
   esac
 fi
@@ -1002,6 +1018,11 @@ exit 1
       const deadline = Date.now() + timeoutMs;
       while (!existsSync(slowStarted) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
       if (!existsSync(slowStarted)) throw new Error("slow connector command did not start");
+    },
+    async waitForCommentPage1(timeoutMs = 5_000) {
+      const deadline = Date.now() + timeoutMs;
+      while (!existsSync(commentPage1Started) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      if (!existsSync(commentPage1Started)) throw new Error("comment page 1 command did not start");
     },
     slowCommandFinished() {
       return existsSync(slowFinished);
@@ -6865,7 +6886,6 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     const cases = [
       { name: "issue body command failure", options: { issueFailureAfterCommentPage1: true }, cause: "issue-body-read", evidence: "[REDACTED_TOKEN]", absent: "comment-tail-page-1" },
       { name: "issue body invalid response", options: { issueInvalidAfterCommentPage1: true }, cause: "issue-body-read", evidence: "GitHub issue response is invalid", absent: "comment-tail-page-1" },
-      { name: "issue body freshness mismatch", options: { issueFreshnessMismatchAfterCommentPage1: true }, cause: "issue-body-freshness-mismatch", evidence: "attempts=3", absent: "comment-tail-page-1" },
       { name: "recent comment page failure", options: { commentPage1Failure: true }, cause: "comment-tail-page-1", evidence: "comment page 1 unavailable", absent: "comment-tail-page-2" },
       { name: "older comment page invalid response", options: { commentPage2Invalid: true }, cause: "comment-tail-page-2", evidence: "GitHub issue comments response is invalid", absent: "comment-tail-page-1" },
     ] as const;
@@ -6903,6 +6923,111 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
         restore.cleanup();
       }
     }
+  });
+
+  it("retains one freshness mismatch and its bounded retry count after recovery", async () => {
+    const projected = await currentGithubBriefDispatch();
+    const restore = installGithubBriefGh(projected.snapshot, { transitionSnapshot: projected.transitionSnapshot, issueFreshnessMismatchAfterCommentPage1: true });
+    try {
+      const result = JSON.parse(await projected.fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: projected.request,
+        spawn: dispatchSpawn(projected.fixture.orchestratorThreadId),
+      }, { projectId: PROJECT_ID, threadId: projected.fixture.orchestratorThreadId }) as string);
+      expect(result.outcome).toBe("OK");
+      expect(result.message).toContain("brief freshness mismatch recovered (attempts=2)");
+      expect(result.evidence).toMatchObject({
+        briefFreshness: [{ expectedExternalRevision: "fixture-in-progress", attempts: 2, mismatchedExternalRevisions: ["fixture-mismatch"] }],
+      });
+      expect(JSON.stringify(result)).not.toContain("ghs_fixture_secret");
+      expect(JSON.stringify(projected.fixture.db.prepare("SELECT event_json FROM state_events").all())).not.toContain("ghs_fixture_secret");
+      expect(JSON.stringify(projected.fixture.db.prepare("SELECT outcome_json FROM mutation_receipts").all())).not.toContain("ghs_fixture_secret");
+      expect(projected.fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    } finally {
+      restore.cleanup();
+    }
+  });
+
+  it("fixtures each reachable brief-read cause without collapsing the labels", async () => {
+    const causes = [
+      "brief-composition",
+      "projection-moved-during-composition",
+      "projection-target-not-current",
+      "repository-mapping-unavailable",
+    ];
+    const expectOnlyCause = (result: { message?: string }, cause: string) => {
+      expect(result.message ?? "").toContain(`cause=${cause}`);
+      for (const other of causes) {
+        if (other !== cause) expect(result.message ?? "").not.toContain(`cause=${other}`);
+      }
+    };
+
+    const composition = await currentGithubBriefDispatch();
+    const compositionRestore = installGithubBriefGh(composition.snapshot, { transitionSnapshot: composition.transitionSnapshot, issueUnmaintainedAfterProjection: true });
+    try {
+      const result = JSON.parse(await composition.fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: composition.request,
+        spawn: dispatchSpawn(composition.fixture.orchestratorThreadId),
+      }, { projectId: PROJECT_ID, threadId: composition.fixture.orchestratorThreadId }) as string);
+      expect(result.outcome).toBe("EXTERNAL_UNAVAILABLE");
+      expectOnlyCause(result, "brief-composition");
+      expect(composition.fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    } finally {
+      compositionRestore.cleanup();
+    }
+
+    const moved = await currentGithubBriefDispatch();
+    const movedRestore = installGithubBriefGh(moved.snapshot, { transitionSnapshot: moved.transitionSnapshot, pauseAfterCommentPage1: true });
+    try {
+      const dispatch = moved.fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: moved.request,
+        spawn: dispatchSpawn(moved.fixture.orchestratorThreadId),
+      }, { projectId: PROJECT_ID, threadId: moved.fixture.orchestratorThreadId });
+      await movedRestore.waitForCommentPage1();
+      moved.fixture.db.prepare(
+        "UPDATE external_work_refs SET observed_external_revision = 'fixture-moved' WHERE project_id = ? AND work_item_id = ?",
+      ).run(PROJECT_ID, WORK_ITEM_ID);
+      const result = JSON.parse(await dispatch as string);
+      expect(result.outcome).toBe("EXTERNAL_UNAVAILABLE");
+      expectOnlyCause(result, "projection-moved-during-composition");
+      expect(moved.fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    } finally {
+      movedRestore.cleanup();
+    }
+
+    const notCurrent = await currentGithubBriefDispatch();
+    const resourceRevision = (notCurrent.fixture.db.prepare(
+      "SELECT resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?",
+    ).get(PROJECT_ID, WORK_ITEM_ID) as { resource_revision: number }).resource_revision;
+    notCurrent.fixture.db.prepare(
+      `UPDATE external_work_refs
+       SET projection_state = 'drifted', attempted_resource_revision = ?, projected_resource_revision = NULL,
+           observed_external_digest = NULL, observed_external_revision = NULL
+       WHERE project_id = ? AND work_item_id = ?`,
+    ).run(resourceRevision, PROJECT_ID, WORK_ITEM_ID);
+    const notCurrentResult = JSON.parse(await notCurrent.fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: notCurrent.request,
+      spawn: dispatchSpawn(notCurrent.fixture.orchestratorThreadId),
+    }, { projectId: PROJECT_ID, threadId: notCurrent.fixture.orchestratorThreadId }) as string);
+    expect(notCurrentResult.outcome).toBe("EXTERNAL_UNAVAILABLE");
+    expectOnlyCause(notCurrentResult, "projection-target-not-current");
+    expect(notCurrent.fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+
+    const mapping = await currentGithubBriefDispatch();
+    const configRow = mapping.fixture.db.prepare(
+      "SELECT canonical_config_json FROM project_config_revisions WHERE project_id = ? AND config_revision = 1",
+    ).get(PROJECT_ID) as { canonical_config_json: string };
+    const config = JSON.parse(configRow.canonical_config_json) as { extensions: { bbCollab: { githubIssues: { repositoryMappings: Array<{ connectorHost: string }> } } } };
+    config.extensions.bbCollab.githubIssues.repositoryMappings[0]!.connectorHost = "https://foreign host";
+    mapping.fixture.db.prepare(
+      "UPDATE project_config_revisions SET canonical_config_json = ? WHERE project_id = ? AND config_revision = 1",
+    ).run(JSON.stringify(config), PROJECT_ID);
+    const mappingResult = JSON.parse(await mapping.fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: mapping.request,
+      spawn: dispatchSpawn(mapping.fixture.orchestratorThreadId),
+    }, { projectId: PROJECT_ID, threadId: mapping.fixture.orchestratorThreadId }) as string);
+    expect(mappingResult.outcome).toBe("EXTERNAL_UNAVAILABLE");
+    expectOnlyCause(mappingResult, "repository-mapping-unavailable");
+    expect(mapping.fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
   });
 
   it("keeps a failed maintained-body projection recoverable without spawning", async () => {

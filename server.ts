@@ -576,6 +576,18 @@ type GithubIssueBriefTarget = {
 
 type GithubIssueBriefTargetRead = GithubIssueBriefTarget | null | "invalid";
 
+type GithubIssueBriefFreshnessEvidence = {
+  expectedExternalRevision: string;
+  attempts: number;
+  mismatchedExternalRevisions: string[];
+};
+
+type GithubIssueBriefRead = {
+  brief: GithubIssueBrief;
+  source: GithubIssueBriefSource;
+  freshness: GithubIssueBriefFreshnessEvidence;
+};
+
 function githubIssueBriefTarget(db: SqliteDatabase | null, projectId: string, workItemId: string): GithubIssueBriefTargetRead {
   if (!db) return null;
   const ref = db.prepare(
@@ -653,7 +665,7 @@ function parseGithubIssueComments(value: unknown): GithubIssueComment[] {
   }).reverse();
 }
 
-async function readGithubIssueBriefAsync(db: SqliteDatabase | null, projectId: string, workItemId: string): Promise<{ brief: GithubIssueBrief; source: GithubIssueBriefSource }> {
+async function readGithubIssueBriefAsync(db: SqliteDatabase | null, projectId: string, workItemId: string): Promise<GithubIssueBriefRead> {
   const freshnessReadAttempts = 3;
   const freshnessReadDelayMs = 25;
   const sanitizeEvidence = (value: string): string => value
@@ -723,9 +735,13 @@ async function readGithubIssueBriefAsync(db: SqliteDatabase | null, projectId: s
   };
 
   let issue: GitHubIssueSnapshot | null = null;
+  let freshnessAttempts = 0;
+  const mismatchedExternalRevisions: string[] = [];
   for (let attempt = 1; attempt <= freshnessReadAttempts; attempt += 1) {
+    freshnessAttempts = attempt;
     issue = await readIssue();
     if (issue.externalRevision === target.projection.observedExternalRevision) break;
+    mismatchedExternalRevisions.push(issue.externalRevision);
     if (attempt < freshnessReadAttempts) await new Promise((resolve) => setTimeout(resolve, freshnessReadDelayMs));
   }
   if (!issue || issue.externalRevision !== target.projection.observedExternalRevision) {
@@ -779,7 +795,7 @@ async function readGithubIssueBriefAsync(db: SqliteDatabase | null, projectId: s
   try {
     currentTarget = githubIssueBriefTarget(db, projectId, workItemId);
   } catch (error) {
-    throw briefFailure("projection-target-read", error);
+    throw briefFailure("projection-target-reread-after-initial-read", error);
   }
   if (!currentTarget || JSON.stringify(currentTarget) !== JSON.stringify(target)) {
     throw briefFailure("projection-moved-during-composition", "the canonical projection target changed during the bounded brief read");
@@ -804,7 +820,15 @@ async function readGithubIssueBriefAsync(db: SqliteDatabase | null, projectId: s
   } catch (error) {
     throw briefFailure("brief-binding", error);
   }
-  return { brief, source };
+  return {
+    brief,
+    source,
+    freshness: {
+      expectedExternalRevision: target.projection.observedExternalRevision ?? "null",
+      attempts: freshnessAttempts,
+      mismatchedExternalRevisions,
+    },
+  };
 }
 
 function appendGithubIssueBrief(spawn: Record<string, unknown>, brief: GithubIssueBrief): Record<string, unknown> {
@@ -1617,6 +1641,7 @@ async function dispatchLane(
     return { outcome: "EXTERNAL_REF_CONFLICT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub pending binding does not match its exact repository-target mapping" };
   }
   let initialBrief: GithubIssueBrief | null = null;
+  let briefFreshnessEvidence: GithubIssueBriefFreshnessEvidence[] = [];
   const dispatchParentThreadId = spawnShape.data.parentThreadId;
   const dispatchTitle = String(spawnShape.data.title ?? "lane");
   const { threadId: _threadId, ...intentAttempt } = request.workAttempt;
@@ -1633,6 +1658,18 @@ async function dispatchLane(
   if (intent.outcome !== "OK") return intent;
   return serializeDispatchRecovery(request, async () => {
     let dispatchSpawn = preparedDispatchSpawn;
+    const withBriefFreshnessEvidence = (result: FoundationResult): FoundationResult => {
+      const recovered = briefFreshnessEvidence.filter((evidence) => evidence.mismatchedExternalRevisions.length > 0);
+      if (result.outcome !== "OK" || recovered.length === 0) return result;
+      const existingEvidence = result.evidence && typeof result.evidence === "object" && !Array.isArray(result.evidence)
+        ? result.evidence as Record<string, unknown>
+        : {};
+      return {
+        ...result,
+        message: `${result.message ?? "dispatch complete"}; brief freshness mismatch recovered (attempts=${recovered.map((evidence) => evidence.attempts).join(",")})`,
+        evidence: { ...existingEvidence, briefFreshness: recovered },
+      };
+    };
     if (briefTarget) {
       const currentWorkItem = db?.prepare(
         "SELECT resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?",
@@ -1662,13 +1699,16 @@ async function dispatchLane(
       }, false, "refuse-active", projectGithubIssueReader(db, request.projectId), githubAdapter);
       if (projection.outcome !== "OK") return projection;
       try {
-        initialBrief = (await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "")).brief;
+        const initialRead = await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "");
+        initialBrief = initialRead.brief;
+        briefFreshnessEvidence.push(initialRead.freshness);
       } catch (error) {
         return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `cause=initial-brief-read; ${String(error)}` };
       }
-      let latestRead: { brief: GithubIssueBrief; source: GithubIssueBriefSource };
+      let latestRead: GithubIssueBriefRead;
       try {
         latestRead = await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "");
+        briefFreshnessEvidence.push(latestRead.freshness);
       } catch (error) {
         return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `cause=freshness-reread; ${String(error)}` };
       }
@@ -1695,14 +1735,14 @@ async function dispatchLane(
           spawnedThread.parentThreadId !== prepared.parentThreadId ||
           spawnedThread.title !== `${dispatchTitle} [dispatch:${request.idempotencyKey}]`
         ) {
-          return reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, false, configProof);
+          return withBriefFreshnessEvidence(await reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, false, configProof));
         }
-        return finalizeDispatchIntent(bb, db, request, prepared, spawnedThread.id, configProof);
+        return withBriefFreshnessEvidence(await finalizeDispatchIntent(bb, db, request, prepared, spawnedThread.id, configProof));
       } catch {
-        return reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, true, configProof);
+        return withBriefFreshnessEvidence(await reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, true, configProof));
       }
     }
-    return reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, true, configProof);
+    return withBriefFreshnessEvidence(await reconcileDispatchIntent(bb, db, request, dispatchSpawn, intent, true, configProof));
   });
 }
 
