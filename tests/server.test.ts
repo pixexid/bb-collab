@@ -17214,7 +17214,7 @@ exit 1
       roleId: null,
       roleGeneration: null,
       repoTargetId: TARGET_ID,
-      environmentId: null,
+      environmentId: "environment-work-item-2",
       threadId: resumedAttempt.thread_id,
       branchName: null,
       baseSha: null,
@@ -17241,7 +17241,7 @@ exit 1
       assignmentId: null,
       roleId: null,
       roleGeneration: null,
-      environmentId: null,
+      environmentId: "environment-work-item-2",
       threadId: resumedAttempt.thread_id,
       branchName: null,
       baseSha: null,
@@ -17644,7 +17644,9 @@ exit 1
         workAttempt: { laneId: "gh643-lane", threadId, assignmentKind: "write", requestedProfile: ROLE_PROFILE },
       })).outcome).toBe("OK");
       const attempt = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state = 'running'").get(PROJECT_ID, WORK_ITEM_ID) as Record<string, unknown>;
-      db.prepare("UPDATE execution_attempts SET environment_id = ?, branch_name = ?, base_sha = ?, candidate_sha = ? WHERE project_id = ? AND execution_attempt_id = ?").run(environmentId, checkout.branchName, BASE_SHA, CANDIDATE_SHA, PROJECT_ID, attempt.execution_attempt_id);
+      // #718: real work-attempt rows never persist environment_id — the terminal
+      // seam must derive it from the native thread. Only candidate facts are seeded.
+      db.prepare("UPDATE execution_attempts SET branch_name = ?, base_sha = ?, candidate_sha = ? WHERE project_id = ? AND execution_attempt_id = ?").run(checkout.branchName, BASE_SHA, CANDIDATE_SHA, PROJECT_ID, attempt.execution_attempt_id);
       const events = makeEvents();
       host.harness.sdk.stub("threads.get", (async () => makeThreadResponse({ id: threadId, projectId: PROJECT_ID, environmentId, providerId: ROLE_PROFILE.providerId, status: "idle", visibility: "visible" })) as never);
       host.harness.sdk.stub("threads.events.list", (async ({ afterSeq }: { afterSeq?: string }) => events.filter((event) => afterSeq === undefined || event.seq > Number(afterSeq))) as never);
@@ -17758,6 +17760,8 @@ exit 1
       ["wrong attempt", () => undefined, (report) => ({ ...report, executionAttemptId: "foreign-attempt" })],
       ["wrong candidate identity", () => undefined, (report) => ({ ...report, candidateSha: BASE_SHA })],
       ["wrong completion identity", () => undefined, (report) => ({ ...report, nativeEventId: "foreign-completion" })],
+      ["wrong report environment", () => undefined, (report) => ({ ...report, environmentId: "foreign-environment" })],
+      ["foreign derived environment", (_events, host) => { host.harness.sdk.stub("threads.get", (async () => makeThreadResponse({ id: threadId, projectId: PROJECT_ID, environmentId: "other-environment", providerId: ROLE_PROFILE.providerId, status: "idle", visibility: "visible" })) as never); }, (report) => report],
     ];
     for (const [name, mutate, reportMutator] of negativeCases) {
       const fixture = await setup(mutate);
@@ -17778,6 +17782,30 @@ exit 1
       });
       expect(result, name).toMatchObject({ outcome: expect.stringMatching(/AMBIGUOUS|UNKNOWN|FOREIGN|EXTERNAL/) , verified: 0 });
       expect(exportFoundation(fixture.db, PROJECT_ID), name).toEqual(before);
+    }
+
+    // #718: a persisted environment identity (seat-attempt shape) must still
+    // match the native thread exactly — derivation never loosens strict rows.
+    {
+      const fixture = await setup();
+      fixture.db.prepare("UPDATE execution_attempts SET environment_id = ? WHERE execution_attempt_id = ?").run("persisted-environment", fixture.attempt.execution_attempt_id);
+      const before = exportFoundation(fixture.db, PROJECT_ID);
+      const result = await fixture.host.harness.callRpc("apply", {
+        projectId: PROJECT_ID,
+        operationClass: "execution_attempt_terminal_report",
+        idempotencyKey: "gh643-negative-persisted-environment",
+        actorReceiptId: RECEIPT_ID,
+        expectedConfigRevision: 1,
+        expectedGovernanceEpoch: 1,
+        expectedFenceToken: fixture.fenceToken,
+        repoTargetId: TARGET_ID,
+        expectedResourceRevision: 3,
+        workItemId: WORK_ITEM_ID,
+        executionAttemptId: fixture.attempt.execution_attempt_id,
+        terminalReport: fixture.report,
+      });
+      expect(result).toMatchObject({ outcome: expect.stringMatching(/AMBIGUOUS|UNKNOWN|FOREIGN|EXTERNAL/), verified: 0 });
+      expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
     }
   });
 });

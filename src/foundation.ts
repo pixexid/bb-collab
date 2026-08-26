@@ -7764,7 +7764,6 @@ function applyExecutionAttemptTerminalReport(
     ["role", attempt.role_id, report.roleId],
     ["role generation", attempt.role_generation, report.roleGeneration],
     ["repository target", attempt.repo_target_id, report.repoTargetId],
-    ["environment", attempt.environment_id, report.environmentId],
     ["thread", attempt.thread_id, report.threadId],
     ["branch", attempt.branch_name, report.branchName],
     ["base", attempt.base_sha, report.baseSha],
@@ -7772,6 +7771,12 @@ function applyExecutionAttemptTerminalReport(
   ];
   const mismatch = exact.find(([, actual, expected]) => !sameNullable(actual, expected));
   if (mismatch) throw refusal("TERMINAL_REPORT_AMBIGUOUS", `terminal report ${mismatch[0]} identity does not match the canonical attempt`);
+  // #718: work-attempt rows never persisted environment_id. A persisted identity
+  // must match the report exactly here; an unpersisted one is bound to the native
+  // thread's environment by the authoritative gate below.
+  if (attempt.environment_id !== null && !sameNullable(report.environmentId, attempt.environment_id)) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report environment identity does not match the canonical attempt");
+  }
   if (attempt.thread_id === null || report.nativeEventSeq <= 0 || report.nativeEventId.length === 0) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report lacks exact native thread/event evidence");
   }
@@ -7797,7 +7802,6 @@ function applyExecutionAttemptTerminalReport(
     ["assignment", authoritative.assignmentId, attempt.assignment_id],
     ["role", authoritative.roleId, attempt.role_id],
     ["role generation", authoritative.roleGeneration, attempt.role_generation],
-    ["environment", authoritative.environmentId, attempt.environment_id],
     ["thread", authoritative.threadId, attempt.thread_id],
     ["branch", authoritative.branchName, attempt.branch_name],
     ["base", authoritative.baseSha, attempt.base_sha],
@@ -7811,6 +7815,14 @@ function applyExecutionAttemptTerminalReport(
   ];
   const authoritativeMismatch = authoritativeExact.find(([, actual, expected]) => !sameNullable(actual, expected));
   if (authoritativeMismatch) throw refusal("TERMINAL_REPORT_AMBIGUOUS", `terminal report authoritative ${authoritativeMismatch[0]} evidence does not match`);
+  // #718: environment binding. Persisted: native evidence must equal it.
+  // Unpersisted (historical work-attempt rows): the native thread's environment
+  // is the attempt's environment, and the report must carry exactly that value.
+  if (attempt.environment_id !== null) {
+    if (!sameNullable(authoritative.environmentId, attempt.environment_id)) throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report authoritative environment evidence does not match");
+  } else if (authoritative.environmentId === null || !sameNullable(authoritative.environmentId, report.environmentId)) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report environment identity does not match the native execution environment");
+  }
   if (canonicalJson(authoritative.evidence) !== canonicalJson(report.evidence)) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report evidence does not match the authoritative native evidence");
   }

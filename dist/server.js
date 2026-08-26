@@ -21076,7 +21076,6 @@ function applyExecutionAttemptTerminalReport(db, request, digest2, evidenceReade
     ["role", attempt.role_id, report.roleId],
     ["role generation", attempt.role_generation, report.roleGeneration],
     ["repository target", attempt.repo_target_id, report.repoTargetId],
-    ["environment", attempt.environment_id, report.environmentId],
     ["thread", attempt.thread_id, report.threadId],
     ["branch", attempt.branch_name, report.branchName],
     ["base", attempt.base_sha, report.baseSha],
@@ -21084,6 +21083,9 @@ function applyExecutionAttemptTerminalReport(db, request, digest2, evidenceReade
   ];
   const mismatch = exact.find(([, actual, expected]) => !sameNullable(actual, expected));
   if (mismatch) throw refusal("TERMINAL_REPORT_AMBIGUOUS", `terminal report ${mismatch[0]} identity does not match the canonical attempt`);
+  if (attempt.environment_id !== null && !sameNullable(report.environmentId, attempt.environment_id)) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report environment identity does not match the canonical attempt");
+  }
   if (attempt.thread_id === null || report.nativeEventSeq <= 0 || report.nativeEventId.length === 0) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report lacks exact native thread/event evidence");
   }
@@ -21109,7 +21111,6 @@ function applyExecutionAttemptTerminalReport(db, request, digest2, evidenceReade
     ["assignment", authoritative.assignmentId, attempt.assignment_id],
     ["role", authoritative.roleId, attempt.role_id],
     ["role generation", authoritative.roleGeneration, attempt.role_generation],
-    ["environment", authoritative.environmentId, attempt.environment_id],
     ["thread", authoritative.threadId, attempt.thread_id],
     ["branch", authoritative.branchName, attempt.branch_name],
     ["base", authoritative.baseSha, attempt.base_sha],
@@ -21123,6 +21124,11 @@ function applyExecutionAttemptTerminalReport(db, request, digest2, evidenceReade
   ];
   const authoritativeMismatch = authoritativeExact.find(([, actual, expected]) => !sameNullable(actual, expected));
   if (authoritativeMismatch) throw refusal("TERMINAL_REPORT_AMBIGUOUS", `terminal report authoritative ${authoritativeMismatch[0]} evidence does not match`);
+  if (attempt.environment_id !== null) {
+    if (!sameNullable(authoritative.environmentId, attempt.environment_id)) throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report authoritative environment evidence does not match");
+  } else if (authoritative.environmentId === null || !sameNullable(authoritative.environmentId, report.environmentId)) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report environment identity does not match the native execution environment");
+  }
   if (canonicalJson(authoritative.evidence) !== canonicalJson(report.evidence)) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report evidence does not match the authoritative native evidence");
   }
@@ -27655,7 +27661,7 @@ function liveTerminalReader(sdk, db, request) {
   return (async () => {
     try {
       const thread = await sdk.threads.get({ threadId });
-      if (thread.projectId !== request.projectId || thread.id !== threadId || thread.environmentId === null || thread.environmentId !== attempt.environment_id) throw new Error("native terminal thread is foreign or has no exact environment");
+      if (thread.projectId !== request.projectId || thread.id !== threadId || thread.environmentId === null || typeof attempt.environment_id === "string" && attempt.environment_id !== thread.environmentId) throw new Error("native terminal thread is foreign or has no exact environment");
       const events = await completeNativeThreadEvents(sdk, threadId);
       const turnId = report.nativeTurnId;
       const completions = events.filter((event) => event.type === "turn/completed" && nativeTurnId(event) === turnId);
@@ -27748,7 +27754,7 @@ function liveTerminalReader(sdk, db, request) {
         assignmentId: attempt.assignment_id ?? null,
         roleId: attempt.role_id ?? null,
         roleGeneration: attempt.role_generation ?? null,
-        environmentId: attempt.environment_id ?? null,
+        environmentId: attempt.environment_id ?? thread.environmentId,
         threadId,
         branchName: attempt.branch_name ?? null,
         baseSha: attempt.base_sha ?? null,

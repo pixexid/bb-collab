@@ -2237,7 +2237,10 @@ function liveTerminalReader(
   return (async () => {
     try {
       const thread = await sdk.threads.get({ threadId });
-      if (thread.projectId !== request.projectId || thread.id !== threadId || thread.environmentId === null || thread.environmentId !== attempt.environment_id) throw new Error("native terminal thread is foreign or has no exact environment");
+      // #718: work-attempt rows never persisted environment_id, so the native
+      // thread's environment is the attempt's environment when unpersisted; a
+      // persisted identity (seat attempts) still must match exactly.
+      if (thread.projectId !== request.projectId || thread.id !== threadId || thread.environmentId === null || (typeof attempt.environment_id === "string" && attempt.environment_id !== thread.environmentId)) throw new Error("native terminal thread is foreign or has no exact environment");
       const events = await completeNativeThreadEvents(sdk, threadId);
       const turnId = report.nativeTurnId;
       const completions = events.filter((event) => event.type === "turn/completed" && nativeTurnId(event) === turnId);
@@ -2336,7 +2339,7 @@ function liveTerminalReader(
         assignmentId: (attempt.assignment_id as string | null) ?? null,
         roleId: (attempt.role_id as AuthoritativeTerminalEvidence["roleId"]) ?? null,
         roleGeneration: (attempt.role_generation as number | null) ?? null,
-        environmentId: (attempt.environment_id as string | null) ?? null,
+        environmentId: (attempt.environment_id as string | null) ?? thread.environmentId,
         threadId,
         branchName: (attempt.branch_name as string | null) ?? null,
         baseSha: (attempt.base_sha as string | null) ?? null,
