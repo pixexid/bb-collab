@@ -104,3 +104,19 @@ resource-revision, WorkItem, and idempotency fields. The live CLI supplies the
 GitHub adapter only for this recovery request; it rereads the exact mapped
 issue and resets the ref to `pending` only when the unchanged observation proves
 the attempted write did not land. Ordinary projection apply remains fenced.
+
+For a `drifted` GitHub projection, supply a fresh observation of the exact bound
+issue instead. The CLI rereads that issue, verifies its identity and revision,
+records the new observation, and resets the ref to `pending`:
+
+```json
+{
+  "projectionRecoveryEvidence": {
+    "kind": "github_issue_observed",
+    "owner": "<mapped-owner>",
+    "repo": "<mapped-repo>",
+    "issueNumber": 667,
+    "externalRevision": "<current-external-revision>"
+  }
+}
+```

@@ -2270,6 +2270,80 @@ describe("GH-676 projection recovery evidence", () => {
       observed_external_digest: (before as { observed_external_digest: string }).observed_external_digest,
     });
   });
+
+  it("re-baselines drift from a fresh exact observation and records the new value", async () => {
+    const { db, fenceToken, adapter } = await boundIssueFixture();
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1), adapter).outcome).toBe("OK");
+    const stale = db.prepare("SELECT observed_external_revision, observed_external_digest FROM external_work_refs").get() as {
+      observed_external_revision: string;
+      observed_external_digest: string;
+    };
+    const changed = adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)!;
+    adapter.put({ ...changed, state: "closed", stateReason: "COMPLETED", externalRevision: "fresh-drift-observation" });
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, { idempotencyKey: "record-drift" }), adapter)).toMatchObject({
+      outcome: "EXTERNAL_DIVERGED",
+      attempted: 1,
+      verified: 0,
+    });
+    expect(db.prepare("SELECT projection_state FROM external_work_refs").get()).toEqual({ projection_state: "drifted" });
+
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, {
+      idempotencyKey: "rebaseline-drift",
+      projectionRecoveryEvidence: {
+        kind: "github_issue_observed",
+        owner: GITHUB_OWNER,
+        repo: GITHUB_REPO,
+        issueNumber: 1,
+        externalRevision: "fresh-drift-observation",
+      },
+    }), adapter)).toMatchObject({
+      outcome: "OK",
+      expected: 1,
+      attempted: 1,
+      verified: 1,
+      evidence: { projectionState: "pending", resolution: "external_observation_rebaselined" },
+    });
+    const rebased = db.prepare("SELECT projection_state, observed_external_revision, observed_external_digest FROM external_work_refs").get() as {
+      projection_state: string;
+      observed_external_revision: string;
+      observed_external_digest: string;
+    };
+    expect(rebased.projection_state).toBe("pending");
+    expect(rebased.observed_external_revision).toBe("fresh-drift-observation");
+    expect(rebased.observed_external_revision).not.toBe(stale.observed_external_revision);
+    expect(rebased.observed_external_digest).not.toBe(stale.observed_external_digest);
+  });
+
+  it("refuses drift re-baseline without an observation", async () => {
+    const { db, fenceToken, adapter } = await boundIssueFixture();
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1), adapter).outcome).toBe("OK");
+    const changed = adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)!;
+    adapter.put({ ...changed, state: "closed", stateReason: "COMPLETED", externalRevision: "unobserved-drift" });
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, { idempotencyKey: "drift-first" }), adapter).outcome).toBe("EXTERNAL_DIVERGED");
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, { idempotencyKey: "drift-without-evidence" }), adapter).outcome).toBe("EXTERNAL_DIVERGED");
+    expect(db.prepare("SELECT projection_state FROM external_work_refs").get()).toEqual({ projection_state: "drifted" });
+  });
+
+  it("refuses drift re-baseline evidence with the wrong identity", async () => {
+    const { db, fenceToken, adapter } = await boundIssueFixture();
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1), adapter).outcome).toBe("OK");
+    const changed = adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)!;
+    adapter.put({ ...changed, state: "closed", stateReason: "COMPLETED", externalRevision: "wrong-identity-drift" });
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, { idempotencyKey: "drift-for-identity" }), adapter).outcome).toBe("EXTERNAL_DIVERGED");
+    const readsBeforeIdentityCheck = adapter.readCalls.length;
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, {
+      idempotencyKey: "wrong-identity-rebaseline",
+      projectionRecoveryEvidence: {
+        kind: "github_issue_observed",
+        owner: "wrong-owner",
+        repo: GITHUB_REPO,
+        issueNumber: 1,
+        externalRevision: "wrong-identity-drift",
+      },
+    }), adapter).outcome).toBe("EXTERNAL_RESPONSE_INVALID");
+    expect(adapter.readCalls).toHaveLength(readsBeforeIdentityCheck);
+    expect(db.prepare("SELECT projection_state FROM external_work_refs").get()).toEqual({ projection_state: "drifted" });
+  });
 });
 
 function directDatabase() {
