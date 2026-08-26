@@ -31,8 +31,7 @@ describe("all-tenant fleet lull", () => {
     db.prepare("UPDATE execution_attempts SET thread_id = 'foreign-thread', lease_owner_thread_id = 'foreign-thread' WHERE execution_attempt_id = 'worker-attempt'").run();
     expect(readFleetLullPredicate(db, "caller-thread").outcome).toBe("unsatisfied");
 
-    const persisted: unknown = undefined;
-    let state = persisted;
+    let state: unknown;
     const wakes: string[] = [];
     const now = { value: 1_000 };
     const waker = createFleetLullWaker({
