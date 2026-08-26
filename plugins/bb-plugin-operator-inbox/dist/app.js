@@ -411,6 +411,8 @@ var {
 } = mod3;
 
 // app.tsx
+var messageBodyClass = "break-words text-sm leading-6";
+var MarkdownBody = Markdown;
 function asText(value) {
   return typeof value === "string" && value.trim() ? value : null;
 }
@@ -713,7 +715,7 @@ function InboxPanel(_props) {
         /* @__PURE__ */ jsxs("div", { className: "grid gap-5 p-4", children: [
           /* @__PURE__ */ jsxs("section", { "aria-labelledby": "message-body-heading", className: "grid gap-2", children: [
             /* @__PURE__ */ jsx("h3", { id: "message-body-heading", className: "text-xs font-semibold uppercase tracking-wide text-muted-foreground", children: "Message" }),
-            /* @__PURE__ */ jsx("p", { className: "whitespace-pre-wrap break-words text-sm leading-6", children: selectedMessage.text }),
+            /* @__PURE__ */ jsx(MarkdownBody, { content: selectedMessage.text, className: messageBodyClass }),
             selectedMessage.notificationError ? /* @__PURE__ */ jsxs("p", { role: "alert", className: "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive", children: [
               "Urgent notification could not be sent: ",
               selectedMessage.notificationError
@@ -724,7 +726,7 @@ function InboxPanel(_props) {
               /* @__PURE__ */ jsx("h3", { className: "text-sm font-semibold", children: "Reply delivered" }),
               /* @__PURE__ */ jsx("time", { className: "text-xs text-muted-foreground", dateTime: new Date(selectedMessage.repliedAtMs).toISOString(), title: formatExactTime(selectedMessage.repliedAtMs), "aria-label": `Delivered ${formatExactTime(selectedMessage.repliedAtMs)}`, children: formatRelativeTime(selectedMessage.repliedAtMs) })
             ] }),
-            /* @__PURE__ */ jsx("p", { className: "whitespace-pre-wrap break-words text-sm leading-6", children: selectedMessage.replyText }),
+            /* @__PURE__ */ jsx(MarkdownBody, { content: selectedMessage.replyText ?? "", className: messageBodyClass }),
             /* @__PURE__ */ jsx("p", { className: "text-xs text-muted-foreground", children: "BB confirmed the matching input in the sender thread." })
           ] }) : /* @__PURE__ */ jsxs("section", { "aria-labelledby": "reply-heading", className: "grid gap-3 border-t border-border pt-4", children: [
             /* @__PURE__ */ jsxs("div", { children: [

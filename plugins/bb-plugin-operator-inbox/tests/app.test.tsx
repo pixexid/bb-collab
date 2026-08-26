@@ -64,6 +64,39 @@ describe("Operator Inbox app", () => {
     expect(source).not.toMatch(/[>](?:↻|↗|✓|▱)[<]/);
   });
 
+  it("renders message and delivered-reply bodies through the host Markdown surface", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const body = "**Blocked** on [issue](https://example.invalid/1)\n\n- one";
+    const operatorMessages = vi.fn(async () => [{
+      messageId: 7,
+      projectId: "project-a",
+      recipient: "operator" as const,
+      senderThreadId: "sender-thread",
+      senderLaneId: null,
+      severity: "routine" as const,
+      text: body,
+      createdAtMs: 1,
+      readAtMs: 2,
+      senderTitle: "Director",
+      repliedAtMs: 3,
+      replyText: "**done**",
+      replyDeliveryError: null,
+      notificationStatus: "not-requested" as const,
+      notificationError: null,
+    }]);
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(operatorMessages) } as never,
+    });
+    await waitFor(() => expect(operatorMessages).toHaveBeenCalled());
+    const markdownBodies = await waitFor(() => rendered.getAllByTestId("bb-markdown"));
+    expect(markdownBodies.some((node) => node.textContent === body)).toBe(true);
+    expect(markdownBodies.some((node) => node.textContent === "**done**")).toBe(true);
+    const source = readFileSync(resolve(import.meta.dirname, "../app.tsx"), "utf8");
+    expect(source).not.toContain("whitespace-pre-wrap break-words text-sm leading-6");
+  });
+
   it("registers a project-exact Inbox panel and surfaces reply delivery failures", async () => {
     const app = await loadedApp();
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
