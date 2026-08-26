@@ -8,7 +8,7 @@ import { createFakePluginHost, makeThreadResponse } from "@bb/plugin-sdk/testing
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import plugin, { cliSchemaError, deployedDistFailureDetail, fleetWatchdogBlockerFiredKey, fleetWatchdogCompositeKey, fleetWatchdogEpisodeKey, fleetWatchdogIssueReopenedKey, fleetWatchdogMergeCloseKey, fleetWatchdogReopenKey, fleetWatchdogRoleLivenessKey, fleetWatchdogScope, IDLE_FLEET_ATTEMPT_STALE_MS, ROLE_QUEUE_CACHE_MS, ROLE_QUEUE_DECISION_BOUND_MS, ROLE_QUEUE_IDLE_THRESHOLD_MS, ROLE_QUEUE_MAX_REPOSITORIES, ROLE_QUEUE_OBSERVATION_MS, ROLE_QUEUE_REFRESH_TIMEOUT_MS, rpcContract, startableQueueStateAsync, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
+import plugin, { cliSchemaError, deployedDistFailureDetail, fleetWatchdogBlockerFiredKey, fleetWatchdogCompositeKey, fleetWatchdogEpisodeKey, fleetWatchdogIssueReopenedKey, fleetWatchdogMergeCloseKey, fleetWatchdogReopenKey, fleetWatchdogRoleLivenessKey, fleetWatchdogScope, githubPrWakeText, IDLE_FLEET_ATTEMPT_STALE_MS, ROLE_QUEUE_CACHE_MS, ROLE_QUEUE_DECISION_BOUND_MS, ROLE_QUEUE_IDLE_THRESHOLD_MS, ROLE_QUEUE_MAX_REPOSITORIES, ROLE_QUEUE_OBSERVATION_MS, ROLE_QUEUE_REFRESH_TIMEOUT_MS, rpcContract, startableQueueStateAsync, URGENT_NOTIFICATION_DEDUP_MS } from "../server.js";
 import { canonicalWorktreePath } from "../src/worktree-cleanup.js";
 import {
   CACHED_CONSUMERS,
@@ -1277,9 +1277,8 @@ describe("GH-658 canonical GitHub PR waits", () => {
     const fired = applyWithFixtureReceipt(fixture.fixture.db, githubPrObservationRequest(fixture, success, "github-pr-observe-success"));
     expect(fired).toMatchObject({ outcome: "OK", evidence: { status: "fired", wake: true, wakeKind: "github_pr_condition_satisfied" } });
     const eventCount = (fixture.fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE event_type = 'github_pr_observation_recorded'").get() as { count: number }).count;
-    // duplicate event after restart: a new idempotency key must not wake again
-    const duplicate = applyWithFixtureReceipt(fixture.fixture.db, githubPrObservationRequest(fixture, success, "github-pr-observe-success-duplicate"));
-    expect(duplicate).toMatchObject({ outcome: "OK", evidence: { status: "fired", wake: false } });
+    const replay = applyWithFixtureReceipt(fixture.fixture.db, githubPrObservationRequest(fixture, success, "github-pr-observe-success"));
+    expect(replay).toMatchObject({ outcome: "OK", replay: true, evidence: { status: "fired", wake: false } });
     expect((fixture.fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE event_type = 'github_pr_observation_recorded'").get() as { count: number }).count).toBe(eventCount);
 
     const next = await githubPrWaitFixture();
@@ -1355,12 +1354,27 @@ describe("GH-658 canonical GitHub PR waits", () => {
   it("records cancelled and delivery_ambiguous without waking the worker", async () => {
     for (const disposition of ["cancelled", "delivery_ambiguous"] as const) {
       const fixture = await githubPrWaitFixture();
+      seedVerifiedFixtureReceipt(fixture.fixture.db, { projectId: PROJECT_ID, receiptId: "plugin-actor", actorKind: "plugin", subjectId: PLUGIN_ID });
       const observationRequest = githubPrObservationRequest(fixture, fixture.observation, `github-pr-${disposition}`);
       const { githubPrObservation: _observation, ...withoutObservation } = observationRequest;
       const result = applyWithFixtureReceipt(fixture.fixture.db, { ...withoutObservation, githubPrDeliveryDisposition: disposition });
       expect(result).toMatchObject({ outcome: "OK", evidence: { status: disposition, wake: false } });
       expect(fixture.fixture.db.prepare("SELECT pr_delivery_state FROM work_item_waits WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ pr_delivery_state: disposition });
     }
+  });
+
+  it("does not retain ambiguous delivery after cancellation", async () => {
+    const fixture = await githubPrWaitFixture();
+    seedVerifiedFixtureReceipt(fixture.fixture.db, { projectId: PROJECT_ID, receiptId: "plugin-actor", actorKind: "plugin", subjectId: PLUGIN_ID });
+    const cancelledRequest = githubPrObservationRequest(fixture, fixture.observation, "github-pr-cancel-before-ambiguous");
+    const { githubPrObservation: _observation, ...withoutObservation } = cancelledRequest;
+    expect(applyWithFixtureReceipt(fixture.fixture.db, { ...withoutObservation, githubPrDeliveryDisposition: "cancelled" })).toMatchObject({
+      outcome: "OK", evidence: { status: "cancelled", wake: false },
+    });
+    const ambiguous = applyWithFixtureReceipt(fixture.fixture.db, { ...withoutObservation, idempotencyKey: "github-pr-ambiguous-after-cancel", githubPrDeliveryDisposition: "delivery_ambiguous" });
+    expect(ambiguous).toMatchObject({ outcome: "OK", evidence: { status: "cancelled", wake: false } });
+    expect(fixture.fixture.db.prepare("SELECT pr_delivery_state FROM work_item_waits WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ pr_delivery_state: "cancelled" });
+    expect(fixture.fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE event_type = 'github_pr_wait_delivery_ambiguous'").get()).toEqual({ count: 0 });
   });
 
   it("keeps an unknown GitHub response silent", async () => {
@@ -1402,6 +1416,181 @@ describe("GH-658 canonical GitHub PR waits", () => {
       const result = applyWithFixtureReceipt(fixture.fixture.db, item.mutate(request));
       expect(result.outcome, item.name).toBe(item.expectedRefusal);
       expect(exportFoundation(fixture.fixture.db, PROJECT_ID), item.name).toEqual(before);
+    }
+  });
+});
+
+describe("GH-658 scheduled PR observer integration", () => {
+  function installPullRequestGh(stateFile: string, callsFile: string, degraded = false) {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-pr-observer-gh-"));
+    const gh = join(bin, "gh");
+    const ghScript = [
+      "#!/bin/sh",
+      "printf '%s\\n' \"$*\" >> '" + callsFile + "'",
+      "if [ \"$1\" = pr ]; then",
+      ...(degraded ? ["  exit 7"] : [
+      "  if [ -f '" + stateFile + "' ]; then",
+      "    printf '%s\\n' '{\"number\":658,\"headRefOid\":\"" + CANDIDATE_SHA + "\",\"state\":\"OPEN\",\"mergedAt\":null,\"reviewDecision\":null,\"reviews\":[],\"statusCheckRollup\":[{\"conclusion\":\"SUCCESS\"}],\"url\":\"https://github.test/example/project/pull/658\"}'",
+      "  else",
+      "    printf '%s\\n' '{\"number\":658,\"headRefOid\":\"" + CANDIDATE_SHA + "\",\"state\":\"OPEN\",\"mergedAt\":null,\"reviewDecision\":null,\"reviews\":[],\"statusCheckRollup\":[{\"status\":\"IN_PROGRESS\",\"conclusion\":null}],\"url\":\"https://github.test/example/project/pull/658\"}'",
+      "  fi",
+      "  exit 0",
+      ]),
+      "fi",
+      "if [ \"$1\" = api ]; then printf '%s\\n' '[]'; exit 0; fi",
+      "exit 1",
+    ].join("\n");
+    writeFileSync(gh, ghScript);
+    chmodSync(gh, 0o755);
+    return { bin, gh, cleanup: () => rmSync(bin, { recursive: true, force: true }) };
+  }
+
+  it("reads one PR per group, stays silent when unchanged, reserves once, and queues fixed exact-thread content", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "bb-collab-pr-observer-state-"));
+    const stateFile = join(stateDir, "changed");
+    const callsFile = join(stateDir, "calls");
+    const gh = installPullRequestGh(stateFile, callsFile);
+    const originalPath = process.env.PATH;
+    const originalGhPath = process.env.BB_COLLAB_GH_PATH;
+    process.env.PATH = gh.bin + ":" + (originalPath ?? "");
+    process.env.BB_COLLAB_GH_PATH = gh.gh;
+    try {
+      const fixture = await githubPrWaitFixture();
+      seedVerifiedFixtureReceipt(fixture.fixture.db, { projectId: PROJECT_ID, receiptId: "plugin-actor", actorKind: "plugin", subjectId: PLUGIN_ID });
+      const sent: Array<Record<string, unknown>> = [];
+      fixture.fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, projectId: PROJECT_ID, status: "active" })) as never);
+      fixture.fixture.host.harness.sdk.stub("threads.send", (async (request: Record<string, unknown>) => { sent.push(request); return { ok: true }; }) as never);
+
+      await Promise.all([
+        fixture.fixture.host.harness.runSchedule("fleet-watchdog"),
+        fixture.fixture.host.harness.runSchedule("fleet-watchdog"),
+      ]);
+      expect(readFileSync(callsFile, "utf8").trim().split("\n")).toHaveLength(1);
+      expect(fixture.fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE event_type = 'github_pr_observation_recorded'").get()).toEqual({ count: 0 });
+      expect(sent).toHaveLength(0);
+
+      writeFileSync(stateFile, "changed");
+      await Promise.all([
+        fixture.fixture.host.harness.runSchedule("fleet-watchdog"),
+        fixture.fixture.host.harness.runSchedule("fleet-watchdog"),
+      ]);
+      expect(readFileSync(callsFile, "utf8").trim().split("\n")).toHaveLength(2);
+      expect(fixture.fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE event_type = 'github_pr_observation_recorded'").get()).toEqual({ count: 1 });
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toMatchObject({ threadId: "thread-work-item-1", mode: "queue-if-active" });
+      const event = fixture.fixture.db.prepare("SELECT event_sequence FROM state_events WHERE event_type = 'github_pr_observation_recorded'").get() as { event_sequence: number };
+      expect((sent[0]!.input as Array<{ text: string }>)[0]!.text).toBe(githubPrWakeText(WORK_ITEM_ID, event.event_sequence));
+      expect((sent[0]!.input as Array<{ text: string }>)[0]!.text).not.toMatch(/SUCCESS|IN_PROGRESS|github\.test|pull\/658|comment|body/i);
+
+      const reservation = fixture.fixture.db.prepare(
+        "SELECT idempotency_key FROM mutation_receipts WHERE operation_class = 'github_pr_observation_record'",
+      ).get() as { idempotency_key: string };
+      expect(reservation.idempotency_key).toBe(
+        `github-pr-observation:${JSON.stringify([PROJECT_ID, TARGET_ID, GITHUB_OWNER, GITHUB_REPO, 658])}:${githubPrSemanticDigest(githubPrObservation({ checksSummary: "success" }))}`,
+      );
+
+      const eventCount = (fixture.fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE event_type = 'github_pr_observation_recorded'").get() as { count: number }).count;
+      fixture.fixture.db.prepare(
+        "UPDATE work_item_waits SET pr_delivery_state = 'pending', pr_last_observed_semantic_digest = ? WHERE project_id = ? AND work_item_id = ?",
+      ).run(githubPrSemanticDigest(fixture.observation), PROJECT_ID, WORK_ITEM_ID);
+      const reloaded = await fixture.fixture.host.harness.lifecycle.reload(plugin);
+      const reloadedDb = reloaded.bb.storage.database();
+      reloaded.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, projectId: PROJECT_ID, status: "active" })) as never);
+      reloaded.harness.sdk.stub("threads.send", (async (request: Record<string, unknown>) => { sent.push(request); return { ok: true }; }) as never);
+      await reloaded.harness.runSchedule("fleet-watchdog");
+      expect(sent).toHaveLength(1);
+      expect((reloadedDb.prepare("SELECT COUNT(*) AS count FROM state_events WHERE event_type = 'github_pr_observation_recorded'").get() as { count: number }).count).toBe(eventCount);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      if (originalGhPath === undefined) delete process.env.BB_COLLAB_GH_PATH;
+      else process.env.BB_COLLAB_GH_PATH = originalGhPath;
+      gh.cleanup();
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("retains ambiguous delivery and refuses archived targets without waking", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "bb-collab-pr-observer-state-"));
+    const stateFile = join(stateDir, "changed");
+    writeFileSync(stateFile, "changed");
+    const callsFile = join(stateDir, "calls");
+    const gh = installPullRequestGh(stateFile, callsFile);
+    const originalPath = process.env.PATH;
+    const originalGhPath = process.env.BB_COLLAB_GH_PATH;
+    process.env.PATH = gh.bin + ":" + (originalPath ?? "");
+    process.env.BB_COLLAB_GH_PATH = gh.gh;
+    try {
+      const ambiguous = await githubPrWaitFixture();
+      seedVerifiedFixtureReceipt(ambiguous.fixture.db, { projectId: PROJECT_ID, receiptId: "plugin-actor", actorKind: "plugin", subjectId: PLUGIN_ID });
+      ambiguous.fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, projectId: PROJECT_ID, status: "active" })) as never);
+      ambiguous.fixture.host.harness.sdk.stub("threads.send", (async () => { throw new Error("send result unknown"); }) as never);
+      await ambiguous.fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(ambiguous.fixture.db.prepare("SELECT pr_delivery_state FROM work_item_waits WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ pr_delivery_state: "delivery_ambiguous" });
+      await ambiguous.fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(ambiguous.fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+
+      const archived = await githubPrWaitFixture();
+      seedVerifiedFixtureReceipt(archived.fixture.db, { projectId: PROJECT_ID, receiptId: "plugin-actor", actorKind: "plugin", subjectId: PLUGIN_ID });
+      archived.fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, projectId: PROJECT_ID, status: "active", archivedAt: 1 })) as never);
+      await archived.fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(archived.fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(archived.fixture.db.prepare("SELECT pr_delivery_state FROM work_item_waits WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ pr_delivery_state: "fired" });
+
+      const deleted = await githubPrWaitFixture();
+      seedVerifiedFixtureReceipt(deleted.fixture.db, { projectId: PROJECT_ID, receiptId: "plugin-actor", actorKind: "plugin", subjectId: PLUGIN_ID });
+      deleted.fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, projectId: PROJECT_ID, status: "active", deletedAt: 1 })) as never);
+      await deleted.fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(deleted.fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(deleted.fixture.db.prepare("SELECT pr_delivery_state FROM work_item_waits WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ pr_delivery_state: "fired" });
+
+      const staleRole = await githubPrWaitFixture();
+      seedVerifiedFixtureReceipt(staleRole.fixture.db, { projectId: PROJECT_ID, receiptId: "plugin-actor", actorKind: "plugin", subjectId: PLUGIN_ID });
+      staleRole.fixture.db.prepare("UPDATE execution_attempts SET role_id = 'director' WHERE project_id = ? AND execution_attempt_id = ?").run(PROJECT_ID, staleRole.executionAttemptId);
+      staleRole.fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, projectId: PROJECT_ID, status: "active" })) as never);
+      await staleRole.fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(staleRole.fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(staleRole.fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: expect.stringContaining("reason=waiting-seat-not-current"),
+      }));
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      if (originalGhPath === undefined) delete process.env.BB_COLLAB_GH_PATH;
+      else process.env.BB_COLLAB_GH_PATH = originalGhPath;
+      gh.cleanup();
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps degraded gh coverage visible instead of treating it as unchanged", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "bb-collab-pr-observer-degraded-"));
+    const stateFile = join(stateDir, "changed");
+    writeFileSync(stateFile, "changed");
+    const callsFile = join(stateDir, "calls");
+    const gh = installPullRequestGh(stateFile, callsFile, true);
+    const originalPath = process.env.PATH;
+    const originalGhPath = process.env.BB_COLLAB_GH_PATH;
+    process.env.PATH = gh.bin + ":" + (originalPath ?? "");
+    process.env.BB_COLLAB_GH_PATH = gh.gh;
+    try {
+      const fixture = await githubPrWaitFixture();
+      seedVerifiedFixtureReceipt(fixture.fixture.db, { projectId: PROJECT_ID, receiptId: "plugin-actor", actorKind: "plugin", subjectId: PLUGIN_ID });
+      await fixture.fixture.host.harness.runSchedule("fleet-watchdog");
+      expect(fixture.fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(fixture.fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE event_type = 'github_pr_observation_recorded'").get()).toEqual({ count: 0 });
+      expect(fixture.fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: expect.stringMatching(/^github-pr observer coverage=degraded .* reason=gh_unavailable/u),
+      }));
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      if (originalGhPath === undefined) delete process.env.BB_COLLAB_GH_PATH;
+      else process.env.BB_COLLAB_GH_PATH = originalGhPath;
+      gh.cleanup();
+      rmSync(stateDir, { recursive: true, force: true });
     }
   });
 });
@@ -3060,7 +3249,7 @@ else printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue:startable"}]}]]'; 
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["idle-fleet-detector", "lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "fleet-watchdog", "worktree-cleanup", "thread-archive-sweep"]);
     expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "closeThreadlessPreparedAttempt", "dispatchLane", "doctor", "export", "registerProject", "registerWait", "roleBrief", "v1-inbox-archive", "v1-inbox-mark-read", "v1-inbox-read", "v1-inbox-reply", "v1-lanes"]);
-    expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["dispatch_lane", "close_threadless_prepared_attempt", "send_to_operator"]);
+    expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["dispatch_lane", "close_threadless_prepared_attempt", "send_to_operator", "register_external_wait"]);
   });
 
   it("evaluates a GitHub blocker through the CLI apply reader", async () => {

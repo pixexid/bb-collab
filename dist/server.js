@@ -18507,6 +18507,9 @@ function checkIdempotency(db, request, digest2) {
     throw refusal("IDEMPOTENCY_KEY_CONFLICT", "idempotency key was already used for another request");
   }
   const replay = JSON.parse(row.outcome_json);
+  if (request.operationClass === "github_pr_observation_record" && replay.evidence !== null && typeof replay.evidence === "object" && !Array.isArray(replay.evidence)) {
+    replay.evidence = { ...replay.evidence, wake: false };
+  }
   Object.defineProperty(replay, "replay", { value: true });
   return replay;
 }
@@ -21898,12 +21901,13 @@ function applyGithubPrObservation(db, request, digest2) {
   if (wait.pr_execution_attempt_id !== request.executionAttemptId) throw refusal("EXECUTION_CONTEXT_FOREIGN", "observation does not match the exact waiting execution attempt");
   requireGithubPrTarget(db, request.projectId, configRevision, workItem.repo_target_id, condition);
   if (request.githubPrDeliveryDisposition !== void 0) {
-    if (wait.pr_delivery_state !== "pending") {
+    const canRetainAmbiguousSend = request.githubPrDeliveryDisposition === "delivery_ambiguous" && wait.pr_delivery_state === "fired";
+    if (wait.pr_delivery_state !== "pending" && !canRetainAmbiguousSend) {
       return result("OK", request.projectId, 1, 0, 0, { evidence: { status: wait.pr_delivery_state, wake: false } });
     }
     db.prepare(
-      "UPDATE work_item_waits SET pr_delivery_state = ? WHERE project_id = ? AND work_item_id = ? AND waker_kind = 'github_pr' AND pr_delivery_state = 'pending'"
-    ).run(request.githubPrDeliveryDisposition, request.projectId, workItem.work_item_id);
+      "UPDATE work_item_waits SET pr_delivery_state = ? WHERE project_id = ? AND work_item_id = ? AND waker_kind = 'github_pr' AND pr_delivery_state = ?"
+    ).run(request.githubPrDeliveryDisposition, request.projectId, workItem.work_item_id, canRetainAmbiguousSend ? "fired" : "pending");
     const eventType = request.githubPrDeliveryDisposition === "cancelled" ? "github_pr_wait_cancelled" : "github_pr_wait_delivery_ambiguous";
     return commitMutation(
       db,
@@ -24536,6 +24540,214 @@ function databaseIsReady(db) {
   if (root) sweepPartialExportDirectories(root);
 }
 
+// src/github-pull-request-observation-provenance.ts
+import { accessSync, constants, statSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { isAbsolute as isAbsolute2 } from "node:path";
+var execFileAsync = promisify(execFile);
+var HOST_PATTERN = /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?::[1-9][0-9]{0,4})?$/u;
+var REPOSITORY_PART_PATTERN = /^[A-Za-z0-9_.-]+$/u;
+var SHA_PATTERN = /^[0-9a-f]{40}$/iu;
+var DEFAULT_TIMEOUT_MS = 1e4;
+var MAX_TIMEOUT_MS = 6e4;
+var MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
+var GH_JSON_FIELDS = "number,headRefOid,state,mergedAt,reviewDecision,reviews,statusCheckRollup,url";
+var validatedGhPaths = /* @__PURE__ */ new Set();
+var GithubPullRequestObservationError = class extends Error {
+  constructor(reason, message, options) {
+    super(message, options);
+    this.reason = reason;
+    this.name = "GithubPullRequestObservationError";
+  }
+  reason;
+  status = "degraded";
+};
+function degraded(reason, message, cause) {
+  return new GithubPullRequestObservationError(reason, message, cause === void 0 ? void 0 : { cause });
+}
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function hasOwn(value, key) {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+function validateTarget(target) {
+  if (!isRecord(target) || !isRecord(target.repositoryIdentity)) {
+    throw degraded("invalid_target", "GitHub pull-request target is not an object with repository identity");
+  }
+  const identity = target.repositoryIdentity;
+  if (typeof identity.host !== "string" || !HOST_PATTERN.test(identity.host) || typeof identity.owner !== "string" || !REPOSITORY_PART_PATTERN.test(identity.owner) || typeof identity.repo !== "string" || !REPOSITORY_PART_PATTERN.test(identity.repo) || !Number.isSafeInteger(target.pullRequestNumber) || target.pullRequestNumber < 1) {
+    throw degraded("invalid_target", "GitHub pull-request target identity is invalid");
+  }
+}
+function validateTimeout(timeoutMs) {
+  const value = timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_TIMEOUT_MS) {
+    throw degraded("invalid_target", `GitHub pull-request observation timeout must be 1-${MAX_TIMEOUT_MS}ms`);
+  }
+  return value;
+}
+function validatedGhPath(path) {
+  if (!isAbsolute2(path) || path.includes("\0")) {
+    throw degraded("gh_path_invalid", "GitHub CLI path must be fully qualified");
+  }
+  if (validatedGhPaths.has(path)) return path;
+  try {
+    if (!statSync(path).isFile()) throw new Error("not a file");
+    accessSync(path, constants.X_OK);
+  } catch (error48) {
+    throw degraded("gh_path_invalid", "GitHub CLI path is missing or not executable", error48);
+  }
+  validatedGhPaths.add(path);
+  return path;
+}
+function repositoryUrlMatches(value, target) {
+  if (typeof value !== "string") return false;
+  try {
+    const url2 = new URL(value);
+    const expectedPath = `/${target.repositoryIdentity.owner}/${target.repositoryIdentity.repo}/pull/${target.pullRequestNumber}`;
+    return url2.protocol === "https:" && url2.host.toLowerCase() === target.repositoryIdentity.host.toLowerCase() && url2.pathname === expectedPath && url2.username === "" && url2.password === "" && url2.search === "" && url2.hash === "";
+  } catch {
+    return false;
+  }
+}
+function normalizeMergeState(value) {
+  if (typeof value.state !== "string" || !hasOwn(value, "mergedAt")) {
+    throw degraded("malformed_response", "GitHub pull-request response is missing merge fields");
+  }
+  const mergedAt = value.mergedAt;
+  if (mergedAt !== null && (typeof mergedAt !== "string" || !Number.isFinite(Date.parse(mergedAt)))) {
+    throw degraded("malformed_response", "GitHub pull-request mergedAt is invalid");
+  }
+  if (value.state === "OPEN") {
+    if (mergedAt !== null) throw degraded("malformed_response", "open GitHub pull request has a merge timestamp");
+    return { state: "open", merged: false };
+  }
+  if (value.state === "CLOSED") {
+    if (mergedAt !== null) return { state: "merged", merged: true };
+    return { state: "closed_unmerged", merged: false };
+  }
+  if (value.state === "MERGED") {
+    if (mergedAt === null) throw degraded("malformed_response", "merged GitHub pull request has no merge timestamp");
+    return { state: "merged", merged: true };
+  }
+  throw degraded("malformed_response", "GitHub pull-request merge state is unknown");
+}
+function checkValue(value) {
+  if (!isRecord(value)) throw degraded("malformed_response", "GitHub check entry is not an object");
+  if (hasOwn(value, "conclusion")) {
+    if (typeof value.conclusion === "string") return value.conclusion.toUpperCase();
+    if (value.conclusion !== null || typeof value.status !== "string") {
+      throw degraded("malformed_response", "GitHub check conclusion is partial or invalid");
+    }
+    return value.status.toUpperCase();
+  }
+  if (typeof value.state === "string") return value.state.toUpperCase();
+  throw degraded("malformed_response", "GitHub check entry has no state or conclusion");
+}
+function normalizeChecks(value) {
+  if (!Array.isArray(value)) throw degraded("malformed_response", "GitHub status check rollup is not an array");
+  if (value.length === 0) return "unknown";
+  const values = value.map(checkValue);
+  const known = /* @__PURE__ */ new Set(["SUCCESS", "NEUTRAL", "SKIPPED", "FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED", "CANCELLED", "EXPECTED", "QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED"]);
+  if (values.some((item) => !known.has(item))) return "unknown";
+  if (values.some((item) => ["FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED"].includes(item))) return "failure";
+  if (values.some((item) => ["EXPECTED", "QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED"].includes(item))) return "pending";
+  if (values.some((item) => item === "CANCELLED")) return "cancelled";
+  return "success";
+}
+function reviewValues(value) {
+  if (!Array.isArray(value)) throw degraded("malformed_response", "GitHub reviews are not an array");
+  return value.map((review) => {
+    if (!isRecord(review) || typeof review.state !== "string") {
+      throw degraded("malformed_response", "GitHub review entry is partial or invalid");
+    }
+    return review.state.toUpperCase();
+  });
+}
+function normalizeReview(value) {
+  if (!hasOwn(value, "reviewDecision")) throw degraded("malformed_response", "GitHub response is missing review decision");
+  const reviews = reviewValues(value.reviews);
+  const knownReviews = /* @__PURE__ */ new Set(["APPROVED", "CHANGES_REQUESTED", "DISMISSED", "COMMENTED", "PENDING"]);
+  if (reviews.some((item) => !knownReviews.has(item))) return "unknown";
+  if (value.reviewDecision !== null && typeof value.reviewDecision !== "string") {
+    throw degraded("malformed_response", "GitHub review decision is invalid");
+  }
+  const decision = typeof value.reviewDecision === "string" ? value.reviewDecision.toUpperCase() : "";
+  if (decision === "APPROVED") return "approved";
+  if (decision === "CHANGES_REQUESTED") return "changes_requested";
+  if (decision === "DISMISSED" || decision === "CHANGED") return "dismissed_or_changed";
+  if (decision === "REVIEW_REQUIRED") return reviews.length === 0 ? "none" : "dismissed_or_changed";
+  if (decision !== "") return "unknown";
+  if (reviews.includes("DISMISSED")) return "dismissed_or_changed";
+  if (reviews.includes("CHANGES_REQUESTED")) return "changes_requested";
+  if (reviews.includes("APPROVED")) return "approved";
+  return "none";
+}
+function normalizeResponse(value, target) {
+  if (!isRecord(value)) throw degraded("malformed_response", "GitHub pull-request response is not an object");
+  if (typeof value.number !== "number" || !Number.isSafeInteger(value.number) || value.number < 1 || value.number !== target.pullRequestNumber || typeof value.headRefOid !== "string" || !SHA_PATTERN.test(value.headRefOid) || !repositoryUrlMatches(value.url, target)) {
+    throw degraded("identity_mismatch", "GitHub pull-request response does not match the exact target identity");
+  }
+  if (!hasOwn(value, "statusCheckRollup")) throw degraded("malformed_response", "GitHub response is missing status checks");
+  const merge2 = normalizeMergeState(value);
+  return {
+    repositoryIdentity: { ...target.repositoryIdentity },
+    pullRequestNumber: target.pullRequestNumber,
+    headSha: value.headRefOid,
+    state: merge2.state,
+    merged: merge2.merged,
+    checksSummary: normalizeChecks(value.statusCheckRollup),
+    reviewDecision: normalizeReview(value)
+  };
+}
+async function readWithGh(target, ghPath, timeoutMs) {
+  const executable = validatedGhPath(ghPath);
+  const env = { ...process.env, GH_HOST: target.repositoryIdentity.host };
+  let stdout;
+  try {
+    const result2 = await execFileAsync(executable, [
+      "pr",
+      "view",
+      String(target.pullRequestNumber),
+      "--repo",
+      `${target.repositoryIdentity.owner}/${target.repositoryIdentity.repo}`,
+      "--json",
+      GH_JSON_FIELDS
+    ], { encoding: "utf8", env, timeout: timeoutMs, killSignal: "SIGKILL", maxBuffer: MAX_OUTPUT_BYTES });
+    stdout = result2.stdout;
+  } catch (error48) {
+    const candidate = error48;
+    if (candidate.code === "ETIMEDOUT" || candidate.killed === true || candidate.signal === "SIGKILL") {
+      throw degraded("timeout", `GitHub pull-request observation exceeded ${timeoutMs}ms`, error48);
+    }
+    throw degraded("gh_unavailable", "GitHub CLI observation failed", error48);
+  }
+  try {
+    return JSON.parse(stdout.trim());
+  } catch (error48) {
+    throw degraded("malformed_response", "GitHub CLI returned invalid JSON", error48);
+  }
+}
+async function observeGithubPullRequest(target, options = {}) {
+  validateTarget(target);
+  const timeoutMs = validateTimeout(options.timeoutMs);
+  let response;
+  if (options.adapter) {
+    try {
+      response = await options.adapter.read(target);
+    } catch (error48) {
+      if (options.ghPath === void 0) throw degraded("adapter_unavailable", "Configured GitHub adapter is unavailable", error48);
+      response = await readWithGh(target, options.ghPath, timeoutMs);
+    }
+  } else {
+    if (options.ghPath === void 0) throw degraded("gh_unavailable", "No configured GitHub adapter or configured gh path is available");
+    response = await readWithGh(target, options.ghPath, timeoutMs);
+  }
+  return normalizeResponse(response, target);
+}
+
 // src/stall-guard.ts
 import { homedir } from "node:os";
 import { join as join2 } from "node:path";
@@ -25031,7 +25243,7 @@ function livenessDecision(state, alerted) {
 
 // src/worktree-cleanup.ts
 import { execFileSync } from "node:child_process";
-import { readFileSync as readFileSync2, realpathSync as realpathSync2, statSync } from "node:fs";
+import { readFileSync as readFileSync2, realpathSync as realpathSync2, statSync as statSync2 } from "node:fs";
 import { resolve } from "node:path";
 function cleanupAttestationFromProfile(profile) {
   const environmentDependent = profile.environmentDependent ?? profile.turns?.some((turn) => turn.environmentDependent) ?? false;
@@ -25047,7 +25259,7 @@ var reflogCreation = /^\S+ \S+ .* (\d+) [-+]\d{4}(?:\t|$)/u;
 function worktreeCreatedAt(path) {
   try {
     const dotGit = resolve(path, ".git");
-    const adminDir = statSync(dotGit).isDirectory() ? dotGit : resolve(path, readFileSync2(dotGit, "utf8").match(/^gitdir: (.+)$/mu)?.[1] ?? "");
+    const adminDir = statSync2(dotGit).isDirectory() ? dotGit : resolve(path, readFileSync2(dotGit, "utf8").match(/^gitdir: (.+)$/mu)?.[1] ?? "");
     const seconds = readFileSync2(resolve(adminDir, "logs/HEAD"), "utf8").split("\n")[0].match(reflogCreation)?.[1];
     return seconds === void 0 ? null : Number(seconds) * 1e3;
   } catch {
@@ -25480,7 +25692,7 @@ async function runArchiveSweep(bb, db, projectId, apply = false, now2 = Date.now
 
 // src/checkout-divergence.ts
 import { spawnSync } from "node:child_process";
-import { existsSync as existsSync2, readFileSync as readFileSync3, statSync as statSync2 } from "node:fs";
+import { existsSync as existsSync2, readFileSync as readFileSync3, statSync as statSync3 } from "node:fs";
 import { dirname as dirname2, join as join4, resolve as resolve2 } from "node:path";
 function readRef(gitDirs, ref) {
   for (const gitDir of gitDirs) {
@@ -25498,7 +25710,7 @@ function readRef(gitDirs, ref) {
 function resolveGitDir(checkoutRoot) {
   const dotGit = join4(checkoutRoot, ".git");
   if (!existsSync2(dotGit)) return null;
-  if (statSync2(dotGit).isDirectory()) return dotGit;
+  if (statSync3(dotGit).isDirectory()) return dotGit;
   const marker = readFileSync3(dotGit, "utf8").trim();
   return marker.startsWith("gitdir:") ? resolve2(checkoutRoot, marker.slice("gitdir:".length).trim()) : null;
 }
@@ -25559,12 +25771,46 @@ function readCheckoutDivergence(checkoutRoot) {
 }
 
 // server.ts
-import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync4, rmSync as rmSync2, statSync as statSync3, writeFileSync as writeFileSync2 } from "node:fs";
-import { execFile, spawnSync as spawnSync2 } from "node:child_process";
-import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute2, join as join5, relative as relative2, sep } from "node:path";
+import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync4, rmSync as rmSync2, statSync as statSync4, writeFileSync as writeFileSync2 } from "node:fs";
+import { execFile as execFile2, spawnSync as spawnSync2 } from "node:child_process";
+import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute3, join as join5, relative as relative2, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 var ERROR_RECOVERY_IO_TIMEOUT_MS = 1e4;
 var dispatchRecoveryQueues = /* @__PURE__ */ new Map();
+var GITHUB_PR_WATCH_SCHEDULE = "fleet-watchdog";
+var GITHUB_PR_BACKOFF_BASE_MS = 3e4;
+var GITHUB_PR_BACKOFF_MAX_MS = 5 * 6e4;
+var githubPrWakeText = (workItemId, eventSequence) => `Canonical external wait ${workItemId} changed.
+Read canonical event ${eventSequence}, re-read the bound GitHub PR, and continue or re-arm.`;
+function normalizedGithubPrObservation(value) {
+  return {
+    repositoryIdentity: { owner: value.repositoryIdentity.owner, repo: value.repositoryIdentity.repo },
+    pullRequestNumber: value.pullRequestNumber,
+    headSha: value.headSha,
+    state: value.state === "open" ? "open" : "closed",
+    merged: value.merged,
+    checksSummary: value.checksSummary,
+    reviewDecision: value.reviewDecision
+  };
+}
+function githubPrBackoffDelayMs(failures, random = Math.random) {
+  const exponent = Math.max(0, Math.min(8, failures - 1));
+  const ceiling = Math.min(GITHUB_PR_BACKOFF_MAX_MS, GITHUB_PR_BACKOFF_BASE_MS * 2 ** exponent);
+  return Math.max(1, Math.floor(ceiling * (0.75 + random() * 0.5)));
+}
+function githubPrGroupKey(wait) {
+  return JSON.stringify([wait.projectId, wait.repoTargetId, wait.owner, wait.repo, wait.prNumber]);
+}
+function githubPrGhPath() {
+  const configured = process.env.BB_COLLAB_GH_PATH;
+  if (configured !== void 0) return Promise.resolve(isAbsolute3(configured) ? configured : null);
+  return new Promise((resolve3) => {
+    execFile2("which", ["gh"], { encoding: "utf8", timeout: 2e3 }, (error48, stdout) => {
+      const path = error48 ? null : stdout.trim();
+      resolve3(path && isAbsolute3(path) ? path : null);
+    });
+  });
+}
 var fleetWatchdogCompositeKey = (...parts) => JSON.stringify(parts);
 var fleetWatchdogIssueReopenedKey = (projectId, workItemId, externalRevision) => `fleet-watchdog:issue-reopened:${fleetWatchdogCompositeKey(projectId, workItemId, externalRevision)}`;
 var fleetWatchdogLegacyIssueReopenedKey = (workItemId, externalRevision) => `fleet-watchdog:issue-reopened:${workItemId}:${externalRevision}`;
@@ -25700,7 +25946,7 @@ function githubJsonAsync(args, connectorHost) {
   const env = githubCommandEnvironment(connectorHost);
   if (!env) return Promise.resolve(null);
   return new Promise((resolve3) => {
-    execFile("gh", args, { encoding: "utf8", timeout: ROLE_QUEUE_REFRESH_TIMEOUT_MS, killSignal: "SIGKILL", env }, (error48, stdout) => {
+    execFile2("gh", args, { encoding: "utf8", timeout: ROLE_QUEUE_REFRESH_TIMEOUT_MS, killSignal: "SIGKILL", env }, (error48, stdout) => {
       if (error48) {
         resolve3(null);
         return;
@@ -26179,6 +26425,9 @@ var registeredWaitInputSchema = external_exports.object({
 }).strict();
 var registeredWaitSchema = registeredWaitInputSchema.extend({
   declaredAtMs: external_exports.number().int().nonnegative()
+}).strict();
+var registerExternalWaitInputSchema = external_exports.object({
+  request: applyRequestSchema
 }).strict();
 var roleBriefRoleSchema = external_exports.enum(["director", "orchestrator", "worker"]);
 var roleBriefBundleSchema = external_exports.object({
@@ -27449,9 +27698,9 @@ async function isLiveCachedConsumerRolloutArtifact(moduleUrl, bb) {
   try {
     const artifactPath = fileURLToPath(new URL(moduleUrl));
     const pluginRoot = resolvedPluginRoot(await bb.sdk.plugins.getSource({ pluginId: bb.pluginId }));
-    if (!pluginRoot || !isAbsolute2(pluginRoot)) return false;
+    if (!pluginRoot || !isAbsolute3(pluginRoot)) return false;
     const relativeArtifactPath = relative2(pluginRoot, artifactPath);
-    if (relativeArtifactPath.length === 0 || relativeArtifactPath === ".." || relativeArtifactPath.startsWith(`..${sep}`) || isAbsolute2(relativeArtifactPath)) return false;
+    if (relativeArtifactPath.length === 0 || relativeArtifactPath === ".." || relativeArtifactPath.startsWith(`..${sep}`) || isAbsolute3(relativeArtifactPath)) return false;
     return basename2(artifactPath) === "server.js" && basename2(dirname3(artifactPath)) === "dist";
   } catch {
     return false;
@@ -27699,7 +27948,7 @@ function deployedDistFailureDetail(error48, stdout, stderr) {
 }
 function runBbCommand(args) {
   return new Promise((resolve3, reject) => {
-    execFile(process.env.BB_CLI?.trim() || "bb", args, { timeout: 1e4 }, (error48) => error48 ? reject(error48) : resolve3());
+    execFile2(process.env.BB_CLI?.trim() || "bb", args, { timeout: 1e4 }, (error48) => error48 ? reject(error48) : resolve3());
   });
 }
 async function defaultNotifyUrgent(message, senderThreadId, run) {
@@ -27827,7 +28076,7 @@ async function readCleanupAttestation(projectId, candidates) {
   const affected = /* @__PURE__ */ new Map();
   for (const threadId of threadIds) {
     const result2 = await new Promise((resolve3) => {
-      execFile(process.execPath, [join5(root, "scripts", "read-executed-profile.mjs"), "--project", projectId, "--thread", threadId], {
+      execFile2(process.execPath, [join5(root, "scripts", "read-executed-profile.mjs"), "--project", projectId, "--thread", threadId], {
         cwd: root,
         encoding: "utf8",
         timeout: 3e4,
@@ -28343,6 +28592,237 @@ async function plugin(bb, options = {}) {
       throw error48;
     } finally {
       if (timer !== void 0) clearTimeout(timer);
+    }
+  };
+  const githubPrBackoff = /* @__PURE__ */ new Map();
+  const githubPrDeliveryInFlight = /* @__PURE__ */ new Set();
+  let githubPrObservationCycleInFlight = null;
+  const readGithubPrPendingWaits = () => {
+    if (!db) return [];
+    const rows = db.prepare(
+      `SELECT waits.project_id, waits.work_item_id, items.repo_target_id, items.resource_revision,
+              waits.pr_execution_attempt_id, waits.pr_waiting_thread_id, waits.pr_waiting_role_id,
+              waits.pr_waiting_role_generation, waits.pr_owner, waits.pr_repo, waits.pr_number,
+              waits.pr_condition_kind, waits.pr_expected_head_sha, waits.pr_waker_schedule,
+              waits.pr_deadline_at_ms, waits.pr_last_observed_semantic_digest
+       FROM work_item_waits AS waits
+       JOIN work_items AS items
+         ON items.project_id = waits.project_id AND items.work_item_id = waits.work_item_id
+       WHERE items.lifecycle_state = 'blocked'
+         AND waits.waker_kind = 'github_pr'
+         AND waits.pr_delivery_state = 'pending'
+       ORDER BY waits.project_id, items.repo_target_id, waits.pr_owner, waits.pr_repo, waits.pr_number, waits.work_item_id`
+    ).all();
+    return rows.flatMap((row) => {
+      const conditionKinds = /* @__PURE__ */ new Set(["pr_merged", "pr_checks", "pr_review_state"]);
+      if (typeof row.project_id !== "string" || typeof row.work_item_id !== "string" || typeof row.repo_target_id !== "string" || !Number.isSafeInteger(row.resource_revision) || typeof row.pr_execution_attempt_id !== "string" || typeof row.pr_waiting_thread_id !== "string" || typeof row.pr_waiting_role_id !== "string" || !Number.isSafeInteger(row.pr_waiting_role_generation) || typeof row.pr_owner !== "string" || typeof row.pr_repo !== "string" || !Number.isSafeInteger(row.pr_number) || !conditionKinds.has(String(row.pr_condition_kind)) || row.pr_expected_head_sha !== null && typeof row.pr_expected_head_sha !== "string" || typeof row.pr_waker_schedule !== "string" || !Number.isSafeInteger(row.pr_deadline_at_ms) || typeof row.pr_last_observed_semantic_digest !== "string") return [];
+      return [{
+        projectId: row.project_id,
+        workItemId: row.work_item_id,
+        repoTargetId: row.repo_target_id,
+        resourceRevision: row.resource_revision,
+        executionAttemptId: row.pr_execution_attempt_id,
+        waitingThreadId: row.pr_waiting_thread_id,
+        waitingRoleId: row.pr_waiting_role_id,
+        waitingRoleGeneration: row.pr_waiting_role_generation,
+        owner: row.pr_owner,
+        repo: row.pr_repo,
+        prNumber: row.pr_number,
+        conditionKind: row.pr_condition_kind,
+        expectedHeadSha: row.pr_expected_head_sha,
+        wakerSchedule: row.pr_waker_schedule,
+        deadlineAtMs: row.pr_deadline_at_ms,
+        lastObservedSemanticDigest: row.pr_last_observed_semantic_digest
+      }];
+    });
+  };
+  const githubPrWake = async (wait, eventSequence, reservationKey) => {
+    if (!db) return;
+    const deliveryKey = `${reservationKey}:${eventSequence}`;
+    if (githubPrDeliveryInFlight.has(deliveryKey)) return;
+    githubPrDeliveryInFlight.add(deliveryKey);
+    try {
+      const bound = db.prepare(
+        `SELECT attempts.execution_attempt_id
+         FROM execution_attempts AS attempts
+         JOIN work_items AS items
+           ON items.project_id = attempts.project_id AND items.work_item_id = attempts.work_item_id
+         JOIN work_item_waits AS waits
+           ON waits.project_id = items.project_id AND waits.work_item_id = items.work_item_id
+         WHERE attempts.project_id = ? AND attempts.execution_attempt_id = ? AND attempts.work_item_id = ?
+           AND attempts.thread_id = ? AND attempts.role_id = ? AND attempts.role_generation = ?
+           AND attempts.state = 'blocked'
+           AND items.lifecycle_state = 'blocked' AND waits.waker_kind = 'github_pr'
+           AND waits.pr_delivery_state = 'fired'`
+      ).get(
+        wait.projectId,
+        wait.executionAttemptId,
+        wait.workItemId,
+        wait.waitingThreadId,
+        wait.waitingRoleId,
+        wait.waitingRoleGeneration
+      );
+      if (!bound) {
+        bb.log.warn(`github-pr observer wake refused: project=${wait.projectId} workItem=${wait.workItemId} reason=waiting-seat-not-current`);
+        return;
+      }
+      const thread = await bb.sdk.threads.get({ threadId: wait.waitingThreadId });
+      if (thread.id !== wait.waitingThreadId || thread.projectId !== wait.projectId || thread.archivedAt !== null || thread.deletedAt !== null) {
+        bb.log.warn(`github-pr observer wake refused: project=${wait.projectId} workItem=${wait.workItemId} reason=waiting-thread-archived-or-foreign`);
+        return;
+      }
+      if (thread.status !== "idle" && thread.status !== "active") {
+        bb.log.warn(`github-pr observer wake refused: project=${wait.projectId} workItem=${wait.workItemId} reason=waiting-thread-status-${thread.status}`);
+        return;
+      }
+      await withRecoverySendTimeout(wait.waitingThreadId, () => sendWhenThreadReady(bb, {
+        threadId: wait.waitingThreadId,
+        mode: "queue-if-active",
+        input: [{ type: "text", visibility: "agent-only", text: githubPrWakeText(wait.workItemId, eventSequence), mentions: [] }]
+      }, wait.projectId));
+      bb.log.info(`github-pr observer wake sent: project=${wait.projectId} workItem=${wait.workItemId} event=${eventSequence}`);
+    } catch (error48) {
+      const actor = db.prepare(
+        `SELECT receipt_id FROM actor_receipts
+         WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
+           AND verification_state = 'verified' ORDER BY issued_at_ms DESC LIMIT 1`
+      ).get(wait.projectId, PLUGIN_ID);
+      const governor = db.prepare(
+        "SELECT governance_epoch, fence_token FROM project_governorship_heads WHERE project_id = ?"
+      ).get(wait.projectId);
+      const config2 = db.prepare(
+        "SELECT config_revision FROM project_config_heads WHERE project_id = ?"
+      ).get(wait.projectId);
+      if (actor && governor && config2) {
+        const ambiguousRequest = {
+          projectId: wait.projectId,
+          operationClass: "github_pr_observation_record",
+          idempotencyKey: `${reservationKey}:delivery-ambiguous`,
+          actorReceiptId: actor.receipt_id,
+          expectedConfigRevision: config2.config_revision,
+          expectedGovernanceEpoch: governor.governance_epoch,
+          expectedFenceToken: governor.fence_token,
+          repoTargetId: wait.repoTargetId,
+          expectedResourceRevision: wait.resourceRevision,
+          workItemId: wait.workItemId,
+          executionAttemptId: wait.executionAttemptId,
+          githubPrDeliveryDisposition: "delivery_ambiguous"
+        };
+        const disposition = await applyLiveAuthorizedMutation(bb, db, ambiguousRequest);
+        if (disposition.outcome !== "OK") bb.log.warn(`github-pr observer ambiguous delivery retention refused: project=${wait.projectId} workItem=${wait.workItemId} outcome=${disposition.outcome}`);
+      }
+      bb.log.warn(`github-pr observer wake ambiguous: project=${wait.projectId} workItem=${wait.workItemId} reason=${String(error48)}`);
+    } finally {
+      githubPrDeliveryInFlight.delete(deliveryKey);
+    }
+  };
+  const runGithubPrObservationCycle = async () => {
+    if (githubPrObservationCycleInFlight) return githubPrObservationCycleInFlight;
+    const cycle = (async () => {
+      if (!db) {
+        bb.log.warn("github-pr observer coverage=blind reason=canonical-store-unavailable");
+        return;
+      }
+      let waits;
+      try {
+        waits = readGithubPrPendingWaits();
+      } catch (error48) {
+        bb.log.warn(`github-pr observer coverage=degraded reason=wait-inventory-unreadable:${String(error48)}`);
+        return;
+      }
+      const groups = /* @__PURE__ */ new Map();
+      for (const wait of waits) {
+        if (wait.wakerSchedule !== GITHUB_PR_WATCH_SCHEDULE) continue;
+        const mapping = githubRepositoryMappings(db, wait.projectId)?.find(
+          (candidate) => candidate.repoTargetId === wait.repoTargetId && candidate.owner === wait.owner && candidate.repo === wait.repo
+        );
+        if (!mapping) {
+          bb.log.warn(`github-pr observer coverage=degraded project=${wait.projectId} workItem=${wait.workItemId} reason=repository-target-unavailable`);
+          continue;
+        }
+        const key = githubPrGroupKey(wait);
+        const group = groups.get(key) ?? {
+          key,
+          projectId: wait.projectId,
+          repoTargetId: wait.repoTargetId,
+          owner: wait.owner,
+          repo: wait.repo,
+          prNumber: wait.prNumber,
+          connectorHost: mapping.connectorHost,
+          waits: []
+        };
+        group.waits.push(wait);
+        groups.set(key, group);
+      }
+      const ghPath = await githubPrGhPath();
+      const now2 = Date.now();
+      for (const group of groups.values()) {
+        const prior = githubPrBackoff.get(group.key);
+        if (prior && prior.retryAtMs > now2) continue;
+        let observation2;
+        try {
+          const normalized = await observeGithubPullRequest({
+            repositoryIdentity: { host: group.connectorHost, owner: group.owner, repo: group.repo },
+            pullRequestNumber: group.prNumber
+          }, ghPath === null ? {} : { ghPath });
+          observation2 = normalizedGithubPrObservation(normalized);
+          githubPrBackoff.delete(group.key);
+        } catch (error48) {
+          const failures = (prior?.failures ?? 0) + 1;
+          githubPrBackoff.set(group.key, { failures, retryAtMs: now2 + githubPrBackoffDelayMs(failures) });
+          const reason = error48 instanceof GithubPullRequestObservationError ? `${error48.reason}:${error48.message}` : String(error48);
+          bb.log.warn(`github-pr observer coverage=degraded project=${group.projectId} repository=${group.owner}/${group.repo} pr=${group.prNumber} reason=${reason}`);
+          continue;
+        }
+        if (!observation2) continue;
+        const semanticDigest = githubPrSemanticDigest(observation2);
+        for (const wait of group.waits) {
+          if (semanticDigest === wait.lastObservedSemanticDigest && now2 < wait.deadlineAtMs) continue;
+          const actor = db.prepare(
+            `SELECT receipt_id FROM actor_receipts
+             WHERE project_id = ? AND actor_kind = 'plugin' AND subject_id = ? AND role_id IS NULL
+               AND verification_state = 'verified' ORDER BY issued_at_ms DESC LIMIT 1`
+          ).get(wait.projectId, PLUGIN_ID);
+          const governor = db.prepare(
+            "SELECT governance_epoch, fence_token FROM project_governorship_heads WHERE project_id = ?"
+          ).get(wait.projectId);
+          const config2 = db.prepare(
+            "SELECT config_revision FROM project_config_heads WHERE project_id = ?"
+          ).get(wait.projectId);
+          if (!actor || !governor || !config2) {
+            bb.log.warn(`github-pr observer coverage=degraded project=${wait.projectId} workItem=${wait.workItemId} reason=authority-unavailable`);
+            continue;
+          }
+          const reservationKey = `github-pr-observation:${githubPrGroupKey(wait)}:${semanticDigest}`;
+          const request = {
+            projectId: wait.projectId,
+            operationClass: "github_pr_observation_record",
+            idempotencyKey: reservationKey,
+            actorReceiptId: actor.receipt_id,
+            expectedConfigRevision: config2.config_revision,
+            expectedGovernanceEpoch: governor.governance_epoch,
+            expectedFenceToken: governor.fence_token,
+            repoTargetId: wait.repoTargetId,
+            expectedResourceRevision: wait.resourceRevision,
+            workItemId: wait.workItemId,
+            executionAttemptId: wait.executionAttemptId,
+            githubPrObservation: observation2
+          };
+          const result2 = await applyLiveAuthorizedMutation(bb, db, request);
+          const evidence = result2.evidence && typeof result2.evidence === "object" && !Array.isArray(result2.evidence) ? result2.evidence : {};
+          if (result2.outcome !== "OK") {
+            bb.log.warn(`github-pr observer canonical reservation refused: project=${wait.projectId} workItem=${wait.workItemId} outcome=${result2.outcome}`);
+            continue;
+          }
+          if (evidence.wake === true && result2.replay !== true && typeof result2.eventSequence === "number") await githubPrWake(wait, result2.eventSequence, reservationKey);
+        }
+      }
+    })();
+    githubPrObservationCycleInFlight = cycle;
+    try {
+      await cycle;
+    } finally {
+      if (githubPrObservationCycleInFlight === cycle) githubPrObservationCycleInFlight = null;
     }
   };
   const recoverErroredThread = async (threadId, projectId, holder, lane) => {
@@ -29292,7 +29772,7 @@ ${thread.titleFallback ?? ""}`);
       let markerAtMs = null;
       try {
         const parsed = Number(readFileSync4(markerPath, "utf8").trim());
-        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync3(markerPath).mtimeMs;
+        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync4(markerPath).mtimeMs;
       } catch {
         markerAtMs = null;
       }
@@ -29324,7 +29804,7 @@ ${thread.titleFallback ?? ""}`);
       let markerAtMs = null;
       try {
         const parsed = Number(readFileSync4(markerPath, "utf8").trim());
-        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync3(markerPath).mtimeMs;
+        markerAtMs = Number.isFinite(parsed) && parsed > 0 ? parsed : statSync4(markerPath).mtimeMs;
       } catch {
         markerAtMs = null;
       }
@@ -30291,7 +30771,7 @@ ${thread.titleFallback ?? ""}`);
     }
     deployedDistCheckRunning = true;
     const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== "BB_CLI"));
-    execFile(process.execPath, [join5(root, "scripts", "check-dist.mjs"), "--deployed"], {
+    execFile2(process.execPath, [join5(root, "scripts", "check-dist.mjs"), "--deployed"], {
       cwd: root,
       encoding: "utf8",
       env,
@@ -30303,9 +30783,10 @@ ${thread.titleFallback ?? ""}`);
       bb.log.error(`deployed-dist automatic check failed: ${detail || "child process failed"}`);
     });
   });
-  bb.background.schedule("fleet-watchdog", "3-59/5 * * * *", () => {
+  bb.background.schedule("fleet-watchdog", "3-59/5 * * * *", async () => {
     checkDeployedDist();
-    return fleetWatchdogCycle();
+    await runGithubPrObservationCycle();
+    await fleetWatchdogCycle();
   });
   bb.background.schedule("worktree-cleanup", "4 * * * *", async () => {
     let projects;
@@ -30590,7 +31071,21 @@ ${thread.titleFallback ?? ""}`);
       return JSON.stringify(await sendOperatorMessage(db, bb, input, context.threadId, notifyUrgent));
     }
   });
-  bb.agents.configure(() => ({ tools: ["dispatch_lane", "close_threadless_prepared_attempt", "send_to_operator"], skills: [] }));
+  bb.agents.registerTool({
+    name: "register_external_wait",
+    description: "Register one exact GitHub pull-request wait through the canonical WorkItem seam.",
+    instructions: "Pass the complete canonical work_item_transition request, including its normalized initial GitHub PR observation. The result is exactly registered, already_satisfied, or refused.",
+    parameters: registerExternalWaitInputSchema,
+    async execute(input, context) {
+      if (input.request.projectId !== context.projectId) throw new Error("request projectId must exactly match the current thread project");
+      if (input.request.operationClass !== "work_item_transition" || input.request.lifecycleState !== "blocked" || input.request.workItemWait?.kind === void 0 || !["pr_merged", "pr_checks", "pr_review_state"].includes(input.request.workItemWait.kind)) return "refused";
+      const result2 = await applyLiveAuthorizedMutation(bb, db, input.request);
+      if (result2.outcome !== "OK") return "refused";
+      const registration = result2.registration;
+      return registration === "already_satisfied" ? "already_satisfied" : registration === "registered" ? "registered" : "refused";
+    }
+  });
+  bb.agents.configure(() => ({ tools: ["dispatch_lane", "close_threadless_prepared_attempt", "send_to_operator", "register_external_wait"], skills: [] }));
   bb.cli.register({
     name: "collab",
     summary: "Inspect the bb-collab foundation and guarded conformance boundary",
@@ -30697,7 +31192,9 @@ export {
   fleetWatchdogRoleLivenessKey,
   fleetWatchdogScope,
   foundationResultSchema,
+  githubPrWakeText,
   isLiveCachedConsumerRolloutArtifact,
+  normalizedGithubPrObservation,
   readLiveRoleFactReader,
   reportProjectWorktreeCleanup,
   rpcContract,
