@@ -894,7 +894,7 @@ describe("semantic idle guard", () => {
     const result = await tool!.execute({}, { threadId: "companion", projectId: "p" });
     expect(result).toMatchObject({ isError: true, content: [{ text: expect.stringContaining("COVERAGE: blind") }] });
     expect(result).toMatchObject({ content: [{ text: expect.stringContaining("export CLI failed") }] });
-    expect(warnings).toEqual(["companion-watcher coverage=blind event=snapshot reason=Error: export CLI failed"]);
+    expect(warnings).toEqual(["companion-watcher coverage=blind event=snapshot project=p reason=Error: export CLI failed"]);
   });
 
   it("retries KV initialization after one rejection", async () => {
@@ -939,7 +939,7 @@ describe("semantic idle guard", () => {
     } as unknown as BbPluginApi;
     companionWatcher(bb, async () => parseCanonicalExport(inlineExport("", { execution_attempts: 0, role_generation_heads: 0, role_generations: 0, work_items: 0 }), fixtureRoot, projectId));
     await tool!.execute({}, { threadId: "companion", projectId });
-    expect(warnings).toEqual(["companion-watcher coverage=blind event=snapshot reason=Error: canonical-export-orchestrator-head-missing"]);
+    expect(warnings).toEqual([`companion-watcher coverage=blind event=snapshot project=${projectId} reason=Error: canonical-export-orchestrator-head-missing`]);
   });
 
   it("backs off unchanged findings, then routes a post-turn repeat to the director", () => {

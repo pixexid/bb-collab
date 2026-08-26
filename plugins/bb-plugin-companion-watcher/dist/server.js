@@ -433,7 +433,7 @@ function companionWatcher(bb, readExport = readCanonicalExport, readGithub = git
         const queuedFound = [];
         const queued = parseQueuedEvidence(await bb.sdk.threads.queuedMessages.list({ threadId: orchestratorId }), (reason) => queuedFound.push(reason));
         const { canonicalComplete, executionAttempts, externalWorkRefs, workItems, parseIssues } = snapshotCanonical(exported, queued.messages.length);
-        if (parseIssues.length > 0) bb.log.warn(`companion-watcher coverage=partial event=snapshot reason=malformed-canonical-rows count=${parseIssues.length} fields=${parseIssues.join(",")}`);
+        if (parseIssues.length > 0) bb.log.warn(`companion-watcher coverage=partial event=snapshot project=${context.projectId} reason=malformed-canonical-rows count=${parseIssues.length} fields=${parseIssues.join(",")}`);
         let githubIssues = [];
         let githubPrs = [];
         let githubRepository;
@@ -445,9 +445,9 @@ function companionWatcher(bb, readExport = readCanonicalExport, readGithub = git
         };
         let coverage = Object.values(sourceCoverage).every((value) => value === "known") ? "known" : "partial";
         if (recentTimeline.timelinePage.hasOlderRows) {
-          bb.log.warn(`companion-watcher coverage=partial event=snapshot reason=timeline-${recentTimeline.timelinePage.olderCursor ? "ceiling" : "cursor-missing"}`);
+          bb.log.warn(`companion-watcher coverage=partial event=snapshot project=${context.projectId} reason=timeline-${recentTimeline.timelinePage.olderCursor ? "ceiling" : "cursor-missing"}`);
         }
-        if (sourceCoverage.queue === "blind") bb.log.warn(`companion-watcher coverage=partial event=snapshot reason=queue-population-incomplete details=${queuedFound.join(",") || "ceiling"}`);
+        if (sourceCoverage.queue === "blind") bb.log.warn(`companion-watcher coverage=partial event=snapshot project=${context.projectId} reason=queue-population-incomplete details=${queuedFound.join(",") || "ceiling"}`);
         try {
           const githubIssuesFound = [];
           const github = parseGithubEvidence(await readGithub(project.gitRemoteUrl), (reason) => githubIssuesFound.push(reason));
@@ -459,21 +459,21 @@ function companionWatcher(bb, readExport = readCanonicalExport, readGithub = git
           if (!github.complete || githubIssuesFound.length > 0) {
             sourceCoverage.github = "blind";
             coverage = "partial";
-            bb.log.warn(`companion-watcher coverage=partial event=snapshot reason=github-population-incomplete details=${githubIssuesFound.join(",") || "ceiling"}`);
+            bb.log.warn(`companion-watcher coverage=partial event=snapshot project=${context.projectId} reason=github-population-incomplete details=${githubIssuesFound.join(",") || "ceiling"}`);
           }
         } catch (error) {
           sourceCoverage.github = "blind";
           sourceCoverage.githubIssues = "blind";
           sourceCoverage.githubPrs = "blind";
           coverage = "blind";
-          bb.log.warn(`companion-watcher coverage=blind event=snapshot reason=${String(error)}`);
+          bb.log.warn(`companion-watcher coverage=blind event=snapshot project=${context.projectId} reason=${String(error)}`);
         }
         const snapshot = { projectId: context.projectId, canonical: { ...exported, executionAttempts, externalWorkRefs, workItems }, queued: queued.messages.slice(0, SNAPSHOT_LIMIT), githubRepository, githubIssues, githubPrs, coverage, sourceCoverage, observedAt: Date.now(), cycleStartedAt: pending.get(context.threadId)?.turnStartedAt };
         candidateSnapshots.set(context.threadId, snapshot);
         return JSON.stringify({ coverage, candidates: extractCandidates(snapshot) });
       } catch (error) {
         const reason = String(error);
-        bb.log.warn(`companion-watcher coverage=blind event=snapshot reason=${reason}`);
+        bb.log.warn(`companion-watcher coverage=blind event=snapshot project=${context.projectId} reason=${reason}`);
         return { isError: true, content: [{ type: "text", text: `COVERAGE: blind
 snapshot read failed: ${reason}` }] };
       }
@@ -528,7 +528,7 @@ snapshot read failed: ${reason}` }] };
       const prior = snapshots.get(request.projectId);
       const now = Date.now();
       route = routeJudgment(prior, judgment, now, request.turnStartedAt);
-      bb.log.info(`companion-watcher coverage=${judgment.coverage} event=judgment illegitimate=${judgment.illegitimate} route=${route ?? "silence"}`);
+      bb.log.info(`companion-watcher coverage=${judgment.coverage} event=judgment project=${request.projectId} illegitimate=${judgment.illegitimate} route=${route ?? "silence"}`);
       if (!route) return;
       const exported = await canonical(request.projectId);
       const target = route === "director" ? readRoleThread(exported, request.projectId, "director") : readRoleThread(exported, request.projectId, "project-orchestrator");
