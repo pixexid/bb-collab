@@ -10,6 +10,7 @@ const PAGE_SIZE = 1_000;
 const ACTIVE_PROFILE = Symbol("active profile");
 const TERMINAL_TURN_STATUSES = new Set(["completed", "failed", "interrupted"]);
 const CODEX_SCOPE_TURN_ID = /^bta[0-9a-z]{7}-[1-9][0-9]*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/iu;
+const isNonEmptyIdentity = (value) => typeof value === "string" && value.trim() !== "";
 
 function isTerminalTurnEvent(event) {
   return event?.type === "turn/completed" && TERMINAL_TURN_STATUSES.has(event.data?.status);
@@ -174,6 +175,63 @@ function settle(turns, profiles, source, { absentReason = "provider-native turn 
   return {
     outcome: knownTurns === results.length && results.length > 0 ? "known" : knownTurns > 0 ? "partial" : "unknown",
     coverage: { ...(activeTurns > 0 ? { activeTurns } : {}), completedTurns: results.length - activeTurns, knownTurns, unknownTurns: results.length - knownTurns, observedOnlyTurns },
+    turns: results,
+  };
+}
+
+const ZCODE_ATTESTATION_SCHEMA = "zcode-acp.attestation/v1";
+
+function readZcodeAttestation(items) {
+  const ids = [...new Set(items.map((item) => item.id))];
+  if (ids.length !== 1) return null;
+  const completed = items.filter((item) => item.eventType === "item/completed");
+  if (completed.length !== 1 || typeof completed[0].result !== "string") return null;
+  try {
+    const attestation = JSON.parse(completed[0].result);
+    if (!attestation || typeof attestation !== "object" || Array.isArray(attestation)
+      || attestation.schema !== ZCODE_ATTESTATION_SCHEMA
+      || ![attestation.providerId, attestation.modelId, attestation.variant].every(isNonEmptyIdentity)) return null;
+    return attestation;
+  } catch {
+    return null;
+  }
+}
+
+function settleZcodeTurns(turns, events) {
+  const results = turns.map((turn) => {
+    if (!turn.scopeTurnId || !turn.providerThreadId) return { ...turn, status: "unknown", reason: "BB completion lacks provider correlation" };
+    const items = events.flatMap((event) => {
+      const item = event?.data?.item;
+      return event?.scope?.turnId === turn.scopeTurnId
+        && event?.data?.providerThreadId === turn.providerThreadId
+        && item?.type === "toolCall"
+        && typeof item.id === "string"
+        && item.id.startsWith("zcode-attest-")
+        ? [{ eventType: event.type, id: item.id, result: item.result }]
+        : [];
+    });
+    if (items.length === 0) return { ...turn, status: "no-execution", reason: "acp-zcode attestation item is absent; no model call executed" };
+    const attestation = readZcodeAttestation(items);
+    if (!attestation) return { ...turn, status: "unknown", reason: "acp-zcode attestation item is malformed or unparseable" };
+    return {
+      ...turn,
+      status: "known",
+      executedProfile: {
+        providerId: attestation.providerId,
+        model: attestation.modelId,
+        reasoningLevel: attestation.variant,
+        kind: "executed-provider-native",
+        source: "acp-zcode attestation",
+      },
+    };
+  });
+  const knownTurns = results.filter((turn) => turn.status === "known").length;
+  const noExecutionTurns = results.filter((turn) => turn.status === "no-execution").length;
+  const unknownTurns = results.filter((turn) => turn.status === "unknown").length;
+  const activeTurns = results.filter((turn) => turn.phase === "active").length;
+  return {
+    outcome: knownTurns === results.length && results.length > 0 ? "known" : noExecutionTurns === results.length && results.length > 0 ? "no-execution" : knownTurns > 0 ? "partial" : "unknown",
+    coverage: { ...(activeTurns > 0 ? { activeTurns } : {}), completedTurns: results.length - activeTurns, knownTurns, unknownTurns, noExecutionTurns, observedOnlyTurns: 0 },
     turns: results,
   };
 }
@@ -372,6 +430,8 @@ export async function readExecutedProfiles({ thread, environment, events, expect
     }
   }
 
+  if (thread.providerId === "acp-zcode") return settleZcodeTurns(turns, events);
+
   const reason = `provider ${thread.providerId} has no measured native read-back`;
   return { ...settle(turns, profiles, "unsupported provider", { absentReason: reason, missingCorrelationReason: reason }), reason };
 }
@@ -416,7 +476,7 @@ export async function main(argv = process.argv.slice(2)) {
   const result = await readExecutedProfiles({ thread: shown.thread, environment: shown.environment, events, expectedTurnId: turnId });
   const environmentDependent = environmentDependentFromEvents(shown.thread, events);
   console.log(JSON.stringify({ threadId, projectId, providerId: shown.thread.providerId, environmentDependent, ...result }, null, 2));
-  if (result.outcome === "unknown") process.exitCode = 2;
+  if (result.outcome === "unknown" || result.outcome === "no-execution") process.exitCode = 2;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main();

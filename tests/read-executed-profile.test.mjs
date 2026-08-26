@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -44,7 +45,113 @@ function jsonl(path, records) {
 const piBridgeLog = (home, providerThreadId, directory = join(home, ".bb", "pi-bridge-sessions")) =>
   join(directory, `${providerThreadId.replace(/[^A-Za-z0-9._-]/gu, "_")}.jsonl`);
 
+const zcodeAttestation = {
+  schema: "zcode-acp.attestation/v1",
+  providerId: "builtin:zai-coding-plan",
+  modelId: "GLM-5.3",
+  variant: "max",
+  requestId: "request-zcode",
+  turnId: "turn-zcode",
+  resultType: "success",
+  usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3, cacheReadTokens: 0 },
+  durationMs: 4,
+  toolCallCount: 0,
+};
+
+function zcodeEvents(providerThreadId, scopeTurnId, result = JSON.stringify(zcodeAttestation)) {
+  const item = { type: "toolCall", id: `zcode-attest-${scopeTurnId}`, result };
+  const scope = { kind: "turn", turnId: scopeTurnId };
+  return [
+    { id: "zcode-item-started", seq: 10, scope, type: "item/started", data: { providerThreadId, item: { type: "toolCall", id: item.id } } },
+    { id: "zcode-item-completed", seq: 11, scope, type: "item/completed", data: { providerThreadId, item } },
+    { id: "zcode-turn-completed", seq: 12, scope, type: "turn/completed", data: { status: "completed", providerThreadId, providerCheckpointId: "zcode-checkpoint" } },
+  ];
+}
+
 describe("executed profile read-back", () => {
+  it("DISCRIMINATOR: reads the executed acp-zcode attestation, not requested settings", async () => {
+    const scopeTurnId = "bta2647fb7-1-zcode-turn";
+    const result = await readExecutedProfiles({
+      thread: { providerId: "acp-zcode", status: "idle", model: "REQUESTED_MODEL_DO_NOT_EMIT", reasoningLevel: "REQUESTED_VARIANT_DO_NOT_EMIT" },
+      environment: { path: "/test/project" },
+      events: zcodeEvents("zcode-session", scopeTurnId),
+      expectedTurnId: scopeTurnId,
+    });
+    expect(result).toMatchObject({
+      outcome: "known",
+      coverage: { completedTurns: 1, knownTurns: 1, unknownTurns: 0, noExecutionTurns: 0 },
+      turns: [{ status: "known", executedProfile: { providerId: "builtin:zai-coding-plan", model: "GLM-5.3", reasoningLevel: "max", kind: "executed-provider-native", source: "acp-zcode attestation" } }],
+    });
+    expect(JSON.stringify(result)).not.toMatch(/REQUESTED_/u);
+  });
+
+  it("DISCRIMINATOR: distinguishes an absent acp-zcode attestation as no-execution", async () => {
+    const scopeTurnId = "bta2647fb7-1-zcode-no-call";
+    const result = await readExecutedProfiles({
+      thread: { providerId: "acp-zcode", status: "idle", model: "REQUESTED_MODEL_DO_NOT_EMIT", reasoningLevel: "REQUESTED_VARIANT_DO_NOT_EMIT" },
+      environment: { path: "/test/project" },
+      events: [interrupted("zcode-session", scopeTurnId, "failed")],
+      expectedTurnId: scopeTurnId,
+    });
+    expect(result).toMatchObject({ outcome: "no-execution", coverage: { completedTurns: 1, knownTurns: 0, unknownTurns: 0, noExecutionTurns: 1 }, turns: [{ status: "no-execution" }] });
+    expect(result.turns[0].status).not.toBe("unknown");
+    expect(JSON.stringify(result)).not.toMatch(/REQUESTED_/u);
+  });
+
+  it("GUARD: does not turn malformed acp-zcode attestation output into known evidence", async () => {
+    const scopeTurnId = "bta2647fb7-1-zcode-malformed";
+    for (const malformed of ["not-json", JSON.stringify({ ...zcodeAttestation, schema: "wrong-schema" })]) {
+      const result = await readExecutedProfiles({
+        thread: { providerId: "acp-zcode", status: "idle" },
+        environment: { path: "/test/project" },
+        events: zcodeEvents("zcode-session", scopeTurnId, malformed),
+        expectedTurnId: scopeTurnId,
+      });
+      expect(result).toMatchObject({ outcome: "unknown", coverage: { completedTurns: 1, knownTurns: 0, unknownTurns: 1, noExecutionTurns: 0 }, turns: [{ status: "unknown", reason: "acp-zcode attestation item is malformed or unparseable" }] });
+    }
+  });
+
+  it("GUARD: treats whitespace-only acp-zcode identity fields as unknown", async () => {
+    const scopeTurnId = "bta2647fb7-1-zcode-blank-identity";
+    const result = await readExecutedProfiles({
+      thread: { providerId: "acp-zcode", status: "idle" },
+      environment: { path: "/test/project" },
+      events: zcodeEvents("zcode-session", scopeTurnId, JSON.stringify({
+        ...zcodeAttestation,
+        providerId: " ",
+        modelId: "\t",
+        variant: "\n",
+      })),
+      expectedTurnId: scopeTurnId,
+    });
+    expect(result).toMatchObject({
+      outcome: "unknown",
+      coverage: { completedTurns: 1, knownTurns: 0, unknownTurns: 1, noExecutionTurns: 0 },
+      turns: [{ status: "unknown", reason: "acp-zcode attestation item is malformed or unparseable" }],
+    });
+  });
+
+  it("REGRESSION: preserves Codex and Pi native output shapes", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const codexSession = "018cc251-f400-7000-8000-000000000000";
+    const codexTurn = "123e4567-e89b-42d3-a456-426614174000";
+    jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${codexSession}.jsonl`), [
+      { type: "session_meta", payload: { id: codexSession, originator: "bb", cwd: "/test/project" } },
+      { type: "turn_context", payload: { turn_id: codexTurn, model: "gpt-5.6-sol", effort: "medium" } },
+    ]);
+    const codex = await readExecutedProfiles({ thread: { providerId: "codex", status: "idle" }, environment: { path: "/test/project" }, events: [completion(codexSession, codexTurn)], home });
+    expect(JSON.stringify(codex)).toBe(JSON.stringify({ outcome: "known", coverage: { completedTurns: 1, knownTurns: 1, unknownTurns: 0, observedOnlyTurns: 0 }, turns: [{ eventId: `event-${codexTurn}`, eventSeq: 10, checkpointId: codexTurn, providerThreadId: codexSession, scopeTurnId: null, status: "known", executedProfile: { providerId: "codex", model: "gpt-5.6-sol", reasoningLevel: "medium", kind: "executed-provider-native", source: "codex turn_context" } }] }));
+
+    const piSession = "pi-session";
+    jsonl(piBridgeLog(home, piSession), [
+      { type: "session", id: "unrelated-session-header", cwd: "/test/project" },
+      { type: "thinking_level_change", id: "reasoning", parentId: null, thinkingLevel: "high" },
+      { type: "message", id: "assistant", parentId: "reasoning", message: { role: "assistant", provider: "kimi-coding", model: "k3" } },
+    ]);
+    const pi = await readExecutedProfiles({ thread: { providerId: "pi" }, environment: { path: "/test/project" }, events: [completion(piSession, "assistant")], home });
+    expect(JSON.stringify(pi)).toBe(JSON.stringify({ outcome: "known", coverage: { completedTurns: 1, knownTurns: 1, unknownTurns: 0, observedOnlyTurns: 0 }, turns: [{ eventId: "event-assistant", eventSeq: 10, checkpointId: "assistant", providerThreadId: piSession, scopeTurnId: null, status: "known", executedProfile: { providerId: "pi", model: "kimi-coding/k3", reasoningLevel: "high", kind: "executed-provider-native", source: "Pi assistant envelope and thinking state" } }] }));
+  });
+
   it("does not call an idle snapshot known after a turn starts during pagination", async () => {
     const events = activeEvents("idle-then-active");
     const result = await readExecutedProfiles({
@@ -488,6 +595,38 @@ describe("executed profile read-back", () => {
         { status: "unknown", reason: "provider-native turn profiles conflict" },
       ],
     });
+  });
+
+  it("REGRESSION: keeps the CLI exit code zero for a partial Codex read", () => {
+    const root = mkdtempSync(join(tmpdir(), "bb-collab-profile-cli-"));
+    const home = join(root, "home");
+    const fakeBin = join(root, "bin");
+    const fakeBbScript = join(root, "fake-bb.mjs");
+    const bb = join(fakeBin, "bb");
+    const providerThreadId = "018cc251-f400-7000-8000-000000000000";
+    const events = [completion(providerThreadId, "turn-1"), completion(providerThreadId, "turn-2")];
+    mkdirSync(fakeBin, { recursive: true });
+    writeFileSync(fakeBbScript, [
+      `const shown = ${JSON.stringify({ thread: { id: "thread-1", projectId: "project-1", providerId: "codex", status: "idle" }, environment: { path: "/test/project" } })};`,
+      `const events = ${JSON.stringify(events)};`,
+      "if (process.argv[3] === \"show\") console.log(JSON.stringify(shown));",
+      "else if (process.argv[3] === \"log\") console.log(JSON.stringify(events));",
+      "else process.exit(1);",
+    ].join("\n"));
+    writeFileSync(bb, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeBbScript)} "$@"\n`);
+    chmodSync(bb, 0o755);
+    jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${providerThreadId}.jsonl`), [
+      { type: "session_meta", payload: { id: providerThreadId, originator: "bb", cwd: "/test/project" } },
+      { type: "turn_context", payload: { turn_id: "turn-1", model: "gpt-5.6-sol", effort: "medium" } },
+      { type: "turn_context", payload: { turn_id: "turn-2", model: "gpt-5.6-sol", effort: "medium" } },
+      { type: "turn_context", payload: { turn_id: "turn-2", model: "gpt-5.6-luna", effort: "medium" } },
+    ]);
+    const result = spawnSync(process.execPath, [
+      new URL("../scripts/read-executed-profile.mjs", import.meta.url).pathname,
+      "--project", "project-1", "--thread", "thread-1",
+    ], { env: { ...process.env, HOME: home, PATH: `${fakeBin}:${process.env.PATH ?? ""}` }, encoding: "utf8" });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ outcome: "partial", coverage: { completedTurns: 2, knownTurns: 1, unknownTurns: 1 } });
   });
 
   it("DISCRIMINATOR: treats NUL-colliding executed profiles as conflicting", async () => {
