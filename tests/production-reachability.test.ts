@@ -8,6 +8,19 @@ import { describe, expect, it } from "vitest";
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const checker = join(root, "scripts", "check-production-reachability.mjs");
 
+function writeImportOnlyFixture() {
+  const directory = mkdtempSync(join(tmpdir(), "bb-collab-production-reachability-import-only-"));
+  mkdirSync(join(directory, "src"));
+  writeFileSync(join(directory, "package.json"), JSON.stringify({ type: "module" }));
+  writeFileSync(join(directory, "tsconfig.json"), JSON.stringify({
+    compilerOptions: { module: "ESNext", moduleResolution: "Bundler", target: "ES2022" },
+  }));
+  writeFileSync(join(directory, "server.ts"), "export default {};\n");
+  writeFileSync(join(directory, "src", "exported.ts"), "export function importedButUnused() {}\n");
+  writeFileSync(join(directory, "src", "consumer.ts"), "import { importedButUnused } from \"./exported.js\";\n");
+  return directory;
+}
+
 function writeFixture() {
   const directory = mkdtempSync(join(tmpdir(), "bb-collab-production-reachability-"));
   mkdirSync(join(directory, "src"));
@@ -24,6 +37,7 @@ function writeFixture() {
 export function calledInProduction() {}
 export function testOnly() {}
 export function unreferenced() {}
+export function importedButUnused() {}
 export function barrelOnly() {}
 export interface Structural { value: string }
 `);
@@ -32,6 +46,9 @@ export interface Structural { value: string }
   writeFileSync(join(directory, "src", "consumer.ts"), `
 import { calledInProduction } from "./feature.js";
 calledInProduction();
+`);
+  writeFileSync(join(directory, "src", "import-only.ts"), `
+import { importedButUnused } from "./feature.js";
 `);
   writeFileSync(join(directory, "src", "barrel.ts"), "export { barrelOnly } from \"./feature.js\";\n");
   writeFileSync(join(directory, "src", "dynamic.ts"), `
@@ -59,15 +76,33 @@ assembleV17CachedConsumerRolloutEvidence();
   return directory;
 }
 
-function report(directory: string) {
+function run(directory: string) {
   try {
-    return JSON.parse(execFileSync(process.execPath, [checker, "--root", directory], { encoding: "utf8" }));
+    return { exitCode: 0, result: JSON.parse(execFileSync(process.execPath, [checker, "--root", directory], { encoding: "utf8" })) };
   } catch (error) {
-    return JSON.parse((error as { stdout: string }).stdout);
+    const failure = error as { status?: number; stdout: string };
+    return { exitCode: failure.status ?? 1, result: JSON.parse(failure.stdout) };
   }
 }
 
+function report(directory: string) {
+  return run(directory).result;
+}
+
 describe("production reachability report", () => {
+  it("fails when production only imports an export without invoking it", () => {
+    const directory = writeImportOnlyFixture();
+    try {
+      const execution = run(directory);
+      expect(execution.exitCode).toBe(1);
+      expect(execution.result.findings).toMatchObject([
+        { names: ["importedButUnused"], status: "STATIC_UNREFERENCED" },
+      ]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("keeps unknown classes fail-closed and does not count a barrel as a caller", () => {
     const directory = writeFixture();
     try {
@@ -76,10 +111,11 @@ describe("production reachability report", () => {
       expect(result.unknownIsNotReachable).toBe(true);
       const status = new Map(result.rows.flatMap((row: { names: string[]; status: string }) => row.names.map((name) => [name, row.status])));
       expect(status.get("calledInProduction")).toBe("STATIC_PRODUCTION_REFERENCE");
+      expect(status.get("importedButUnused")).toBe("STATIC_UNREFERENCED");
       expect(status.get("barrelOnly")).toBe("STATIC_UNREFERENCED");
       expect(status.get("dynamicallySelected")).toBe("UNKNOWN_DYNAMIC");
       expect(status.get("registrySelected")).toBe("UNKNOWN_DYNAMIC");
-      expect(result.rows.find((row: { names: string[] }) => row.names.includes("registrySelected"))).toMatchObject({ status: "UNKNOWN_DYNAMIC", productionReferenceCount: 1 });
+      expect(result.rows.find((row: { names: string[] }) => row.names.includes("registrySelected"))).toMatchObject({ status: "UNKNOWN_DYNAMIC", productionReferenceCount: 0 });
       expect(result.unknown.dynamicExports.some((row: { names: string[] }) => row.names.includes("registrySelected"))).toBe(true);
       expect(status.get("externalOnly")).toBe("UNKNOWN_EXTERNAL");
       expect(status.get("Structural")).toBe("UNKNOWN_TYPE_ONLY");
