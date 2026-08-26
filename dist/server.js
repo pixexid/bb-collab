@@ -26015,10 +26015,10 @@ function createFleetLullWaker(options) {
   };
   const fire = async (wait, reason) => {
     if (state.fired[wait.waitId]) return;
+    await options.wake(wait, reason);
     state.fired[wait.waitId] = reason;
     clearTimer(wait.waitId);
     await save();
-    await options.wake(wait, reason);
   };
   const evaluate = async (only) => {
     await load();
@@ -26029,8 +26029,10 @@ function createFleetLullWaker(options) {
         continue;
       }
       const predicate = readFleetLullPredicate(options.db, wait.excludedThreadId, now2());
+      if (only && predicate.outcome === "unknown") return predicate;
       if (predicate.outcome === "satisfied") await fire(wait, "satisfied");
     }
+    return void 0;
   };
   const armTimer = (wait) => {
     clearTimer(wait.waitId);
@@ -26062,10 +26064,17 @@ function createFleetLullWaker(options) {
         if (state.fired[input.waitId]) return { outcome: "refused", message: "waitId was already consumed by a fleet lull wake" };
         return { outcome: "registered", wait: existing, replay: true };
       }
+      const initialPredicate = readFleetLullPredicate(options.db, input.excludedThreadId, now2());
+      if (initialPredicate.outcome === "unknown") {
+        return { outcome: "CANONICAL_STORE_UNAVAILABLE", message: initialPredicate.reason ?? "canonical SQLite store is unavailable" };
+      }
       state.waits.push(input);
       await save();
       armTimer(input);
-      await evaluate(input);
+      const predicate = await evaluate(input);
+      if (predicate?.outcome === "unknown") {
+        return { outcome: "CANONICAL_STORE_UNAVAILABLE", message: predicate.reason ?? "canonical SQLite store is unavailable" };
+      }
       return state.fired[input.waitId] === "satisfied" ? { outcome: "already_satisfied", wait: input, replay: false } : { outcome: "registered", wait: input, replay: false };
     }),
     signal: () => enqueue(async () => {
@@ -26879,6 +26888,7 @@ var fleetLullWaitInputSchema = external_exports.object({
 var fleetLullWaitSchema = external_exports.discriminatedUnion("outcome", [
   external_exports.object({ outcome: external_exports.literal("registered"), wait: fleetLullWaitInputSchema, replay: external_exports.boolean() }).strict(),
   external_exports.object({ outcome: external_exports.literal("already_satisfied"), wait: fleetLullWaitInputSchema, replay: external_exports.boolean() }).strict(),
+  external_exports.object({ outcome: external_exports.literal("CANONICAL_STORE_UNAVAILABLE"), message: external_exports.string() }).strict(),
   external_exports.object({ outcome: external_exports.literal("refused"), message: external_exports.string() }).strict()
 ]);
 var registerExternalWaitInputSchema = external_exports.object({
@@ -28855,6 +28865,9 @@ async function runCli(db, bb, argv, ctx, deps) {
     }
     try {
       const result2 = await deps.registerFleetLullWait(parsed.data);
+      if (result2.outcome === "CANONICAL_STORE_UNAVAILABLE") {
+        return cliResult({ outcome: "CANONICAL_STORE_UNAVAILABLE", subject: projectId, expected: 1, attempted: 0, verified: 0, message: result2.message });
+      }
       if (result2.outcome === "refused") return cliResult({ outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message: result2.message });
       return cliResult({
         outcome: "OK",

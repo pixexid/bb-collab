@@ -79,6 +79,7 @@ export type FleetLullWakeReason = "satisfied" | "timeout";
 export type FleetLullWaitResult =
   | { outcome: "registered"; wait: FleetLullWait; replay: boolean }
   | { outcome: "already_satisfied"; wait: FleetLullWait; replay: boolean }
+  | { outcome: "CANONICAL_STORE_UNAVAILABLE"; message: string }
   | { outcome: "refused"; message: string };
 
 export interface FleetLullWaitPersistence {
@@ -142,12 +143,12 @@ export function createFleetLullWaker(options: {
   };
   const fire = async (wait: FleetLullWait, reason: FleetLullWakeReason) => {
     if (state.fired[wait.waitId]) return;
+    await options.wake(wait, reason);
     state.fired[wait.waitId] = reason;
     clearTimer(wait.waitId);
     await save();
-    await options.wake(wait, reason);
   };
-  const evaluate = async (only?: FleetLullWait) => {
+  const evaluate = async (only?: FleetLullWait): Promise<FleetLullPredicate | undefined> => {
     await load();
     const waits = only ? [only] : state.waits;
     for (const wait of waits) {
@@ -156,8 +157,10 @@ export function createFleetLullWaker(options: {
         continue;
       }
       const predicate = readFleetLullPredicate(options.db, wait.excludedThreadId, now());
+      if (only && predicate.outcome === "unknown") return predicate;
       if (predicate.outcome === "satisfied") await fire(wait, "satisfied");
     }
+    return undefined;
   };
   const armTimer = (wait: FleetLullWait) => {
     clearTimer(wait.waitId);
@@ -189,10 +192,17 @@ export function createFleetLullWaker(options: {
         if (state.fired[input.waitId]) return { outcome: "refused", message: "waitId was already consumed by a fleet lull wake" };
         return { outcome: "registered", wait: existing, replay: true };
       }
+      const initialPredicate = readFleetLullPredicate(options.db, input.excludedThreadId, now());
+      if (initialPredicate.outcome === "unknown") {
+        return { outcome: "CANONICAL_STORE_UNAVAILABLE", message: initialPredicate.reason ?? "canonical SQLite store is unavailable" };
+      }
       state.waits.push(input);
       await save();
       armTimer(input);
-      await evaluate(input);
+      const predicate = await evaluate(input);
+      if (predicate?.outcome === "unknown") {
+        return { outcome: "CANONICAL_STORE_UNAVAILABLE", message: predicate.reason ?? "canonical SQLite store is unavailable" };
+      }
       return state.fired[input.waitId] === "satisfied"
         ? { outcome: "already_satisfied", wait: input, replay: false }
         : { outcome: "registered", wait: input, replay: false };

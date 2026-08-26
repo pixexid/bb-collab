@@ -1141,6 +1141,7 @@ const fleetLullWaitInputSchema = z.object({
 const fleetLullWaitSchema = z.discriminatedUnion("outcome", [
   z.object({ outcome: z.literal("registered"), wait: fleetLullWaitInputSchema, replay: z.boolean() }).strict(),
   z.object({ outcome: z.literal("already_satisfied"), wait: fleetLullWaitInputSchema, replay: z.boolean() }).strict(),
+  z.object({ outcome: z.literal("CANONICAL_STORE_UNAVAILABLE"), message: z.string() }).strict(),
   z.object({ outcome: z.literal("refused"), message: z.string() }).strict(),
 ]);
 const registerExternalWaitInputSchema = z.object({
@@ -3476,6 +3477,9 @@ async function runCli(
     }
     try {
       const result = await deps.registerFleetLullWait(parsed.data);
+      if (result.outcome === "CANONICAL_STORE_UNAVAILABLE") {
+        return cliResult({ outcome: "CANONICAL_STORE_UNAVAILABLE", subject: projectId, expected: 1, attempted: 0, verified: 0, message: result.message });
+      }
       if (result.outcome === "refused") return cliResult({ outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message: result.message });
       return cliResult({
         outcome: "OK",

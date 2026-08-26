@@ -4367,6 +4367,30 @@ else printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue:startable"}]}]]'; 
     expect(JSON.parse(result.stdout)).toMatchObject({ outcome: "CANONICAL_STORE_UNAVAILABLE", message: "operator inbox store is unavailable" });
   });
 
+  it("surfaces canonical-store unavailability through both lull wait surfaces", async () => {
+    const host = hostFor();
+    vi.spyOn(host.bb.storage, "database").mockImplementation(() => { throw new Error("database unavailable"); });
+    await plugin(host.bb, { notifyUrgent: async () => undefined });
+    const request = {
+      projectId: PROJECT_ID,
+      waitId: "lull-store-unavailable",
+      waiterThreadId: ROLE_THREAD_ID,
+      excludedThreadId: ROLE_THREAD_ID,
+      deadlineAtMs: Date.now() + 60_000,
+    };
+
+    await expect(host.harness.callRpc("registerFleetLullWait", request)).resolves.toMatchObject({
+      outcome: "CANONICAL_STORE_UNAVAILABLE",
+      message: "canonical-store-unavailable",
+    });
+    const cli = await host.harness.runCli(["wait-lull", "--project", PROJECT_ID, "--request", JSON.stringify(request)], {
+      threadId: ROLE_THREAD_ID,
+      projectId: PROJECT_ID,
+    });
+    expect(cli.exitCode).toBe(2);
+    expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "CANONICAL_STORE_UNAVAILABLE", message: "canonical-store-unavailable" });
+  });
+
   it("delivers replies through host steer-if-active only after the matching sender event lands", async () => {
     const host = hostFor();
     await plugin(host.bb, { notifyUrgent: async () => undefined });
