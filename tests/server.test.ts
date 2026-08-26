@@ -1859,8 +1859,8 @@ trap "" TERM
 while :; do :; done
 `);
     chmodSync(wrapper, 0o755);
-    const originalPath = process.env.PATH;
-    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const originalGitPath = process.env.BB_COLLAB_GIT_PATH;
+    process.env.BB_COLLAB_GIT_PATH = wrapper;
     let childPid: number | null = null;
     try {
       const result = readCheckoutDivergence(fixture.directory);
@@ -1891,8 +1891,8 @@ while :; do :; done
           // The escapee may already have exited.
         }
       }
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
+      if (originalGitPath === undefined) delete process.env.BB_COLLAB_GIT_PATH;
+      else process.env.BB_COLLAB_GIT_PATH = originalGitPath;
       rmSync(fixture.directory, { recursive: true, force: true });
       rmSync(bin, { recursive: true, force: true });
     }
