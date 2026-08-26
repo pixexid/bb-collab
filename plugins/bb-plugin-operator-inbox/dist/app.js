@@ -10528,8 +10528,16 @@ function clearUnreadObserver() {
 
 // app.tsx
 var messageBodyClass = "break-words text-sm leading-6";
+var markdownComponents = {
+  img: ({ alt }) => /* @__PURE__ */ jsx("span", { children: alt }),
+  p: ({ children }) => /* @__PURE__ */ jsx("p", { className: "my-1.5", children }),
+  ol: ({ children }) => /* @__PURE__ */ jsx("ol", { className: "my-1.5 list-decimal pl-5", children }),
+  ul: ({ children }) => /* @__PURE__ */ jsx("ul", { className: "my-1.5 list-disc pl-5", children }),
+  li: ({ children }) => /* @__PURE__ */ jsx("li", { className: "my-0.5", children }),
+  a: ({ href, children }) => /* @__PURE__ */ jsx("a", { href, className: "text-primary underline underline-offset-2", children })
+};
 function MessageBody({ text: text5 }) {
-  return /* @__PURE__ */ jsx("div", { className: messageBodyClass, children: /* @__PURE__ */ jsx(Markdown, { remarkPlugins: [remarkBreaks], components: { img: ({ alt }) => /* @__PURE__ */ jsx("span", { children: alt }) }, children: text5 }) });
+  return /* @__PURE__ */ jsx("div", { className: messageBodyClass, children: /* @__PURE__ */ jsx(Markdown, { remarkPlugins: [remarkBreaks], components: markdownComponents, children: text5 }) });
 }
 function asText(value) {
   return typeof value === "string" && value.trim() ? value : null;

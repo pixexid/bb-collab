@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArchiveIcon, ArrowClockwiseIcon, EnvelopeOpenIcon, PaperPlaneTiltIcon } from "@phosphor-icons/react";
 import ReactMarkdown from "react-markdown";
+import type { Components } from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import { definePluginApp, experimental_useSidebarThreads, useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import type { PluginNavPanelProps, PluginRpcResult } from "@get-bb/plugin-sdk/app";
@@ -14,8 +15,22 @@ const messageBodyClass = "break-words text-sm leading-6";
 // both deterministically: images render as alt text only, single newlines stay hard
 // breaks. Raw HTML stays escaped by default; the default urlTransform already rejects
 // javascript:/data: schemes.
+// Host preflight zeroes <p>/list margins and strips markers, so unstyled markdown
+// elements render as one blob. ponytail: style only what bodies actually contain
+// (paragraphs, lists, links); headings/blockquotes keep defaults until a sender
+// uses them.
+const markdownComponents: Components = {
+  img: ({ alt }) => <span>{alt}</span>,
+  p: ({ children }) => <p className="my-1.5">{children}</p>,
+
+  ol: ({ children }) => <ol className="my-1.5 list-decimal pl-5">{children}</ol>,
+  ul: ({ children }) => <ul className="my-1.5 list-disc pl-5">{children}</ul>,
+  li: ({ children }) => <li className="my-0.5">{children}</li>,
+  a: ({ href, children }) => <a href={href} className="text-primary underline underline-offset-2">{children}</a>,
+};
+
 function MessageBody({ text }: { text: string }) {
-  return <div className={messageBodyClass}><ReactMarkdown remarkPlugins={[remarkBreaks]} components={{ img: ({ alt }) => <span>{alt}</span> }}>{text}</ReactMarkdown></div>;
+  return <div className={messageBodyClass}><ReactMarkdown remarkPlugins={[remarkBreaks]} components={markdownComponents}>{text}</ReactMarkdown></div>;
 }
 
 type OperatorMessagesResult = PluginRpcResult<typeof rpcContract["operatorMessages"]>;

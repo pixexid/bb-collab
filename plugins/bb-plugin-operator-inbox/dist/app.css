@@ -140,6 +140,15 @@
     .mx-auto {
       margin-inline: auto;
     }
+    .my-0\.5 {
+      margin-block: calc(var(--spacing) * 0.5);
+    }
+    .my-1 {
+      margin-block: calc(var(--spacing) * 1);
+    }
+    .my-1\.5 {
+      margin-block: calc(var(--spacing) * 1.5);
+    }
     .mt-1 {
       margin-top: calc(var(--spacing) * 1);
     }
@@ -190,6 +199,12 @@
     }
     .shrink-0 {
       flex-shrink: 0;
+    }
+    .list-decimal {
+      list-style-type: decimal;
+    }
+    .list-disc {
+      list-style-type: disc;
     }
     .flex-wrap {
       flex-wrap: wrap;
@@ -358,6 +373,9 @@
     }
     .pb-2 {
       padding-bottom: calc(var(--spacing) * 2);
+    }
+    .pl-5 {
+      padding-left: calc(var(--spacing) * 5);
     }
     .text-center {
       text-align: center;

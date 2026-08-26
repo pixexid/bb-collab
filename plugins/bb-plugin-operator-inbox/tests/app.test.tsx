@@ -101,6 +101,9 @@ describe("Operator Inbox app", () => {
     expect(rendered.container.textContent).toContain("line one");
     expect(rendered.container.textContent).toContain("line two");
     expect(rendered.getByText("one").tagName).toBe("LI");
+    // Spacing/markers survive host preflight: paragraphs carry margin, lists carry markers + indent.
+    expect(rendered.getByText("one").closest("ul")?.className).toContain("list-disc");
+    expect(rendered.container.querySelectorAll("p.my-1\\.5").length).toBeGreaterThan(0);
     const source = readFileSync(resolve(import.meta.dirname, "../app.tsx"), "utf8");
     expect(source).not.toContain("whitespace-pre-wrap break-words text-sm leading-6");
   });
