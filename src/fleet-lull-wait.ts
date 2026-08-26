@@ -192,11 +192,10 @@ export function createFleetLullWaker(options: {
       state.waits.push(input);
       await save();
       armTimer(input);
-      const before = state.fired[input.waitId];
       await evaluate(input);
       return state.fired[input.waitId] === "satisfied"
         ? { outcome: "already_satisfied", wait: input, replay: false }
-        : before ? { outcome: "registered", wait: input, replay: true } : { outcome: "registered", wait: input, replay: false };
+        : { outcome: "registered", wait: input, replay: false };
     }),
     signal: () => enqueue(async () => {
       if (!stopped) await evaluate();
