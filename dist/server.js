@@ -25248,6 +25248,23 @@ function livenessDecision(state, alerted) {
 import { execFileSync } from "node:child_process";
 import { readFileSync as readFileSync2, realpathSync as realpathSync2, statSync as statSync2 } from "node:fs";
 import { resolve } from "node:path";
+
+// src/git-path.ts
+import { spawnSync } from "node:child_process";
+import { isAbsolute as isAbsolute3 } from "node:path";
+function gitPath() {
+  const configured = process.env.BB_COLLAB_GIT_PATH;
+  if (configured !== void 0) return isAbsolute3(configured) ? configured : null;
+  try {
+    const result2 = spawnSync("which", ["git"], { encoding: "utf8", timeout: 2e3 });
+    const path = result2.error || result2.status !== 0 ? null : result2.stdout.trim();
+    return path && isAbsolute3(path) ? path : null;
+  } catch {
+    return null;
+  }
+}
+
+// src/worktree-cleanup.ts
 function cleanupAttestationFromProfile(profile) {
   const environmentDependent = profile.environmentDependent ?? profile.turns?.some((turn) => turn.environmentDependent) ?? false;
   if (environmentDependent) {
@@ -25393,7 +25410,9 @@ function runWorktreeCleanup(entries, options) {
   return { outcome: refused.length > 0 ? "refused" : "reported", wouldRemove, removableCandidateCount: wouldRemove.length, refused, environmentRecordsReleased: false, attestation };
 }
 function git(args, cwd) {
-  return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } }).trim();
+  const executable = gitPath();
+  if (!executable) throw new Error("git executable unavailable");
+  return execFileSync(executable, args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } }).trim();
 }
 function listGitWorktrees(repoRoot) {
   const lines = git(["worktree", "list", "--porcelain"], repoRoot).split("\n");
@@ -25412,6 +25431,8 @@ function listGitWorktrees(repoRoot) {
 function cleanupGitWorktrees(repoRoot, liveThreadIds, liveWorktreeThreadIds = /* @__PURE__ */ new Map(), environmentInventoryComplete = false, protectedEnvironmentPaths = /* @__PURE__ */ new Set(), pluginSourceResolved = true, attestation, entries) {
   const originMain = git(["rev-parse", "refs/remotes/origin/main"], repoRoot);
   const status = (path) => git(["status", "--porcelain", "--untracked-files=all"], path);
+  const executable = gitPath();
+  if (!executable) throw new Error("git executable unavailable");
   return runWorktreeCleanup(entries ?? listGitWorktrees(repoRoot), {
     liveThreadIds,
     liveWorktreeThreadIds,
@@ -25424,7 +25445,7 @@ function cleanupGitWorktrees(repoRoot, liveThreadIds, liveWorktreeThreadIds = /*
     status,
     reachable: (path, head) => {
       try {
-        execFileSync("git", ["merge-base", "--is-ancestor", head, originMain], { cwd: path, stdio: "pipe", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } });
+        execFileSync(executable, ["merge-base", "--is-ancestor", head, originMain], { cwd: path, stdio: "pipe", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } });
         return true;
       } catch {
         return false;
@@ -25694,7 +25715,7 @@ async function runArchiveSweep(bb, db, projectId, apply = false, now2 = Date.now
 }
 
 // src/checkout-divergence.ts
-import { spawnSync } from "node:child_process";
+import { spawnSync as spawnSync2 } from "node:child_process";
 import { existsSync as existsSync2, readFileSync as readFileSync3, statSync as statSync3 } from "node:fs";
 import { dirname as dirname2, join as join4, resolve as resolve2 } from "node:path";
 function readRef(gitDirs, ref) {
@@ -25745,11 +25766,13 @@ function readCheckoutDivergence(checkoutRoot) {
     const checkoutHead = readHead(gitDir, commonDir);
     const originMainRef = readRef([commonDir, gitDir], "refs/remotes/origin/main");
     if (!checkoutHead || !originMainRef) return { checkoutHead, originMainRef, behindCount: null, verdict: "unavailable", processGroupReap: "not-attempted" };
+    const executable = gitPath();
+    if (!executable) return { checkoutHead, originMainRef, behindCount: null, verdict: "unavailable", processGroupReap: "not-attempted" };
     let behindCount = null;
     let processGroupReap = "not-attempted";
     try {
       const options = { cwd: checkoutRoot, encoding: "utf8", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" }, stdio: ["ignore", "pipe", "ignore"], timeout: 1e3, killSignal: "SIGKILL", detached: true };
-      const result2 = spawnSync("git", ["rev-list", "--count", `${checkoutHead}..${originMainRef}`], options);
+      const result2 = spawnSync2(executable, ["rev-list", "--count", `${checkoutHead}..${originMainRef}`], options);
       if (typeof result2.pid === "number" && result2.pid > 0) {
         try {
           process.kill(-result2.pid, "SIGKILL");
@@ -25762,7 +25785,10 @@ function readCheckoutDivergence(checkoutRoot) {
           }
         }
       }
-      if (result2.error) throw result2.error;
+      const errorCode = result2.error?.code;
+      if (errorCode === "ENOENT" || errorCode === "EACCES" || errorCode === "ENOTDIR") {
+        return { checkoutHead, originMainRef, behindCount: null, verdict: "unavailable", processGroupReap };
+      }
       const count = result2.stdout.trim();
       if (/^\d+$/u.test(count)) behindCount = Number(count);
     } catch {
@@ -25775,8 +25801,8 @@ function readCheckoutDivergence(checkoutRoot) {
 
 // server.ts
 import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync4, rmSync as rmSync2, statSync as statSync4, writeFileSync as writeFileSync2 } from "node:fs";
-import { execFile as execFile2, spawnSync as spawnSync2 } from "node:child_process";
-import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute3, join as join5, relative as relative2, sep } from "node:path";
+import { execFile as execFile2, spawnSync as spawnSync3 } from "node:child_process";
+import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute4, join as join5, relative as relative2, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 var ERROR_RECOVERY_IO_TIMEOUT_MS = 1e4;
 var dispatchRecoveryQueues = /* @__PURE__ */ new Map();
@@ -25806,11 +25832,11 @@ function githubPrGroupKey(wait) {
 }
 function githubPrGhPath() {
   const configured = process.env.BB_COLLAB_GH_PATH;
-  if (configured !== void 0) return isAbsolute3(configured) ? configured : null;
+  if (configured !== void 0) return isAbsolute4(configured) ? configured : null;
   try {
-    const result2 = spawnSync2("which", ["gh"], { encoding: "utf8", timeout: 2e3 });
+    const result2 = spawnSync3("which", ["gh"], { encoding: "utf8", timeout: 2e3 });
     const path = result2.error || result2.status !== 0 ? null : result2.stdout.trim();
-    return path && isAbsolute3(path) ? path : null;
+    return path && isAbsolute4(path) ? path : null;
   } catch {
     return null;
   }
@@ -25933,7 +25959,7 @@ function githubJson(args, connectorHost) {
     const ghPath = githubPrGhPath();
     if (!env || !ghPath) return null;
     const options = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 1e4, killSignal: "SIGKILL", detached: true, env };
-    const result2 = spawnSync2(ghPath, args, options);
+    const result2 = spawnSync3(ghPath, args, options);
     if (typeof result2.pid === "number" && result2.pid > 0) {
       try {
         process.kill(-result2.pid, "SIGKILL");
@@ -27704,9 +27730,9 @@ async function isLiveCachedConsumerRolloutArtifact(moduleUrl, bb) {
   try {
     const artifactPath = fileURLToPath(new URL(moduleUrl));
     const pluginRoot = resolvedPluginRoot(await bb.sdk.plugins.getSource({ pluginId: bb.pluginId }));
-    if (!pluginRoot || !isAbsolute3(pluginRoot)) return false;
+    if (!pluginRoot || !isAbsolute4(pluginRoot)) return false;
     const relativeArtifactPath = relative2(pluginRoot, artifactPath);
-    if (relativeArtifactPath.length === 0 || relativeArtifactPath === ".." || relativeArtifactPath.startsWith(`..${sep}`) || isAbsolute3(relativeArtifactPath)) return false;
+    if (relativeArtifactPath.length === 0 || relativeArtifactPath === ".." || relativeArtifactPath.startsWith(`..${sep}`) || isAbsolute4(relativeArtifactPath)) return false;
     return basename2(artifactPath) === "server.js" && basename2(dirname3(artifactPath)) === "dist";
   } catch {
     return false;

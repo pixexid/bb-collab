@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { resolve } from "node:path";
+import { gitPath } from "./git-path.js";
 
 export type WorktreePopulation = "scratch" | "managed" | "candidate" | "unknown";
 
@@ -233,7 +234,9 @@ export function runWorktreeCleanup(entries: WorktreeEntry[], options: WorktreeCl
 }
 
 function git(args: string[], cwd: string): string {
-  return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } }).trim();
+  const executable = gitPath();
+  if (!executable) throw new Error("git executable unavailable");
+  return execFileSync(executable, args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } }).trim();
 }
 
 export function listGitWorktrees(repoRoot: string): WorktreeEntry[] {
@@ -263,6 +266,8 @@ export function cleanupGitWorktrees(
 ): WorktreeCleanupReport {
   const originMain = git(["rev-parse", "refs/remotes/origin/main"], repoRoot);
   const status = (path: string) => git(["status", "--porcelain", "--untracked-files=all"], path);
+  const executable = gitPath();
+  if (!executable) throw new Error("git executable unavailable");
   return runWorktreeCleanup(entries ?? listGitWorktrees(repoRoot), {
     liveThreadIds,
     liveWorktreeThreadIds,
@@ -275,7 +280,7 @@ export function cleanupGitWorktrees(
     status,
     reachable: (path, head) => {
       try {
-        execFileSync("git", ["merge-base", "--is-ancestor", head, originMain], { cwd: path, stdio: "pipe", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } });
+        execFileSync(executable, ["merge-base", "--is-ancestor", head, originMain], { cwd: path, stdio: "pipe", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } });
         return true;
       } catch {
         return false;
