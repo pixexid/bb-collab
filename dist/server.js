@@ -22131,7 +22131,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
   }
   if (wait !== void 0 && !enteringBlocked && !swappingBlockedWait) {
     if (machineWait) throw refusal("WORK_ITEM_STATE_INVALID", "machine-evaluable blocker requires an atomic transition to blocked");
-    if (["blocked", "succeeded", "failed", "cancelled"].includes(workItem.lifecycle_state)) {
+    if (workItem.lifecycle_state === "blocked" || wait !== null && ["succeeded", "failed", "cancelled"].includes(workItem.lifecycle_state)) {
       throw refusal("WORK_ITEM_STATE_INVALID", wait === null ? workItem.lifecycle_state === "blocked" ? "blocked work item cannot clear its machine-evaluable blocker through a wait mutation" : "terminal work item has no wait to clear" : "blocked or terminal work item cannot carry a human wait");
     }
     if (wait !== null && existingWait) throw refusal("WORK_ITEM_WAIT_OPEN", "work item already carries an open wait");
@@ -22459,9 +22459,6 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
   if (workItem.lifecycle_state === "review_pending" && activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write")) {
     throw refusal("WORK_ITEM_STATE_INVALID", "review-pending cannot carry an active writing attempt");
   }
-  if (["succeeded", "failed", "cancelled"].includes(nextState) && existingWait && workItem.lifecycle_state !== "blocked") {
-    throw refusal("WORK_ITEM_WAIT_OPEN", "resolve the work item wait before terminalizing it");
-  }
   const nextRevision = workItem.resource_revision + 1;
   const updated = db.prepare(
     `UPDATE work_items SET lifecycle_state = ?, body = ?, resource_revision = ?, updated_at_ms = ?
@@ -22473,7 +22470,9 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
       expectedResourceRevision: request.expectedResourceRevision ?? void 0
     });
   }
-  if (enteringBlocked) {
+  if (["succeeded", "failed", "cancelled"].includes(nextState)) {
+    db.prepare("DELETE FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").run(request.projectId, workItem.work_item_id);
+  } else if (enteringBlocked) {
     const blocker = machineWait.kind === "work_item_succeeded" ? { kind: machineWait.kind, workItemId: machineWait.workItemId } : machineWait.kind === "github_issue_closed" ? { kind: machineWait.kind, owner: machineWait.owner, repo: machineWait.repo, issueNumber: machineWait.issueNumber } : machineWait;
     if (isGithubPrWait(machineWait)) {
       const semanticDigest = githubPrSemanticDigest(githubPrObservation);

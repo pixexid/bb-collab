@@ -13587,42 +13587,66 @@ else printf '%s\\n' '[]'; fi
     expect(exportFoundation(db, PROJECT_ID)).not.toEqual(before);
   });
 
-  it("refuses terminalizing a stale WorkItem with an open wait, then clears and retires it", async () => {
+  it.each(["succeeded", "failed", "cancelled"] as const)("discharges an open wait when a WorkItem terminalizes as %s", async (terminalState) => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host);
     expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 1, {
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1))).toMatchObject({ outcome: "OK", currentResourceRevision: 2 });
+    expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 2, {
       kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat",
-    }))).toMatchObject({ outcome: "OK", currentResourceRevision: 2 });
-    expect(applyWithFixtureReceipt(db, {
-      ...bootstrapRequest(),
-      operationClass: "config_revision",
-      idempotencyKey: "config-2-after-wait",
-      expectedConfigRevision: 1,
-      configRevision: 2,
-      expectedGovernanceEpoch: 1,
-      expectedFenceToken: fenceToken,
-      config: { permissionMode: "auto", visibility: "visible", repositoryTargets: [TARGET_ID] },
-      targets: [{ ...bootstrapRequest().targets![0]!, defaultBranch: "develop" }],
-    }).outcome).toBe("OK");
-
-    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "cancelled", 2, {
-      idempotencyKey: "stale-wait-terminal-refused",
-      expectedConfigRevision: 2,
-    }))).toMatchObject({ outcome: "WORK_ITEM_WAIT_OPEN", attempted: 0 });
-    expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 2, null, {
-      expectedConfigRevision: 2,
     }))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
-    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "cancelled", 3, {
-      idempotencyKey: "stale-wait-terminal",
-      expectedConfigRevision: 2,
-    }))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
-    expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 4, null, {
-      expectedConfigRevision: 2,
-      idempotencyKey: "stale-terminal-wait-clear",
-    }))).toMatchObject({
-      outcome: "WORK_ITEM_STATE_INVALID", message: "terminal work item has no wait to clear", attempted: 0,
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 3))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    if (terminalState === "succeeded") {
+      expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 4))).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
+    }
+    const terminalRevision = terminalState === "succeeded" ? 5 : 4;
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, terminalState, terminalRevision))).toMatchObject({
+      outcome: "OK", currentResourceRevision: terminalRevision + 1,
     });
+    expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ lifecycle_state: terminalState, resource_revision: terminalRevision + 1 });
+    expect(db.prepare("SELECT 1 FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toBeUndefined();
+  });
+
+  it("clears a pre-existing wait on an already-terminal WorkItem through the receipted wait seam", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1))).toMatchObject({ outcome: "OK", currentResourceRevision: 2 });
+    expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 2, {
+      kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat",
+    }))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
+    db.prepare("UPDATE work_items SET lifecycle_state = 'failed' WHERE project_id = ? AND work_item_id = ?").run(PROJECT_ID, WORK_ITEM_ID);
+
+    const cleared = applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 3, null, { idempotencyKey: "terminal-wait-cleanup" }));
+    expect(cleared).toMatchObject({ outcome: "OK", currentResourceRevision: 4, mutationReceipt: { operationClass: "work_item_transition" } });
+    expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "failed", resource_revision: 4 });
+    expect(db.prepare("SELECT 1 FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toBeUndefined();
+    expect(db.prepare("SELECT event_type FROM state_events WHERE project_id = ? AND aggregate_type = 'work_item' AND aggregate_id = ? ORDER BY event_sequence DESC LIMIT 1").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ event_type: "work_item_wait_cleared" });
+  });
+
+  it("does not change the preserved wi-gh-141 control while terminalizing another WorkItem", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    const controlId = "wi-gh-141";
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      idempotencyKey: "control-141-create",
+      workItemId: controlId,
+      workItem: { workItemId: controlId, title: "Preserved control", body: "Do not touch." },
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1, { idempotencyKey: "control-141-ready", workItemId: controlId }))).toMatchObject({ outcome: "OK" });
+    db.prepare(
+      "INSERT INTO work_item_waits (project_id, work_item_id, domain_id, waker, waker_kind, declared_at_ms, declared_by_seat, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(PROJECT_ID, controlId, "default", "preserved-control", "schedule", 0, "control-seat", null);
+    const controlBefore = db.prepare("SELECT * FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, controlId);
+    const controlWaitBefore = db.prepare("SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, controlId);
+
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 2, { kind: "schedule", schedule: "stall-guard-liveness", declaredBySeat: "worker-seat" }))).toMatchObject({ outcome: "OK" });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "cancelled", 3))).toMatchObject({ outcome: "OK" });
+
+    expect(db.prepare("SELECT * FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, controlId)).toEqual(controlBefore);
+    expect(db.prepare("SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, controlId)).toEqual(controlWaitBefore);
   });
 
   it("creates multiple targets through the resolver and rejects an ambiguous selector", async () => {
@@ -14543,7 +14567,7 @@ else printf '%s\\n' '[]'; fi
     expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND origin = 'work_item' AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')").get("proj_gh300_registration")).toEqual({ count: 0 });
   });
 
-  it("records one WorkItem wait and refuses terminal transition until it is cleared", async () => {
+  it("records one WorkItem wait and discharges it during terminal transition", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host);
     expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
@@ -14554,9 +14578,8 @@ else printf '%s\\n' '[]'; fi
     expect(db.prepare("SELECT work_item_id, waker, waker_kind, declared_by_seat FROM work_item_waits").get()).toEqual({
       work_item_id: WORK_ITEM_ID, waker: "stall-guard-liveness", waker_kind: "schedule", declared_by_seat: "worker-seat",
     });
-    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "cancelled", 3))).toMatchObject({ outcome: "WORK_ITEM_WAIT_OPEN", attempted: 0 });
-    expect(applyWithFixtureReceipt(db, workItemWaitRequest(fenceToken, 3, null)).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "cancelled", 4)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "cancelled", 3))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ count: 0 });
   });
 
   it("creates one exact GitHub projection, replays idempotently, and survives plugin reload", async () => {
