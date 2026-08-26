@@ -7800,8 +7800,8 @@ else
 fi
 `);
     chmodSync(gh, 0o755);
-    const originalPath = process.env.PATH;
-    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const originalGhPath = process.env.BB_COLLAB_GH_PATH;
+    process.env.BB_COLLAB_GH_PATH = gh;
     try {
       const fixture = await fleetWatchdogFixture(0, true, 1, false);
       const dispatch = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
@@ -7849,8 +7849,8 @@ fi
       expect(readFileSync(argsLog, "utf8")).toBe("api\nrepos/example/project/issues\n--paginate\n--slurp\n--method\nGET\n-f\nstate=open\n-f\nper_page=100\n".repeat(4));
     } finally {
       clock.mockRestore();
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
+      if (originalGhPath === undefined) delete process.env.BB_COLLAB_GH_PATH;
+      else process.env.BB_COLLAB_GH_PATH = originalGhPath;
       rmSync(bin, { recursive: true, force: true });
     }
   });
