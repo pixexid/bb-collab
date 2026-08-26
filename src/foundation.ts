@@ -10126,6 +10126,15 @@ function recoverAmbiguousProjection(
     });
   }
   if (context.ref.projection_state === "drifted") {
+    if (evidence.kind !== "github_issue_observed") {
+      return refusalResult(request.projectId, {
+        code: "EXTERNAL_RESPONSE_INVALID",
+        message: "drift re-baseline requires an observed external issue evidence kind",
+        expected: 1,
+        attempted: 0,
+        verified: 0,
+      });
+    }
     let snapshot: GitHubIssueSnapshot;
     try {
       const value = adapter.read(evidence.owner, evidence.repo, evidence.issueNumber);
@@ -10148,6 +10157,24 @@ function recoverAmbiguousProjection(
       const replay = checkIdempotency(db, request, digest);
       if (replay) return replay;
       const authority = revalidateProjectionContext(db, request, context);
+      // ponytail: external adapters have no CAS; the final revision read bounds the race to the post-read local write window.
+      let latest: GitHubIssueSnapshot;
+      try {
+        const value = adapter.read(evidence.owner, evidence.repo, evidence.issueNumber);
+        if (value === null) return result("EXTERNAL_RESPONSE_INVALID", request.projectId, 1, 1, 0, { message: "projection re-baseline issue observation was not found" });
+        latest = parseSnapshot(value);
+      } catch (error) {
+        if (error instanceof Refusal) return refusalResult(request.projectId, error.data);
+        return result("EXTERNAL_RESPONSE_INVALID", request.projectId, 1, 1, 0, { message: "projection re-baseline issue observation is invalid" });
+      }
+      if (
+        latest.owner !== snapshot.owner ||
+        latest.repo !== snapshot.repo ||
+        latest.issueNumber !== snapshot.issueNumber ||
+        latest.externalRevision !== snapshot.externalRevision
+      ) {
+        return result("EXTERNAL_RESPONSE_INVALID", request.projectId, 1, 1, 0, { message: "external issue changed after the re-baseline observation" });
+      }
       const updated = db.prepare(
         `UPDATE external_work_refs SET projection_state = 'pending', attempted_resource_revision = ?,
          desired_digest = ?, observed_external_revision = ?, observed_external_digest = ?,
@@ -10198,6 +10225,15 @@ function recoverAmbiguousProjection(
     return refusalResult(request.projectId, {
       code: "EXTERNAL_DELIVERY_AMBIGUOUS",
       message: "external delivery is durably fenced",
+      expected: 1,
+      attempted: 0,
+      verified: 0,
+    });
+  }
+  if (evidence.kind !== "github_issue_unchanged") {
+    return refusalResult(request.projectId, {
+      code: "EXTERNAL_RESPONSE_INVALID",
+      message: "delivery recovery requires an unchanged external issue evidence kind",
       expected: 1,
       attempted: 0,
       verified: 0,

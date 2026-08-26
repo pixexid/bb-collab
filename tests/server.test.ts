@@ -2314,6 +2314,41 @@ describe("GH-676 projection recovery evidence", () => {
     expect(rebased.observed_external_digest).not.toBe(stale.observed_external_digest);
   });
 
+  it("review mutant: refuses a re-baseline when the issue changes after the live read", async () => {
+    const { db, fenceToken, adapter } = await boundIssueFixture();
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1), adapter).outcome).toBe("OK");
+    const changed = adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)!;
+    adapter.put({ ...changed, state: "closed", stateReason: "COMPLETED", externalRevision: "before-race" });
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, { idempotencyKey: "record-race-drift" }), adapter).outcome).toBe("EXTERNAL_DIVERGED");
+
+    const read = adapter.read.bind(adapter);
+    let firstRecoveryRead = true;
+    adapter.read = (owner, repo, issueNumber) => {
+      const snapshot = read(owner, repo, issueNumber);
+      if (firstRecoveryRead) {
+        firstRecoveryRead = false;
+        adapter.put({ ...snapshot!, externalRevision: "after-race" });
+      }
+      return snapshot;
+    };
+    const recovery = applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1, {
+      idempotencyKey: "refuse-race-rebaseline",
+      projectionRecoveryEvidence: {
+        kind: "github_issue_observed",
+        owner: GITHUB_OWNER,
+        repo: GITHUB_REPO,
+        issueNumber: 1,
+        externalRevision: "before-race",
+      },
+    }), adapter);
+    expect(recovery).toMatchObject({ outcome: "EXTERNAL_RESPONSE_INVALID", expected: 1, attempted: 1, verified: 0 });
+    expect(db.prepare("SELECT projection_state, observed_external_revision FROM external_work_refs").get()).toEqual({
+      projection_state: "drifted",
+      observed_external_revision: "fixture-1",
+    });
+    expect(adapter.snapshot(GITHUB_OWNER, GITHUB_REPO, 1)?.externalRevision).toBe("after-race");
+  });
+
   it("refuses drift re-baseline without an observation", async () => {
     const { db, fenceToken, adapter } = await boundIssueFixture();
     expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 1), adapter).outcome).toBe("OK");
@@ -14945,6 +14980,11 @@ else printf '%s\\n' '[]'; fi
       projectionRecoveryEvidence: { ...evidence, externalRevision: "not-the-observation" },
     }), adapter).outcome).toBe("EXTERNAL_RESPONSE_INVALID");
     expect(db.prepare("SELECT projection_state FROM external_work_refs").get()).toEqual({ projection_state: "delivery_ambiguous" });
+
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 2, {
+      idempotencyKey: "invalid-recovery-kind",
+      projectionRecoveryEvidence: { ...evidence, kind: "github_issue_observed" },
+    }), adapter)).toMatchObject({ outcome: "EXTERNAL_RESPONSE_INVALID", expected: 1, attempted: 0, verified: 0 });
 
     expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 2, {
       idempotencyKey: "valid-recovery-observation",
