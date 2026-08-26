@@ -26316,28 +26316,131 @@ function parseGithubIssueComments(value) {
   }).reverse();
 }
 async function readGithubIssueBriefAsync(db, projectId, workItemId) {
-  const target = githubIssueBriefTarget(db, projectId, workItemId);
-  if (!target || target === "invalid" || !projectionIsCurrent(target)) throw new Error("GitHub issue projection is unavailable for the current WorkItem revision");
+  const freshnessReadAttempts = 3;
+  const freshnessReadDelayMs = 25;
+  const sanitizeEvidence = (value) => value.replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|github_token_[A-Za-z0-9_]+)\b/gu, "[REDACTED_TOKEN]").replace(/\b(bearer|token|password|secret|credential|authorization)\s*[:=]?\s+\S+/giu, "$1=[REDACTED]").slice(0, 2e3) || "(none)";
+  const briefFailure = (cause, reason, stderr = "") => new Error(
+    `cause=${cause}; reason=${sanitizeEvidence(String(reason))}; stderr=${sanitizeEvidence(stderr)}`
+  );
+  let target;
+  try {
+    target = githubIssueBriefTarget(db, projectId, workItemId);
+  } catch (error48) {
+    throw briefFailure("projection-target-read", error48);
+  }
+  if (!target || target === "invalid" || !projectionIsCurrent(target)) {
+    throw briefFailure("projection-target-not-current", "target is missing, invalid, or not current for the WorkItem revision");
+  }
   const mapping = githubRepositoryMappingForRepository(db, projectId, target.owner, target.repo);
-  if (!mapping) throw new Error("GitHub repository mapping is missing or ambiguous");
-  const issue2 = await readGithubIssueForBackfillAsync(target.owner, target.repo, target.issueNumber, mapping.connectorHost);
-  if (issue2.externalRevision !== target.projection.observedExternalRevision) throw new Error("GitHub issue body freshness does not match the current projection");
-  const firstPage = await githubJsonAsync([
-    "api",
-    `repos/${target.owner}/${target.repo}/issues/${target.issueNumber}/comments?per_page=${GITHUB_ISSUE_COMMENT_TAIL_LIMIT}&page=1&sort=created&direction=desc`
-  ], mapping.connectorHost);
-  const comments = parseGithubIssueComments(firstPage);
+  if (!mapping) throw briefFailure("repository-mapping-unavailable", "repository mapping is missing or ambiguous");
+  const readBriefJson = (args, cause) => {
+    const env = githubCommandEnvironment(mapping.connectorHost);
+    const ghPath = githubPrGhPath();
+    if (!env || !ghPath) return Promise.reject(briefFailure(cause, "GitHub CLI path or connector host is unavailable"));
+    return new Promise((resolve3, reject) => {
+      execFile2(ghPath, args, { encoding: "utf8", timeout: ROLE_QUEUE_REFRESH_TIMEOUT_MS, killSignal: "SIGKILL", env }, (error48, stdout, stderr) => {
+        if (error48) {
+          reject(briefFailure(cause, error48, stderr));
+          return;
+        }
+        try {
+          resolve3({ value: JSON.parse(stdout.trim()), stderr });
+        } catch (parseError) {
+          reject(briefFailure(cause, parseError, stderr));
+        }
+      });
+    });
+  };
+  const readIssue = async () => {
+    const response = await readBriefJson([
+      "issue",
+      "view",
+      String(target.issueNumber),
+      "--repo",
+      `${target.owner}/${target.repo}`,
+      "--json",
+      "number,title,body,state,stateReason,labels,updatedAt,url"
+    ], "issue-body-read");
+    const value = response.value;
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw briefFailure("issue-body-read", "GitHub issue response is unavailable", response.stderr);
+    const record2 = value;
+    if (typeof record2.number !== "number" || !Number.isSafeInteger(record2.number) || typeof record2.title !== "string" || record2.body !== null && typeof record2.body !== "string" || record2.state !== "OPEN" && record2.state !== "CLOSED" || !validGithubStateReason(record2.state, record2.stateReason) || !Array.isArray(record2.labels) || !record2.labels.every((label) => label && typeof label === "object" && !Array.isArray(label) && typeof label.name === "string") || typeof record2.updatedAt !== "string" || !githubIssueIdentityMatches(record2.url, target.owner, target.repo, record2.number, mapping.connectorHost)) {
+      throw briefFailure("issue-body-read", "GitHub issue response is invalid", response.stderr);
+    }
+    const identity = githubIssueIdentity(record2.url);
+    return {
+      owner: identity.owner,
+      repo: identity.repo,
+      issueNumber: identity.issueNumber,
+      title: record2.title,
+      body: record2.body ?? "",
+      state: record2.state === "OPEN" ? "open" : "closed",
+      stateReason: record2.stateReason === "" || record2.stateReason === null ? void 0 : record2.stateReason,
+      labels: record2.labels.map((label) => label.name),
+      externalRevision: record2.updatedAt
+    };
+  };
+  let issue2 = null;
+  for (let attempt = 1; attempt <= freshnessReadAttempts; attempt += 1) {
+    issue2 = await readIssue();
+    if (issue2.externalRevision === target.projection.observedExternalRevision) break;
+    if (attempt < freshnessReadAttempts) await new Promise((resolve3) => setTimeout(resolve3, freshnessReadDelayMs));
+  }
+  if (!issue2 || issue2.externalRevision !== target.projection.observedExternalRevision) {
+    throw briefFailure(
+      "issue-body-freshness-mismatch",
+      `expected=${target.projection.observedExternalRevision ?? "null"}; observed=${issue2?.externalRevision ?? "null"}; attempts=${freshnessReadAttempts}`
+    );
+  }
+  let firstPage;
+  let firstPageStderr = "";
+  try {
+    const response = await readBriefJson([
+      "api",
+      `repos/${target.owner}/${target.repo}/issues/${target.issueNumber}/comments?per_page=${GITHUB_ISSUE_COMMENT_TAIL_LIMIT}&page=1&sort=created&direction=desc`
+    ], "comment-tail-page-1");
+    firstPage = response.value;
+    firstPageStderr = response.stderr;
+  } catch (error48) {
+    throw briefFailure("comment-tail-page-1", error48);
+  }
+  let comments;
+  try {
+    comments = parseGithubIssueComments(firstPage);
+  } catch (error48) {
+    throw briefFailure("comment-tail-page-1", error48, firstPageStderr);
+  }
   let commentsCapped = false;
   if (comments.length === GITHUB_ISSUE_COMMENT_TAIL_LIMIT) {
-    const secondPage = await githubJsonAsync([
-      "api",
-      `repos/${target.owner}/${target.repo}/issues/${target.issueNumber}/comments?per_page=${GITHUB_ISSUE_COMMENT_TAIL_LIMIT}&page=2&sort=created&direction=desc`
-    ], mapping.connectorHost);
-    const olderComments = parseGithubIssueComments(secondPage);
+    let secondPage;
+    let secondPageStderr = "";
+    try {
+      const response = await readBriefJson([
+        "api",
+        `repos/${target.owner}/${target.repo}/issues/${target.issueNumber}/comments?per_page=${GITHUB_ISSUE_COMMENT_TAIL_LIMIT}&page=2&sort=created&direction=desc`
+      ], "comment-tail-page-2");
+      secondPage = response.value;
+      secondPageStderr = response.stderr;
+    } catch (error48) {
+      throw briefFailure("comment-tail-page-2", error48);
+    }
+    let olderComments;
+    try {
+      olderComments = parseGithubIssueComments(secondPage);
+    } catch (error48) {
+      throw briefFailure("comment-tail-page-2", error48, secondPageStderr);
+    }
     commentsCapped = olderComments.length > 0;
   }
-  const currentTarget = githubIssueBriefTarget(db, projectId, workItemId);
-  if (!currentTarget || JSON.stringify(currentTarget) !== JSON.stringify(target)) throw new Error("GitHub issue projection moved during brief composition");
+  let currentTarget;
+  try {
+    currentTarget = githubIssueBriefTarget(db, projectId, workItemId);
+  } catch (error48) {
+    throw briefFailure("projection-target-read", error48);
+  }
+  if (!currentTarget || JSON.stringify(currentTarget) !== JSON.stringify(target)) {
+    throw briefFailure("projection-moved-during-composition", "the canonical projection target changed during the bounded brief read");
+  }
   const source = {
     ...issue2,
     projectId,
@@ -26347,8 +26450,17 @@ async function readGithubIssueBriefAsync(db, projectId, workItemId) {
     bodyCurrent: true,
     projection: target.projection
   };
-  const brief = composeGithubIssueBrief(source);
-  assertGithubIssueBriefBinding(brief, { projectId, owner: target.owner, repo: target.repo, issueNumber: target.issueNumber });
+  let brief;
+  try {
+    brief = composeGithubIssueBrief(source);
+  } catch (error48) {
+    throw briefFailure("brief-composition", error48);
+  }
+  try {
+    assertGithubIssueBriefBinding(brief, { projectId, owner: target.owner, repo: target.repo, issueNumber: target.issueNumber });
+  } catch (error48) {
+    throw briefFailure("brief-binding", error48);
+  }
   return { brief, source };
 }
 function appendGithubIssueBrief(spawn, brief) {
@@ -27041,11 +27153,11 @@ async function dispatchLane(bb, db, input) {
     return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub issue projection identity is malformed or ambiguous" };
   }
   if (briefTarget && !briefTarget.stale && !projectionIsCurrent(briefTarget) && !projectionIsInitialPending(briefTarget)) {
-    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub issue projection is stale or ambiguous for the canonical WorkItem" };
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "cause=projection-target-not-current; GitHub issue projection is stale or ambiguous for the canonical WorkItem" };
   }
   const githubAdapter = briefTarget ? githubCliAdapterForWorkItem(db, request.projectId, request.workItemId ?? "") : null;
   if (briefTarget && !githubAdapter) {
-    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub projection capability is unavailable for the current WorkItem" };
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "cause=repository-mapping-unavailable; GitHub projection capability is unavailable for the current WorkItem" };
   }
   if (briefTarget && projectionIsInitialPending(briefTarget) && (briefTarget.owner !== githubAdapter.owner || briefTarget.repo !== githubAdapter.repo)) {
     return { outcome: "EXTERNAL_REF_CONFLICT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub pending binding does not match its exact repository-target mapping" };
@@ -27070,7 +27182,7 @@ async function dispatchLane(bb, db, input) {
         "SELECT resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?"
       ).get(request.projectId, request.workItemId ?? "");
       if (!currentWorkItem || !Number.isSafeInteger(currentWorkItem.resource_revision)) {
-        return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub projection capability is unavailable for the current WorkItem" };
+        return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "cause=canonical-work-item-read; GitHub projection capability is unavailable for the current WorkItem" };
       }
       const projection = await applyLiveAuthorizedMutationAsync(bb, db, {
         projectId: request.projectId,
@@ -27095,19 +27207,19 @@ async function dispatchLane(bb, db, input) {
       if (projection.outcome !== "OK") return projection;
       try {
         initialBrief = (await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "")).brief;
-      } catch {
-        return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub issue body, projection, and comment-tail source is unavailable" };
+      } catch (error48) {
+        return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `cause=initial-brief-read; ${String(error48)}` };
       }
       let latestRead;
       try {
         latestRead = await readGithubIssueBriefAsync(db, request.projectId, request.workItemId ?? "");
-      } catch {
-        return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub issue body and comment-tail reread is unavailable" };
+      } catch (error48) {
+        return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `cause=freshness-reread; ${String(error48)}` };
       }
       try {
         assertGithubIssueBriefAnchor(initialBrief, latestRead.source);
-      } catch {
-        return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "GitHub issue body or comment tail moved before dispatch" };
+      } catch (error48) {
+        return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `cause=brief-anchor-moved; ${String(error48)}` };
       }
       dispatchSpawn = appendGithubIssueBrief(dispatchSpawn, latestRead.brief);
     }

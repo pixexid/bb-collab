@@ -933,7 +933,7 @@ async function currentGithubBriefDispatch(projectId = PROJECT_ID, connectorHost 
   };
 }
 
-function installGithubBriefGh(snapshot: { title: string; body: string; state: "open" | "closed"; labels: readonly string[]; externalRevision: string }, options: { transitionSnapshot?: typeof snapshot; incomplete?: boolean; mutationFailure?: boolean; slowConnectorHost?: string; responseUrl?: string; issueNumber?: number } = {}) {
+function installGithubBriefGh(snapshot: { title: string; body: string; state: "open" | "closed"; labels: readonly string[]; externalRevision: string }, options: { transitionSnapshot?: typeof snapshot; incomplete?: boolean; mutationFailure?: boolean; slowConnectorHost?: string; responseUrl?: string; issueNumber?: number; issueFailureAfterCommentPage1?: boolean; issueInvalidAfterCommentPage1?: boolean; issueFreshnessMismatchAfterCommentPage1?: boolean; commentPage1Failure?: boolean; commentPage2Invalid?: boolean } = {}) {
   const bin = mkdtempSync(join(tmpdir(), "bb-collab-github-brief-"));
   const gh = join(bin, "gh");
   const calls = join(bin, "calls");
@@ -941,6 +941,7 @@ function installGithubBriefGh(snapshot: { title: string; body: string; state: "o
   const fastTransitioned = join(bin, "fast-transitioned");
   const slowStarted = join(bin, "slow-started");
   const slowFinished = join(bin, "slow-finished");
+  const commentPage1Seen = join(bin, "comment-page-1-seen");
   const issueNumber = options.issueNumber ?? 1;
   const issue = JSON.stringify({ number: issueNumber, title: snapshot.title, body: snapshot.body, state: snapshot.state === "open" ? "OPEN" : "CLOSED", stateReason: snapshot.state === "open" ? "REOPENED" : "COMPLETED", labels: snapshot.labels.map((name) => ({ name })), updatedAt: snapshot.externalRevision, url: options.responseUrl ?? `https://__GH_HOST__/example/project/issues/${issueNumber}` });
   const transitionSnapshot = options.transitionSnapshot ?? snapshot;
@@ -959,6 +960,12 @@ connector_host="\${GH_HOST:-default}"
 if [ "$connector_host" = '${options.slowConnectorHost ?? ""}' ]; then touch '${slowStarted}'; sleep 2; touch '${slowFinished}'; fi
 if [ "$connector_host" = '${options.slowConnectorHost ?? ""}' ]; then state_file='${slowTransitioned}'; else state_file='${fastTransitioned}'; fi
 if [ "$1" = issue ]; then
+  if [ -n '${options.issueFailureAfterCommentPage1 ? "yes" : ""}' ] && [ -f '${commentPage1Seen}' ]; then printf '%s\\n' 'token=ghs_fixture_secret issue body unavailable' >&2; exit 17; fi
+  if [ -n '${options.issueInvalidAfterCommentPage1 ? "yes" : ""}' ] && [ -f '${commentPage1Seen}' ]; then printf '%s\\n' '{"not":"an issue"}'; exit 0; fi
+  if [ -n '${options.issueFreshnessMismatchAfterCommentPage1 ? "yes" : ""}' ] && [ -f '${commentPage1Seen}' ]; then
+    printf '%s\\n' '${transitionedIssue}' | sed "s/__GH_HOST__/$connector_host/g; s/\\"updatedAt\\":\\"[^\\"]*\\"/\\"updatedAt\\":\\"fixture-mismatch\\"/"
+    exit 0
+  fi
   if [ -f "$state_file" ]; then printf '%s\\n' '${transitionedIssue}' | sed "s/__GH_HOST__/$connector_host/g"; else printf '%s\\n' '${issue}' | sed "s/__GH_HOST__/$connector_host/g"; fi
   exit 0
 fi
@@ -968,8 +975,8 @@ if [ "$1" = api ]; then
       ${options.mutationFailure ? "exit 12" : `touch "$state_file"; printf '%s\\n' '{"number":${issueNumber},"html_url":"https://__GH_HOST__/example/project/issues/${issueNumber}"}' | sed "s/__GH_HOST__/$connector_host/g"`}
       exit 0 ;;
     *--paginate*) exit 12 ;;
-    *page=1*) printf '%s\\n' '${recent}'; exit 0 ;;
-    *page=2*) printf '%s\\n' '${older}'; exit 0 ;;
+    *page=1*) touch '${commentPage1Seen}'; ${options.commentPage1Failure ? "printf '%s\\n' 'comment page 1 unavailable' >&2; exit 18" : `printf '%s\\n' '${recent}'; exit 0`} ;;
+    *page=2*) ${options.commentPage2Invalid ? "printf '%s\\n' '{\"not\":\"comments\"}'; exit 0" : `printf '%s\\n' '${older}'; exit 0`} ;;
   esac
 fi
 exit 1
@@ -6851,6 +6858,50 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       expect(calls.match(/page=2/gu)).toHaveLength(1);
     } finally {
       restore.cleanup();
+    }
+  });
+
+  it("carries one discriminating, redacted cause for each brief-read failure fixture", async () => {
+    const cases = [
+      { name: "issue body command failure", options: { issueFailureAfterCommentPage1: true }, cause: "issue-body-read", evidence: "[REDACTED_TOKEN]", absent: "comment-tail-page-1" },
+      { name: "issue body invalid response", options: { issueInvalidAfterCommentPage1: true }, cause: "issue-body-read", evidence: "GitHub issue response is invalid", absent: "comment-tail-page-1" },
+      { name: "issue body freshness mismatch", options: { issueFreshnessMismatchAfterCommentPage1: true }, cause: "issue-body-freshness-mismatch", evidence: "attempts=3", absent: "comment-tail-page-1" },
+      { name: "recent comment page failure", options: { commentPage1Failure: true }, cause: "comment-tail-page-1", evidence: "comment page 1 unavailable", absent: "comment-tail-page-2" },
+      { name: "older comment page invalid response", options: { commentPage2Invalid: true }, cause: "comment-tail-page-2", evidence: "GitHub issue comments response is invalid", absent: "comment-tail-page-1" },
+    ] as const;
+    const causes = cases.map((item) => item.cause);
+    for (const item of cases) {
+      const baseline = await currentGithubBriefDispatch();
+      const baselineRestore = installGithubBriefGh(baseline.snapshot, { transitionSnapshot: baseline.transitionSnapshot });
+      try {
+        const baselineResult = JSON.parse(await baseline.fixture.host.harness.callAgentTool("dispatch_lane", {
+          request: baseline.request,
+          spawn: dispatchSpawn(baseline.fixture.orchestratorThreadId),
+        }, { projectId: PROJECT_ID, threadId: baseline.fixture.orchestratorThreadId }) as string);
+        expect(baselineResult.outcome, `unmutated baseline for ${item.name}`).toBe("OK");
+      } finally {
+        baselineRestore.cleanup();
+      }
+
+      const projected = await currentGithubBriefDispatch();
+      const restore = installGithubBriefGh(projected.snapshot, { transitionSnapshot: projected.transitionSnapshot, ...item.options });
+      try {
+        const result = JSON.parse(await projected.fixture.host.harness.callAgentTool("dispatch_lane", {
+          request: projected.request,
+          spawn: dispatchSpawn(projected.fixture.orchestratorThreadId),
+        }, { projectId: PROJECT_ID, threadId: projected.fixture.orchestratorThreadId }) as string);
+        expect(result.outcome, item.name).toBe("EXTERNAL_UNAVAILABLE");
+        expect(result.message, item.name).toContain(`cause=${item.cause}`);
+        expect(result.message, item.name).toContain(item.evidence);
+        expect(result.message, item.name).not.toContain("ghs_fixture_secret");
+        expect(result.message, item.name).not.toContain(item.absent);
+        for (const cause of causes) {
+          if (cause !== item.cause) expect(result.message, `${item.name} collapsed into ${cause}`).not.toContain(`cause=${cause}`);
+        }
+        expect(projected.fixture.host.harness.inspection.sdk.callsTo("threads.spawn"), item.name).toHaveLength(0);
+      } finally {
+        restore.cleanup();
+      }
     }
   });
 
