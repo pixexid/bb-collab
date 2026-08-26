@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -108,6 +109,26 @@ describe("executed profile read-back", () => {
       });
       expect(result).toMatchObject({ outcome: "unknown", coverage: { completedTurns: 1, knownTurns: 0, unknownTurns: 1, noExecutionTurns: 0 }, turns: [{ status: "unknown", reason: "acp-zcode attestation item is malformed or unparseable" }] });
     }
+  });
+
+  it("GUARD: treats whitespace-only acp-zcode identity fields as unknown", async () => {
+    const scopeTurnId = "bta2647fb7-1-zcode-blank-identity";
+    const result = await readExecutedProfiles({
+      thread: { providerId: "acp-zcode", status: "idle" },
+      environment: { path: "/test/project" },
+      events: zcodeEvents("zcode-session", scopeTurnId, JSON.stringify({
+        ...zcodeAttestation,
+        providerId: " ",
+        modelId: "\t",
+        variant: "\n",
+      })),
+      expectedTurnId: scopeTurnId,
+    });
+    expect(result).toMatchObject({
+      outcome: "unknown",
+      coverage: { completedTurns: 1, knownTurns: 0, unknownTurns: 1, noExecutionTurns: 0 },
+      turns: [{ status: "unknown", reason: "acp-zcode attestation item is malformed or unparseable" }],
+    });
   });
 
   it("REGRESSION: preserves Codex and Pi native output shapes", async () => {
@@ -574,6 +595,38 @@ describe("executed profile read-back", () => {
         { status: "unknown", reason: "provider-native turn profiles conflict" },
       ],
     });
+  });
+
+  it("REGRESSION: keeps the CLI exit code zero for a partial Codex read", () => {
+    const root = mkdtempSync(join(tmpdir(), "bb-collab-profile-cli-"));
+    const home = join(root, "home");
+    const fakeBin = join(root, "bin");
+    const fakeBbScript = join(root, "fake-bb.mjs");
+    const bb = join(fakeBin, "bb");
+    const providerThreadId = "018cc251-f400-7000-8000-000000000000";
+    const events = [completion(providerThreadId, "turn-1"), completion(providerThreadId, "turn-2")];
+    mkdirSync(fakeBin, { recursive: true });
+    writeFileSync(fakeBbScript, [
+      `const shown = ${JSON.stringify({ thread: { id: "thread-1", projectId: "project-1", providerId: "codex", status: "idle" }, environment: { path: "/test/project" } })};`,
+      `const events = ${JSON.stringify(events)};`,
+      "if (process.argv[3] === \"show\") console.log(JSON.stringify(shown));",
+      "else if (process.argv[3] === \"log\") console.log(JSON.stringify(events));",
+      "else process.exit(1);",
+    ].join("\n"));
+    writeFileSync(bb, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeBbScript)} "$@"\n`);
+    chmodSync(bb, 0o755);
+    jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${providerThreadId}.jsonl`), [
+      { type: "session_meta", payload: { id: providerThreadId, originator: "bb", cwd: "/test/project" } },
+      { type: "turn_context", payload: { turn_id: "turn-1", model: "gpt-5.6-sol", effort: "medium" } },
+      { type: "turn_context", payload: { turn_id: "turn-2", model: "gpt-5.6-sol", effort: "medium" } },
+      { type: "turn_context", payload: { turn_id: "turn-2", model: "gpt-5.6-luna", effort: "medium" } },
+    ]);
+    const result = spawnSync(process.execPath, [
+      new URL("../scripts/read-executed-profile.mjs", import.meta.url).pathname,
+      "--project", "project-1", "--thread", "thread-1",
+    ], { env: { ...process.env, HOME: home, PATH: `${fakeBin}:${process.env.PATH ?? ""}` }, encoding: "utf8" });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ outcome: "partial", coverage: { completedTurns: 2, knownTurns: 1, unknownTurns: 1 } });
   });
 
   it("DISCRIMINATOR: treats NUL-colliding executed profiles as conflicting", async () => {

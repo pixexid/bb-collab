@@ -10,6 +10,7 @@ const PAGE_SIZE = 1_000;
 const ACTIVE_PROFILE = Symbol("active profile");
 const TERMINAL_TURN_STATUSES = new Set(["completed", "failed", "interrupted"]);
 const CODEX_SCOPE_TURN_ID = /^bta[0-9a-z]{7}-[1-9][0-9]*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/iu;
+const isNonEmptyIdentity = (value) => typeof value === "string" && value.trim() !== "";
 
 function isTerminalTurnEvent(event) {
   return event?.type === "turn/completed" && TERMINAL_TURN_STATUSES.has(event.data?.status);
@@ -189,7 +190,7 @@ function readZcodeAttestation(items) {
     const attestation = JSON.parse(completed[0].result);
     if (!attestation || typeof attestation !== "object" || Array.isArray(attestation)
       || attestation.schema !== ZCODE_ATTESTATION_SCHEMA
-      || ![attestation.providerId, attestation.modelId, attestation.variant].every((value) => typeof value === "string" && value !== "")) return null;
+      || ![attestation.providerId, attestation.modelId, attestation.variant].every(isNonEmptyIdentity)) return null;
     return attestation;
   } catch {
     return null;
@@ -475,7 +476,7 @@ export async function main(argv = process.argv.slice(2)) {
   const result = await readExecutedProfiles({ thread: shown.thread, environment: shown.environment, events, expectedTurnId: turnId });
   const environmentDependent = environmentDependentFromEvents(shown.thread, events);
   console.log(JSON.stringify({ threadId, projectId, providerId: shown.thread.providerId, environmentDependent, ...result }, null, 2));
-  if (result.outcome !== "known") process.exitCode = 2;
+  if (result.outcome === "unknown" || result.outcome === "no-execution") process.exitCode = 2;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main();
