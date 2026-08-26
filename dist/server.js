@@ -18507,6 +18507,9 @@ function checkIdempotency(db, request, digest2) {
     throw refusal("IDEMPOTENCY_KEY_CONFLICT", "idempotency key was already used for another request");
   }
   const replay = JSON.parse(row.outcome_json);
+  if (request.operationClass === "github_pr_observation_record" && replay.evidence !== null && typeof replay.evidence === "object" && !Array.isArray(replay.evidence)) {
+    replay.evidence = { ...replay.evidence, wake: false };
+  }
   Object.defineProperty(replay, "replay", { value: true });
   return replay;
 }
@@ -28811,7 +28814,7 @@ async function plugin(bb, options = {}) {
             bb.log.warn(`github-pr observer canonical reservation refused: project=${wait.projectId} workItem=${wait.workItemId} outcome=${result2.outcome}`);
             continue;
           }
-          if (evidence.wake === true && typeof result2.eventSequence === "number") await githubPrWake(wait, result2.eventSequence, reservationKey);
+          if (evidence.wake === true && result2.replay !== true && typeof result2.eventSequence === "number") await githubPrWake(wait, result2.eventSequence, reservationKey);
         }
       }
     })();

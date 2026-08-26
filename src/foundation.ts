@@ -4649,6 +4649,9 @@ function checkIdempotency(db: SqliteDatabase, request: ApplyRequest, digest: str
     throw refusal("IDEMPOTENCY_KEY_CONFLICT", "idempotency key was already used for another request");
   }
   const replay = JSON.parse(row.outcome_json) as FoundationResult;
+  if (request.operationClass === "github_pr_observation_record" && replay.evidence !== null && typeof replay.evidence === "object" && !Array.isArray(replay.evidence)) {
+    replay.evidence = { ...replay.evidence as Record<string, unknown>, wake: false };
+  }
   Object.defineProperty(replay, "replay", { value: true });
   return replay;
 }

@@ -3735,7 +3735,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
             bb.log.warn(`github-pr observer canonical reservation refused: project=${wait.projectId} workItem=${wait.workItemId} outcome=${result.outcome}`);
             continue;
           }
-          if (evidence.wake === true && typeof result.eventSequence === "number") await githubPrWake(wait, result.eventSequence, reservationKey);
+          if (evidence.wake === true && result.replay !== true && typeof result.eventSequence === "number") await githubPrWake(wait, result.eventSequence, reservationKey);
         }
       }
     })();
