@@ -933,7 +933,7 @@ async function currentGithubBriefDispatch(projectId = PROJECT_ID, connectorHost 
   };
 }
 
-function installGithubBriefGh(snapshot: { title: string; body: string; state: "open" | "closed"; labels: readonly string[]; externalRevision: string }, options: { transitionSnapshot?: typeof snapshot; incomplete?: boolean; mutationFailure?: boolean; slowConnectorHost?: string; responseUrl?: string; issueNumber?: number; issueFailureAfterCommentPage1?: boolean; issueInvalidAfterCommentPage1?: boolean; issueFreshnessMismatchAfterCommentPage1?: boolean; issueUnmaintainedAfterProjection?: boolean; commentPage1Failure?: boolean; commentPage2Invalid?: boolean; pauseAfterCommentPage1?: boolean } = {}) {
+function installGithubBriefGh(snapshot: { title: string; body: string; state: "open" | "closed"; labels: readonly string[]; externalRevision: string }, options: { transitionSnapshot?: typeof snapshot; incomplete?: boolean; mutationFailure?: boolean; slowConnectorHost?: string; responseUrl?: string; issueNumber?: number; issueFailureAfterCommentPage1?: boolean; issueInvalidAfterCommentPage1?: boolean; issueFreshnessMismatchAfterCommentPage1?: boolean; issueFreshnessMismatchAlways?: boolean; issueUnmaintainedAfterProjection?: boolean; commentPage1Failure?: boolean; commentPage2Invalid?: boolean; pauseAfterCommentPage1?: boolean } = {}) {
   const bin = mkdtempSync(join(tmpdir(), "bb-collab-github-brief-"));
   const gh = join(bin, "gh");
   const calls = join(bin, "calls");
@@ -977,7 +977,7 @@ if [ "$1" = issue ]; then
   fi
   if [ -n '${options.issueFailureAfterCommentPage1 ? "yes" : ""}' ] && [ -f '${commentPage1Seen}' ]; then printf '%s\\n' 'token=ghs_fixture_secret issue body unavailable' >&2; exit 17; fi
   if [ -n '${options.issueInvalidAfterCommentPage1 ? "yes" : ""}' ] && [ -f '${commentPage1Seen}' ]; then printf '%s\\n' '{"not":"an issue"}'; exit 0; fi
-  if [ -n '${options.issueFreshnessMismatchAfterCommentPage1 ? "yes" : ""}' ] && [ ! -f '${freshnessMismatchSeen}' ] && [ -f '${commentPage1Seen}' ]; then
+  if [ -n '${options.issueFreshnessMismatchAfterCommentPage1 ? "yes" : ""}' ] && [ -f '${commentPage1Seen}' ] && { [ -n '${options.issueFreshnessMismatchAlways ? "yes" : ""}' ] || [ ! -f '${freshnessMismatchSeen}' ]; }; then
     touch '${freshnessMismatchSeen}'
     printf '%s\\n' '${transitionedIssue}' | sed "s/__GH_HOST__/$connector_host/g; s/\\"updatedAt\\":\\"[^\\"]*\\"/\\"updatedAt\\":\\"fixture-mismatch\\"/"
     exit 0
@@ -6886,6 +6886,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     const cases = [
       { name: "issue body command failure", options: { issueFailureAfterCommentPage1: true }, cause: "issue-body-read", evidence: "[REDACTED_TOKEN]", absent: "comment-tail-page-1" },
       { name: "issue body invalid response", options: { issueInvalidAfterCommentPage1: true }, cause: "issue-body-read", evidence: "GitHub issue response is invalid", absent: "comment-tail-page-1" },
+      { name: "issue body freshness mismatch", options: { issueFreshnessMismatchAfterCommentPage1: true, issueFreshnessMismatchAlways: true }, cause: "issue-body-freshness-mismatch", evidence: "attempts=3", absent: "comment-tail-page-1" },
       { name: "recent comment page failure", options: { commentPage1Failure: true }, cause: "comment-tail-page-1", evidence: "comment page 1 unavailable", absent: "comment-tail-page-2" },
       { name: "older comment page invalid response", options: { commentPage2Invalid: true }, cause: "comment-tail-page-2", evidence: "GitHub issue comments response is invalid", absent: "comment-tail-page-1" },
     ] as const;
@@ -6911,12 +6912,12 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
           spawn: dispatchSpawn(projected.fixture.orchestratorThreadId),
         }, { projectId: PROJECT_ID, threadId: projected.fixture.orchestratorThreadId }) as string);
         expect(result.outcome, item.name).toBe("EXTERNAL_UNAVAILABLE");
-        expect(result.message, item.name).toContain(`cause=${item.cause}`);
+        expect(result.message, item.name).toContain(`cause=${item.cause};`);
         expect(result.message, item.name).toContain(item.evidence);
         expect(result.message, item.name).not.toContain("ghs_fixture_secret");
         expect(result.message, item.name).not.toContain(item.absent);
         for (const cause of causes) {
-          if (cause !== item.cause) expect(result.message, `${item.name} collapsed into ${cause}`).not.toContain(`cause=${cause}`);
+          if (cause !== item.cause) expect(result.message, `${item.name} collapsed into ${cause}`).not.toContain(`cause=${cause};`);
         }
         expect(projected.fixture.host.harness.inspection.sdk.callsTo("threads.spawn"), item.name).toHaveLength(0);
       } finally {
@@ -6947,6 +6948,62 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     }
   });
 
+  it("carries the initial projection target read cause", async () => {
+    const projected = await currentGithubBriefDispatch();
+    const restore = installGithubBriefGh(projected.snapshot, { transitionSnapshot: projected.transitionSnapshot });
+    const originalPrepare = projected.fixture.db.prepare.bind(projected.fixture.db);
+    let targetReads = 0;
+    const prepare = vi.spyOn(projected.fixture.db, "prepare").mockImplementation(((sql: string) => {
+      if (sql.includes("SELECT work_items.resource_revision, external_work_refs.*")) {
+        targetReads += 1;
+        if (targetReads === 2) throw new Error("projection target read unavailable");
+      }
+      return originalPrepare(sql);
+    }) as never);
+    try {
+      const result = JSON.parse(await projected.fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: projected.request,
+        spawn: dispatchSpawn(projected.fixture.orchestratorThreadId),
+      }, { projectId: PROJECT_ID, threadId: projected.fixture.orchestratorThreadId }) as string);
+      expect(result.outcome).toBe("EXTERNAL_UNAVAILABLE");
+      expect(targetReads).toBe(2);
+      expect(result.message).toContain("cause=projection-target-read;");
+      expect(result.message).not.toContain("cause=projection-target-reread-after-initial-read;");
+      expect(projected.fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    } finally {
+      prepare.mockRestore();
+      restore.cleanup();
+    }
+  });
+
+  it("carries the later projection target reread cause", async () => {
+    const projected = await currentGithubBriefDispatch();
+    const restore = installGithubBriefGh(projected.snapshot, { transitionSnapshot: projected.transitionSnapshot });
+    const originalPrepare = projected.fixture.db.prepare.bind(projected.fixture.db);
+    let targetReads = 0;
+    const prepare = vi.spyOn(projected.fixture.db, "prepare").mockImplementation(((sql: string) => {
+      if (sql.includes("SELECT work_items.resource_revision, external_work_refs.*")) {
+        targetReads += 1;
+        if (targetReads === 3) throw new Error("projection target reread unavailable");
+      }
+      return originalPrepare(sql);
+    }) as never);
+    try {
+      const result = JSON.parse(await projected.fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: projected.request,
+        spawn: dispatchSpawn(projected.fixture.orchestratorThreadId),
+      }, { projectId: PROJECT_ID, threadId: projected.fixture.orchestratorThreadId }) as string);
+      expect(result.outcome).toBe("EXTERNAL_UNAVAILABLE");
+      expect(targetReads).toBe(3);
+      expect(result.message).toContain("cause=projection-target-reread-after-initial-read;");
+      expect(result.message).not.toContain("cause=projection-target-read;");
+      expect(projected.fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    } finally {
+      prepare.mockRestore();
+      restore.cleanup();
+    }
+  });
+
   it("fixtures each reachable brief-read cause without collapsing the labels", async () => {
     const causes = [
       "brief-composition",
@@ -6955,9 +7012,9 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       "repository-mapping-unavailable",
     ];
     const expectOnlyCause = (result: { message?: string }, cause: string) => {
-      expect(result.message ?? "").toContain(`cause=${cause}`);
+      expect(result.message ?? "").toContain(`cause=${cause};`);
       for (const other of causes) {
-        if (other !== cause) expect(result.message ?? "").not.toContain(`cause=${other}`);
+        if (other !== cause) expect(result.message ?? "").not.toContain(`cause=${other};`);
       }
     };
 
