@@ -64,10 +64,9 @@ describe("Operator Inbox app", () => {
     expect(source).not.toMatch(/[>](?:↻|↗|✓|▱)[<]/);
   });
 
-  it("renders message and delivered-reply bodies through the host Markdown surface", async () => {
+  it("renders message and delivered-reply bodies as safe Markdown (no image fetch, hard line breaks)", async () => {
     const app = await loadedApp();
     const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
-    const body = "**Blocked** on [issue](https://example.invalid/1)\n\n- one";
     const operatorMessages = vi.fn(async () => [{
       messageId: 7,
       projectId: "project-a",
@@ -75,12 +74,12 @@ describe("Operator Inbox app", () => {
       senderThreadId: "sender-thread",
       senderLaneId: null,
       severity: "routine" as const,
-      text: body,
+      text: "**Blocked** on [issue](https://example.invalid/1)\nand a beacon ![pixel](https://example.invalid/pixel?m=7)\n\n- one",
       createdAtMs: 1,
       readAtMs: 2,
       senderTitle: "Director",
       repliedAtMs: 3,
-      replyText: "**done**",
+      replyText: "line one\nline two",
       replyDeliveryError: null,
       notificationStatus: "not-requested" as const,
       notificationError: null,
@@ -90,11 +89,51 @@ describe("Operator Inbox app", () => {
       rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(operatorMessages) } as never,
     });
     await waitFor(() => expect(operatorMessages).toHaveBeenCalled());
-    const markdownBodies = await waitFor(() => rendered.getAllByTestId("bb-markdown"));
-    expect(markdownBodies.some((node) => node.textContent === body)).toBe(true);
-    expect(markdownBodies.some((node) => node.textContent === "**done**")).toBe(true);
+    await waitFor(() => expect(rendered.container.querySelector("strong")?.textContent).toBe("Blocked"));
+    const link = rendered.container.querySelector("a[href='https://example.invalid/1']");
+    expect(link).not.toBeNull();
+    // P1: a markdown image in a fleet-authored body must never emit <img> (no read beacon);
+    // its alt text is shown instead.
+    expect(rendered.container.querySelector("img")).toBeNull();
+    expect(rendered.getByText("pixel")).toBeTruthy();
+    // P2: a single newline inside the body and the reply stays a hard line break.
+    expect(rendered.container.querySelectorAll("br").length).toBeGreaterThanOrEqual(2);
+    expect(rendered.container.textContent).toContain("line one");
+    expect(rendered.container.textContent).toContain("line two");
+    expect(rendered.getByText("one").tagName).toBe("LI");
     const source = readFileSync(resolve(import.meta.dirname, "../app.tsx"), "utf8");
     expect(source).not.toContain("whitespace-pre-wrap break-words text-sm leading-6");
+  });
+
+  it("renders fleet-authored HTML and hostile URL schemes inert", async () => {
+    const app = await loadedApp();
+    const inbox = app.navPanels.find((panel) => panel.id === "inbox")!;
+    const operatorMessages = vi.fn(async () => [{
+      messageId: 8,
+      projectId: "project-a",
+      recipient: "operator" as const,
+      senderThreadId: "s",
+      senderLaneId: null,
+      severity: "routine" as const,
+      text: "<script>alert(1)</script><img src=\"https://example.invalid/x\" onerror=\"alert(2)\"> [bad](javascript:alert(3))",
+      createdAtMs: 1,
+      readAtMs: null,
+      senderTitle: null,
+      repliedAtMs: null,
+      replyText: null,
+      replyDeliveryError: null,
+      notificationStatus: "not-requested" as const,
+      notificationError: null,
+    }]);
+    const rendered = renderSlot(inbox, { subPath: "" }, {
+      sidebarThreads: { status: "ready", projects: [project("project-a", "Project A")], threads: [] },
+      rpc: { ...(rpcHandlers() as unknown as Record<string, unknown>), operatorMessages: okMessages(operatorMessages) } as never,
+    });
+    await waitFor(() => expect(operatorMessages).toHaveBeenCalled());
+    await waitFor(() => expect(rendered.container.textContent).toContain("<script>alert(1)</script>"));
+    expect(rendered.container.querySelector("script")).toBeNull();
+    expect(rendered.container.querySelectorAll("img").length).toBe(0);
+    expect(rendered.container.querySelector("a[href^='javascript']")).toBeNull();
   });
 
   it("registers a project-exact Inbox panel and surfaces reply delivery failures", async () => {
