@@ -1,6 +1,7 @@
 import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { gitPath } from "./git-path.js";
 
 export interface CheckoutDivergence {
   checkoutHead: string | null;
@@ -63,11 +64,13 @@ export function readCheckoutDivergence(checkoutRoot: string | null): CheckoutDiv
     const checkoutHead = readHead(gitDir, commonDir);
     const originMainRef = readRef([commonDir, gitDir], "refs/remotes/origin/main");
     if (!checkoutHead || !originMainRef) return { checkoutHead, originMainRef, behindCount: null, verdict: "unavailable", processGroupReap: "not-attempted" };
+    const executable = gitPath();
+    if (!executable) return { checkoutHead, originMainRef, behindCount: null, verdict: "unavailable", processGroupReap: "not-attempted" };
     let behindCount: number | null = null;
     let processGroupReap: CheckoutDivergence["processGroupReap"] = "not-attempted";
     try {
       const options: SpawnSyncOptionsWithStringEncoding & { detached: true } = { cwd: checkoutRoot, encoding: "utf8", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" }, stdio: ["ignore", "pipe", "ignore"], timeout: 1_000, killSignal: "SIGKILL", detached: true };
-      const result = spawnSync("git", ["rev-list", "--count", `${checkoutHead}..${originMainRef}`], options);
+      const result = spawnSync(executable, ["rev-list", "--count", `${checkoutHead}..${originMainRef}`], options);
       if (typeof result.pid === "number" && result.pid > 0) {
         try {
           process.kill(-result.pid, "SIGKILL");
@@ -80,7 +83,10 @@ export function readCheckoutDivergence(checkoutRoot: string | null): CheckoutDiv
           }
         }
       }
-      if (result.error) throw result.error;
+      const errorCode = (result.error as NodeJS.ErrnoException | undefined)?.code;
+      if (errorCode === "ENOENT" || errorCode === "EACCES" || errorCode === "ENOTDIR") {
+        return { checkoutHead, originMainRef, behindCount: null, verdict: "unavailable", processGroupReap };
+      }
       const count = result.stdout.trim();
       if (/^\d+$/u.test(count)) behindCount = Number(count);
     } catch {
