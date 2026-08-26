@@ -4706,8 +4706,8 @@ printf '%s\\n' finished >> ${marker}
 printf '%s\\n' '[]'
 `);
     chmodSync(gh, 0o755);
-    const originalPath = process.env.PATH;
-    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const originalGhPath = process.env.BB_COLLAB_GH_PATH;
+    process.env.BB_COLLAB_GH_PATH = gh;
     try {
       const fixture = await fleetWatchdogFixture(0, true, 1, false);
       const workItemId = "slow-github-read";
@@ -4734,8 +4734,8 @@ printf '%s\\n' '[]'
       expect(timerAt).toBeLessThan(finishedAt);
       await cycle;
     } finally {
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
+      if (originalGhPath === undefined) delete process.env.BB_COLLAB_GH_PATH;
+      else process.env.BB_COLLAB_GH_PATH = originalGhPath;
       rmSync(bin, { recursive: true, force: true });
     }
   });
@@ -4751,8 +4751,8 @@ printf '%s\\n' finished >> ${marker}
 if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue:startable"}]}]]'; else printf '%s\\n' '[{"number":305,"labels":[{"name":"queue:startable"}]}]'; fi
 `);
     chmodSync(gh, 0o755);
-    const originalPath = process.env.PATH;
-    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const originalGhPath = process.env.BB_COLLAB_GH_PATH;
+    process.env.BB_COLLAB_GH_PATH = gh;
     try {
       const fixture = await fleetWatchdogFixture(0, true, 1, false);
       let timerAt = Number.POSITIVE_INFINITY;
@@ -4772,8 +4772,8 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
       expect(timerAt).toBeLessThan(finishedAt);
       await observation;
     } finally {
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
+      if (originalGhPath === undefined) delete process.env.BB_COLLAB_GH_PATH;
+      else process.env.BB_COLLAB_GH_PATH = originalGhPath;
       rmSync(bin, { recursive: true, force: true });
     }
   });
@@ -5147,8 +5147,8 @@ while [ ! -f '${release}' ]; do sleep 0.05; done
 printf '%s\n' '[[{"number":205,"labels":[{"name":"queue:startable"}]}]]'
 `);
     chmodSync(gh, 0o755);
-    const originalPath = process.env.PATH;
-    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const originalGhPath = process.env.BB_COLLAB_GH_PATH;
+    process.env.BB_COLLAB_GH_PATH = gh;
     let service: ReturnType<Awaited<ReturnType<typeof fleetWatchdogFixture>>["host"]["harness"]["runService"]> | undefined;
     try {
       const fixture = await fleetWatchdogFixture(0, true);
@@ -5176,8 +5176,8 @@ printf '%s\n' '[[{"number":205,"labels":[{"name":"queue:startable"}]}]]'
     } finally {
       service?.controller.abort();
       await service?.done;
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
+      if (originalGhPath === undefined) delete process.env.BB_COLLAB_GH_PATH;
+      else process.env.BB_COLLAB_GH_PATH = originalGhPath;
       rmSync(bin, { recursive: true, force: true });
     }
   });
@@ -5194,8 +5194,8 @@ if [ "$count" -le 3 ]; then issue=205; else issue=206; fi
 printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
 `);
     chmodSync(gh, 0o755);
-    const originalPath = process.env.PATH;
-    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const originalGhPath = process.env.BB_COLLAB_GH_PATH;
+    process.env.BB_COLLAB_GH_PATH = gh;
     let service: ReturnType<Awaited<ReturnType<typeof fleetWatchdogFixture>>["host"]["harness"]["runService"]> | undefined;
     try {
       const fixture = await fleetWatchdogFixture(0, true);
@@ -5224,8 +5224,8 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       service?.controller.abort();
       await service?.done;
       clock.mockRestore();
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
+      if (originalGhPath === undefined) delete process.env.BB_COLLAB_GH_PATH;
+      else process.env.BB_COLLAB_GH_PATH = originalGhPath;
       rmSync(bin, { recursive: true, force: true });
     }
   });
@@ -8924,8 +8924,8 @@ exit 1
     writeFileSync(queue, '[{"number":305,"labels":[{"name":"queue:startable"}]}]');
     writeFileSync(gh, `#!/bin/sh\nprintf 'call\\n' >> "${calls}"\nif [ "$1" = api ]; then printf '['; cat "${queue}"; printf ']\\n'; else cat "${queue}"; fi\n`);
     chmodSync(gh, 0o755);
-    const originalPath = process.env.PATH;
-    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const originalGhPath = process.env.BB_COLLAB_GH_PATH;
+    process.env.BB_COLLAB_GH_PATH = gh;
     const clock = vi.spyOn(Date, "now").mockReturnValue(100);
     try {
       const fixture = await fleetWatchdogFixture(1, true, 1);
@@ -8978,8 +8978,8 @@ exit 1
       }, { startAtMs: 110, endAtMs: 200 }).laneSlotUtilization.status).toBe("unknown");
     } finally {
       clock.mockRestore();
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
+      if (originalGhPath === undefined) delete process.env.BB_COLLAB_GH_PATH;
+      else process.env.BB_COLLAB_GH_PATH = originalGhPath;
       rmSync(bin, { recursive: true, force: true });
     }
   });
@@ -14941,8 +14941,8 @@ if [ "$1" != "issue" ] || [ "$2" != "view" ] || [ "$3" != "1" ] || [ "\${GH_HOST
 printf '%s\\n' '${external}'
 `);
     chmodSync(gh, 0o755);
-    const originalPath = process.env.PATH;
-    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const originalGhPath = process.env.BB_COLLAB_GH_PATH;
+    process.env.BB_COLLAB_GH_PATH = gh;
     try {
       const evidence = {
         kind: "github_issue_unchanged" as const,
@@ -14964,8 +14964,8 @@ printf '%s\\n' '${external}'
       expect(readFileSync(calls, "utf8")).toContain("issue view 1 --repo example/project");
       expect(db.prepare("SELECT projection_state FROM external_work_refs").get()).toEqual({ projection_state: "pending" });
     } finally {
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
+      if (originalGhPath === undefined) delete process.env.BB_COLLAB_GH_PATH;
+      else process.env.BB_COLLAB_GH_PATH = originalGhPath;
       rmSync(bin, { recursive: true, force: true });
     }
   });
@@ -16609,8 +16609,8 @@ if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "401" ]; then printf '%s\
 exit 1
 `);
     chmodSync(gh, 0o755);
-    const originalPath = process.env.PATH;
-    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    const originalGhPath = process.env.BB_COLLAB_GH_PATH;
+    process.env.BB_COLLAB_GH_PATH = gh;
     try {
       const host = await loadedHost("proj_github_backfill_cli");
       const db = host.bb.storage.database();
@@ -16633,8 +16633,8 @@ exit 1
       expect(db.prepare("SELECT issue_number FROM external_work_refs WHERE project_id = ? ORDER BY issue_number").all("proj_github_backfill_cli")).toEqual([{ issue_number: 401 }]);
       expect(db.prepare("SELECT state FROM work_item_github_backfills WHERE project_id = ?").get("proj_github_backfill_cli")).toEqual({ state: "degraded" });
     } finally {
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
+      if (originalGhPath === undefined) delete process.env.BB_COLLAB_GH_PATH;
+      else process.env.BB_COLLAB_GH_PATH = originalGhPath;
       rmSync(bin, { recursive: true, force: true });
     }
   });
