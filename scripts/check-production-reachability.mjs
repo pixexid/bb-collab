@@ -143,6 +143,10 @@ function isTestFile(path) {
   return testPath.test(path);
 }
 
+function isImportBinding(node) {
+  return Boolean(ts.findAncestor(node.parent, (ancestor) => ts.isImportDeclaration(ancestor)));
+}
+
 function helperConventionApplies(path, names) {
   return helperPath.test(path) && names.every((name) => helperName.test(name));
 }
@@ -326,7 +330,7 @@ function analyzeRepository(rootDirectory = scriptRoot, explicitFiles = null) {
   for (const sourceFile of sourceFiles) {
     const path = relativePath(root, sourceFile.fileName);
     ts.forEachChild(sourceFile, function inspect(node) {
-      if (ts.isIdentifier(node) && !declarationName(node)) {
+      if (ts.isIdentifier(node) && !declarationName(node) && !isImportBinding(node)) {
         const symbol = checker.getSymbolAtLocation(node);
         if (symbol) {
           const record = exportRecords.get(symbolKey(resolveAlias(checker, symbol)));
