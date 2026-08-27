@@ -8792,7 +8792,7 @@ function applyStrandedExecutionAttemptClosure(
   const configRevision = requireConfig(db, request, workItemConfigRevision);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
-  requireRoleActorBinding(db, request, true);
+  requireRoleActorBinding(db, request, false);
   const workItem = requireWorkItem(db, request, configRevision, undefined, true);
   if (workItem.lifecycle_state !== "in_progress") {
     throw refusal("WORK_ITEM_STATE_INVALID", "stranded execution closure requires an in-progress work item");
