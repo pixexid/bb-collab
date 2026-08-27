@@ -1712,6 +1712,109 @@ describe("GH-733 authoritative WorkItem wait role identity", () => {
   });
 });
 
+describe("GH-746 authenticated native dispatch role identity", () => {
+  async function dispatchFixture() {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    fixture.db.prepare("DELETE FROM actor_receipts WHERE actor_kind = 'role'").run();
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM actor_receipts WHERE actor_kind = 'role'").get()).toEqual({ count: 0 });
+    return fixture;
+  }
+
+  function latestAttempt(fixture: Awaited<ReturnType<typeof dispatchFixture>>) {
+    return fixture.db.prepare(
+      "SELECT execution_attempt_id, thread_id, role_id, role_generation, state FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item' ORDER BY attempt_ordinal DESC LIMIT 1",
+    ).get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string; thread_id: string | null; role_id: string | null; role_generation: number | null; state: string };
+  }
+
+  it("persists the current orchestrator through actual dispatch_lane and binds its exact wait with zero role receipts", async () => {
+    const fixture = await dispatchFixture();
+    const dispatched = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2, { idempotencyKey: "gh746-native-write" }),
+      spawn: dispatchSpawn(fixture.orchestratorThreadId),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(dispatched).toMatchObject({ outcome: "OK" });
+    const attempt = latestAttempt(fixture);
+    expect(attempt).toMatchObject({ thread_id: "lane-1", role_id: "project-orchestrator", role_generation: 1, state: "running" });
+    fixture.addNativeLane(attempt.thread_id!, "idle");
+    const revision = (fixture.db.prepare("SELECT resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID) as { resource_revision: number }).resource_revision;
+    const waitRequest = transitionRequest(fixture.fenceToken, "blocked", revision, {
+      idempotencyKey: "gh746-native-write-wait",
+      roleId: "project-orchestrator",
+      expectedGeneration: 1,
+      workItemWait: githubPrChecksWait(attempt.execution_attempt_id, { waitingThreadId: attempt.thread_id! }),
+      githubPrObservation: githubPrObservation({ checksSummary: "success" }),
+    });
+    expect(applyFixtureMutation(fixture.db, waitRequest, null, null, null, null, null, null, true)).toMatchObject({ outcome: "OK", registration: "already_satisfied" });
+    expect(await fixture.host.harness.callAgentTool("register_external_wait", { request: waitRequest }, { projectId: PROJECT_ID, threadId: attempt.thread_id! })).toBe("already_satisfied");
+  });
+
+  it.each([
+    ["non-holder", "thread-not-a-holder", {}, "ROLE_HOLDER_MISMATCH"],
+    ["role mismatch", "thread-fleet-orchestrator", { roleId: "director" as const }, "ROLE_HOLDER_MISMATCH"],
+    ["generation mismatch", "thread-fleet-orchestrator", { expectedGeneration: 2 }, "ROLE_GENERATION_STALE"],
+  ] as const)("refuses %s native context before prepare or spawn", async (_name, threadId, overrides, expected) => {
+    const fixture = await dispatchFixture();
+    const before = exportFoundation(fixture.db, PROJECT_ID);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2, { idempotencyKey: `gh746-${_name}`, ...overrides }),
+      spawn: dispatchSpawn(fixture.orchestratorThreadId),
+    }, { projectId: PROJECT_ID, threadId }) as string);
+    expect(result.outcome).toBe(expected);
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("refuses a retired predecessor and leaves canonical state unchanged", async () => {
+    const fixture = await dispatchFixture();
+    advanceOrchestrator(fixture.db, fixture.fenceToken);
+    fixture.db.prepare("DELETE FROM actor_receipts WHERE actor_kind = 'role'").run();
+    const before = exportFoundation(fixture.db, PROJECT_ID);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2, { idempotencyKey: "gh746-retired" }),
+      spawn: dispatchSpawn(fixture.orchestratorThreadId),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result.outcome).toBe("ROLE_HOLDER_MISMATCH");
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("keeps RPC, direct apply fields, profile text, and spawned thread payload role-less", async () => {
+    const fixture = await dispatchFixture();
+    const result = await fixture.host.harness.callRpc("dispatchLane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2, {
+        idempotencyKey: "gh746-background-roleless",
+        roleId: "project-orchestrator",
+        expectedGeneration: 1,
+        workAttempt: { laneId: "payload-lane", threadId: ROLE_THREAD_ID, assignmentKind: "write", requestedProfile: ROLE_PROFILE },
+      }),
+      spawn: dispatchSpawn(fixture.orchestratorThreadId),
+    });
+    expect(result).toMatchObject({ outcome: "OK" });
+    expect(latestAttempt(fixture)).toMatchObject({ thread_id: "lane-1", role_id: null, role_generation: null, state: "running" });
+
+    const direct = await dispatchFixture();
+    expect(applyFixtureMutation(direct.db, transitionRequest(direct.fenceToken, "in_progress", 2, {
+      idempotencyKey: "gh746-direct-apply-roleless",
+      roleId: "project-orchestrator",
+      expectedGeneration: 1,
+      workAttempt: { laneId: "direct-payload-lane", threadId: ROLE_THREAD_ID, assignmentKind: "write", requestedProfile: ROLE_PROFILE },
+    }))).toMatchObject({ outcome: "OK" });
+    expect(latestAttempt(direct)).toMatchObject({ thread_id: ROLE_THREAD_ID, role_id: null, role_generation: null, state: "running" });
+  });
+
+  it("refuses a foreign-project authenticated context without mutation", async () => {
+    const fixture = await dispatchFixture();
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2, { idempotencyKey: "gh746-foreign-project" });
+    const before = exportFoundation(fixture.db, PROJECT_ID);
+    expect(applyFixtureMutation(fixture.db, request, null, null, null, null, null, null, false, {
+      projectId: FOREIGN_PROJECT_ID,
+      threadId: fixture.orchestratorThreadId,
+    })).toMatchObject({ outcome: "ROLE_CONTEXT_FOREIGN", attempted: 0, verified: 0 });
+    expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+  });
+});
+
 describe("GH-658 scheduled PR observer integration", () => {
   function installPullRequestGh(stateFile: string, callsFile: string, degraded = false) {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-pr-observer-gh-"));
@@ -6650,7 +6753,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
   });
 
   it("dispatches a local review only with exact native base, candidate, server, and ancestry proof", async () => {
-    const fixture = await assignmentFixture({ withoutGithubIssues: true });
+    const fixture = await assignmentFixture({ withoutGithubIssues: false, targetRemoteUrl: `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git` });
     activateReviewer(fixture.db, fixture.fenceToken);
     const frozenBrief = "Review the exact local candidate and return one qualified verdict.";
     const checkoutPath = "/workspace/worktrees/local-review";
@@ -6701,6 +6804,8 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
         workingTree: { deletions: 0, files: [], hasUncommittedChanges: false, insertions: 0, lineStatsComplete: true, state: "committed_unmerged" },
       },
     })) as never);
+    fixture.db.prepare("DELETE FROM actor_receipts WHERE actor_kind = 'role'").run();
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM actor_receipts WHERE actor_kind = 'role'").get()).toEqual({ count: 0 });
     const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
       request: transitionRequest(fixture.fenceToken, undefined, 4, { idempotencyKey: "local-review-dispatch", workAttempt: reviewAttempt }),
       spawn: dispatchSpawn(ROLE_THREAD_ID, { environment: { type: "reuse", environmentId: ROLE_ENVIRONMENT_ID } }),
@@ -6708,11 +6813,16 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(result).toMatchObject({ outcome: "OK" });
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
     expect(fixture.db.prepare(
-      `SELECT review_role_requirement_id, review_role_id, review_role_generation,
+      `SELECT execution_attempt_id, thread_id, role_id, role_generation,
+              review_role_requirement_id, review_role_id, review_role_generation,
               review_frozen_brief_version, review_frozen_brief_content, review_frozen_brief_digest,
               review_return_path_json, dispatch_input_digest, requested_profile_digest, repo_target_id
          FROM execution_attempts WHERE project_id = ? AND work_item_id = ? ORDER BY attempt_ordinal DESC LIMIT 1`,
     ).get(PROJECT_ID, WORK_ITEM_ID)).toEqual({
+      execution_attempt_id: expect.any(String),
+      thread_id: "local-review-native",
+      role_id: "project-orchestrator",
+      role_generation: 1,
       review_role_requirement_id: "reviewer-v1",
       review_role_id: "independent-reviewer",
       review_role_generation: 2,
@@ -6724,6 +6834,20 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       requested_profile_digest: ROLE_PROFILE_DIGEST,
       repo_target_id: TARGET_ID,
     });
+    const attempt = fixture.db.prepare(
+      "SELECT execution_attempt_id, thread_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? ORDER BY attempt_ordinal DESC LIMIT 1",
+    ).get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string; thread_id: string };
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, projectId: PROJECT_ID, status: "idle" })) as never);
+    const revision = (fixture.db.prepare("SELECT resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID) as { resource_revision: number }).resource_revision;
+    const waitRequest = transitionRequest(fixture.fenceToken, "blocked", revision, {
+      idempotencyKey: "local-review-exact-wait",
+      roleId: "project-orchestrator",
+      expectedGeneration: 1,
+      workItemWait: githubPrChecksWait(attempt.execution_attempt_id, { waitingThreadId: attempt.thread_id }),
+      githubPrObservation: githubPrObservation({ checksSummary: "success" }),
+    });
+    expect(applyFixtureMutation(fixture.db, waitRequest, null, null, null, null, null, null, true)).toMatchObject({ outcome: "OK", registration: "already_satisfied" });
+    expect(await fixture.host.harness.callAgentTool("register_external_wait", { request: waitRequest }, { projectId: PROJECT_ID, threadId: attempt.thread_id })).toBe("already_satisfied");
     const attemptEvent = fixture.db.prepare(
       "SELECT event_json FROM state_events WHERE project_id = ? AND event_type = 'work_item_attempt_armed' ORDER BY event_sequence DESC LIMIT 1",
     ).get(PROJECT_ID) as { event_json: string };

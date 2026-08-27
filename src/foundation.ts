@@ -3,6 +3,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import type Database from "better-sqlite3";
 import { z } from "zod";
+import { readRoleHolderStates } from "./awareness.js";
 import type { CheckoutDivergence } from "./checkout-divergence.js";
 import { maintainedIssueBody } from "./github-issue-brief.js";
 
@@ -21,6 +22,7 @@ const PREVIOUS_SCHEMA_VERSION = 32;
 export const ROLE_IDS = ["director", "project-orchestrator", "worker", "independent-reviewer"] as const;
 export const ROLE_GENERATION_EVENT_TYPES = ["role_generation_created", "role_generation_succeeded"] as const;
 export type RoleGenerationEventType = (typeof ROLE_GENERATION_EVENT_TYPES)[number];
+export type AuthenticatedNativeCaller = Readonly<{ projectId: string; threadId: string }>;
 
 export function roleGenerationEventType(generation: number, predecessorGeneration: number | null): RoleGenerationEventType {
   if (generation === 1 && predecessorGeneration === null) return "role_generation_created";
@@ -9256,6 +9258,7 @@ function applyWorkItemTransition(
   digest: string,
   githubObservation: GitHubIssueSnapshot | null,
   githubPrObservation: GithubPrObservation | undefined,
+  authenticatedNativeCaller: AuthenticatedNativeCaller | null,
 ): FoundationResult {
   if (request.threadlessPreparedClosure !== undefined) return applyThreadlessPreparedClosure(db, request, digest);
   if (request.strandedExecutionAttemptClosure !== undefined) return applyStrandedExecutionAttemptClosure(db, request, digest);
@@ -9275,11 +9278,30 @@ function applyWorkItemTransition(
   // The watchdog uses a verified plugin actor rather than a role holder; role actors
   // must still prove current standing on every revalidation, including after stop.
   const roleActor = requireRoleActorBinding(db, request, false);
-  if (request.workAttempt && roleActor && request.roleId !== undefined && request.roleId !== roleActor.roleId) {
-    throw refusal("ROLE_HOLDER_MISMATCH", "work attempt role does not match the verified actor receipt");
+  let nativeRole: { roleId: "director" | "project-orchestrator"; roleGeneration: number } | null = null;
+  if (request.workAttempt && authenticatedNativeCaller && !committedDispatchIntent) {
+    if (authenticatedNativeCaller.projectId !== request.projectId) {
+      throw refusal("ROLE_CONTEXT_FOREIGN", "authenticated native caller belongs to a different project");
+    }
+    const holders = readRoleHolderStates(db).filter((holder) =>
+      holder.project_id === request.projectId &&
+      (holder.domain_id ?? "default") === (request.domainId ?? "default") &&
+      holder.thread_id === authenticatedNativeCaller.threadId &&
+      (holder.role_id === "director" || holder.role_id === "project-orchestrator"));
+    if (holders.length !== 1) throw refusal("ROLE_HOLDER_MISMATCH", "authenticated native caller is not the unique current director or project-orchestrator holder");
+    nativeRole = { roleId: holders[0]!.role_id as "director" | "project-orchestrator", roleGeneration: holders[0]!.role_generation };
   }
-  if (request.workAttempt && roleActor && request.expectedGeneration !== null && request.expectedGeneration !== roleActor.roleGeneration) {
-    throw refusal("ROLE_GENERATION_STALE", "work attempt generation does not match the verified actor receipt");
+  if (roleActor && nativeRole && (roleActor.roleId !== nativeRole.roleId || roleActor.roleGeneration !== nativeRole.roleGeneration)) {
+    throw refusal("ROLE_HOLDER_MISMATCH", "verified actor receipt and authenticated native caller disagree");
+  }
+  const attemptRole = nativeRole ?? roleActor;
+  const writeAttemptRole = attemptRole;
+  const reviewAttemptRole = attemptRole;
+  if (request.workAttempt && attemptRole && request.roleId !== undefined && request.roleId !== attemptRole.roleId) {
+    throw refusal("ROLE_HOLDER_MISMATCH", "work attempt role does not match the authoritative role binding");
+  }
+  if (request.workAttempt && attemptRole && request.expectedGeneration !== null && request.expectedGeneration !== attemptRole.roleGeneration) {
+    throw refusal("ROLE_GENERATION_STALE", "work attempt generation does not match the authoritative role binding");
   }
   let nextState = request.lifecycleState;
   let configContinuation: WorkItemDispatchConfigProof | null = null;
@@ -9578,8 +9600,8 @@ function applyWorkItemTransition(
         repoTargetId: workItem.repo_target_id,
         laneId: workAttempt.laneId,
         threadId: null,
-        roleId: roleActor?.roleId ?? null,
-        roleGeneration: roleActor?.roleGeneration ?? null,
+        roleId: reviewAttemptRole?.roleId ?? null,
+        roleGeneration: reviewAttemptRole?.roleGeneration ?? null,
         leaseOwnerThreadId: null,
         assignmentKind: "review",
         requestedProfile: requireWorkAttemptProfile(workAttempt),
@@ -9646,8 +9668,8 @@ function applyWorkItemTransition(
       repoTargetId: workItem.repo_target_id,
       laneId: workAttempt.laneId,
       threadId: workAttempt.threadId ?? null,
-      roleId: roleActor?.roleId ?? null,
-      roleGeneration: roleActor?.roleGeneration ?? null,
+      roleId: writeAttemptRole?.roleId ?? null,
+      roleGeneration: writeAttemptRole?.roleGeneration ?? null,
       leaseOwnerThreadId: workAttempt.threadId ?? null,
       assignmentKind: workAttempt.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt),
@@ -9852,8 +9874,8 @@ function applyWorkItemTransition(
       repoTargetId: workItem.repo_target_id,
       laneId: workAttempt!.laneId,
       threadId: workAttempt!.threadId ?? null,
-      roleId: roleActor?.roleId ?? null,
-      roleGeneration: roleActor?.roleGeneration ?? null,
+      roleId: writeAttemptRole?.roleId ?? null,
+      roleGeneration: writeAttemptRole?.roleGeneration ?? null,
       leaseOwnerThreadId: workAttempt!.threadId ?? null,
       assignmentKind: workAttempt!.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt!),
@@ -9884,8 +9906,8 @@ function applyWorkItemTransition(
         repoTargetId: workItem.repo_target_id,
         laneId: workAttempt.laneId,
         threadId: workAttempt.threadId ?? null,
-        roleId: roleActor?.roleId ?? null,
-        roleGeneration: roleActor?.roleGeneration ?? null,
+        roleId: reviewAttemptRole?.roleId ?? null,
+        roleGeneration: reviewAttemptRole?.roleGeneration ?? null,
         leaseOwnerThreadId: workAttempt.threadId ?? null,
         assignmentKind: "review",
         requestedProfile: requireWorkAttemptProfile(workAttempt),
@@ -11329,6 +11351,7 @@ export function applyAuthorizedMutation(
   githubIssueReader: GitHubIssueReader | null = null,
   executionAttemptEvidenceReader: ExecutionAttemptEvidenceReader | null = null,
   dryRun = false,
+  authenticatedNativeCaller: AuthenticatedNativeCaller | null = null,
 ): FoundationResult {
   let request: ApplyRequest;
   try {
@@ -11338,7 +11361,7 @@ export function applyAuthorizedMutation(
     return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error) });
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun, authenticatedNativeCaller);
 }
 
 export async function applyAuthorizedMutationAsync(
@@ -11381,6 +11404,7 @@ export function applyFixtureMutation(
   githubIssueReader: GitHubIssueReader | null = null,
   executionAttemptEvidenceReader: ExecutionAttemptEvidenceReader | null = null,
   dryRun = false,
+  authenticatedNativeCaller: AuthenticatedNativeCaller | null = null,
 ): FoundationResult {
   let request: ApplyRequest;
   try {
@@ -11453,7 +11477,7 @@ export function applyFixtureMutation(
         case "work_item_create":
           return applyWorkItemCreate(db, request, digest);
         case "work_item_transition":
-          return applyWorkItemTransition(db, request, digest, githubObservation, request.githubPrObservation);
+          return applyWorkItemTransition(db, request, digest, githubObservation, request.githubPrObservation, authenticatedNativeCaller);
         case "github_pr_observation_record":
           return applyGithubPrObservation(db, request, digest);
         case "execution_attempt_terminal_report":
