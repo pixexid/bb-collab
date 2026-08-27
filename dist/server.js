@@ -17383,10 +17383,10 @@ var terminalReportSchema = external_exports.object({
   nativeEventSeq: external_exports.number().int().positive(),
   nativeTurnId: id,
   evidence: external_exports.array(terminalEvidenceSchema).min(1).max(64),
-  reportedAtMs: external_exports.number().int().nonnegative(),
-  receiptEventId: id,
-  receiptEventSeq: external_exports.number().int().positive(),
-  receivedAtMs: external_exports.number().int().nonnegative()
+  reportedAtMs: external_exports.number().int().nonnegative().optional(),
+  receiptEventId: id.optional(),
+  receiptEventSeq: external_exports.number().int().positive().optional(),
+  receivedAtMs: external_exports.number().int().nonnegative().optional()
 }).strict();
 var interruptionEvidenceSchema = external_exports.object({
   projectId: id,
@@ -17555,6 +17555,38 @@ var reviewFactsSchema = external_exports.object({
   authors: external_exports.array(gitIdentitySchema).min(1).max(64),
   committers: external_exports.array(gitIdentitySchema).min(1).max(64)
 }).strict();
+function threadlessPreparedReplayProbeDigest(input) {
+  return sha256(canonicalJson({
+    kind: "threadless-prepared-closure-replay-probe",
+    ...input
+  }));
+}
+function buildTerminalReport(input) {
+  return {
+    receiptVersion: 1,
+    outcome: input.outcome,
+    projectId: input.evidence.projectId,
+    assignmentId: input.evidence.assignmentId,
+    executionAttemptId: input.evidence.executionAttemptId,
+    workItemId: input.evidence.workItemId,
+    roleId: input.evidence.roleId,
+    roleGeneration: input.evidence.roleGeneration,
+    repoTargetId: input.evidence.repoTargetId,
+    environmentId: input.evidence.environmentId,
+    threadId: input.evidence.threadId,
+    branchName: input.evidence.branchName,
+    baseSha: input.evidence.baseSha,
+    candidateSha: input.evidence.candidateSha,
+    nativeReceiptDigest: input.evidence.nativeReceiptDigest,
+    actualProfileDigest: input.evidence.actualProfileDigest,
+    candidateObservationDigest: input.evidence.candidateObservationDigest,
+    reasonCode: input.reasonCode,
+    nativeEventId: input.evidence.nativeEventId,
+    nativeEventSeq: input.evidence.nativeEventSeq,
+    nativeTurnId: input.evidence.nativeTurnId,
+    evidence: input.evidence.evidence
+  };
+}
 function stringField(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 256 ? value : null;
 }
@@ -18503,6 +18535,14 @@ function requireTarget(db, projectId, configRevision, targetId, allowStaleTarget
   if (sameProject && allowStaleTarget) return sameProject;
   if (sameProject) throw refusal("REPO_TARGET_STALE", "repository target is not registered in the expected config revision");
   throw refusal("REPO_TARGET_FOREIGN", "repository target is not registered for this project");
+}
+function checkMutationIdempotency(db, request) {
+  try {
+    return checkIdempotency(db, request, mutationRequestDigest(request));
+  } catch (error48) {
+    if (isRefusal(error48)) return refusalResult(request.projectId, error48.data);
+    throw error48;
+  }
 }
 function checkIdempotency(db, request, digest2) {
   const row = asRow(
@@ -21619,6 +21659,30 @@ function applyThreadlessPreparedClosure(db, request, digest2) {
   if (dispatchRefusal.reference !== `mutation:${preparationEvent.idempotency_key}` || !originalReceipt || originalReceipt.operation_class !== "work_item_transition" || originalReceipt.committed_event_sequence !== preparation.eventSequence || closure.dispatchMarker !== `[dispatch:${preparationEvent.idempotency_key}]`) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure dispatch-refusal evidence is not the exact durable intent receipt");
   }
+  const replayRequestDigest = threadlessPreparedReplayProbeDigest({
+    projectId: request.projectId,
+    workItemId: workItem.work_item_id,
+    executionAttemptId: attempt.execution_attempt_id,
+    idempotencyKey: preparationEvent.idempotency_key
+  });
+  const replayProbe = {
+    projectId: request.projectId,
+    operationClass: "work_item_transition",
+    idempotencyKey: preparationEvent.idempotency_key
+  };
+  let replayConflictObserved = false;
+  try {
+    if (checkIdempotency(db, replayProbe, replayRequestDigest) !== null) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure replay probe did not conflict");
+    }
+  } catch (error48) {
+    if (!isRefusal(error48)) throw refusal("CANONICAL_STORE_UNAVAILABLE", "thread-less closure replay probe could not read the durable idempotency receipt");
+    if (error48.data.code !== "IDEMPOTENCY_KEY_CONFLICT") throw error48;
+    replayConflictObserved = true;
+  }
+  if (!replayConflictObserved) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure replay probe did not conflict");
+  }
   const expectedDispatchRefusal = sha256(canonicalJson({
     kind: "dispatch_refusal",
     projectId: request.projectId,
@@ -21630,7 +21694,7 @@ function applyThreadlessPreparedClosure(db, request, digest2) {
   if (dispatchRefusal.digest !== expectedDispatchRefusal) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure dispatch-refusal evidence is not exact");
   }
-  if (replayConflict.reference !== `replay:${preparationEvent.idempotency_key}` || replayConflict.requestDigest === originalReceipt.request_digest || replayConflict.digest !== sha256(canonicalJson({
+  if (replayConflict.reference !== `replay:${preparationEvent.idempotency_key}` || replayConflict.requestDigest !== replayRequestDigest || replayConflict.digest !== sha256(canonicalJson({
     kind: "replay_conflict",
     projectId: request.projectId,
     workItemId: workItem.work_item_id,
@@ -26767,7 +26831,17 @@ var threadlessPreparedClosureInputSchema = external_exports.object({
   request: applyRequestSchema,
   correctionId: external_exports.string().trim().min(1).max(256),
   dispatchIntentIdempotencyKey: external_exports.string().trim().min(1).max(256),
-  replayRequestDigest: external_exports.string().regex(/^[0-9a-f]{64}$/u)
+  replayRequestDigest: external_exports.string().regex(/^[0-9a-f]{64}$/u).optional()
+}).strict();
+var terminalReportBuilderInputSchema = external_exports.object({
+  projectId: projectIdSchema,
+  workItemId: sidebarThreadIdSchema,
+  executionAttemptId: sidebarThreadIdSchema,
+  outcome: external_exports.enum(["DONE", "BLOCKED"]),
+  reasonCode: sidebarThreadIdSchema,
+  nativeEventId: sidebarThreadIdSchema,
+  nativeEventSeq: external_exports.number().int().positive(),
+  nativeTurnId: sidebarThreadIdSchema
 }).strict();
 var dispatchEnvironmentSchema = external_exports.union([
   external_exports.object({ type: external_exports.literal("project-default") }).strict(),
@@ -27342,7 +27416,7 @@ function dispatchInventoryEvidence(threads, projectId, executionAttemptId, dispa
 async function closeThreadlessPreparedAttempt(bb, db, input) {
   const parsed = threadlessPreparedClosureInputSchema.safeParse(input);
   if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "threadless-prepared-closure", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
-  const { request, correctionId, dispatchIntentIdempotencyKey, replayRequestDigest } = parsed.data;
+  const { request, correctionId, dispatchIntentIdempotencyKey } = parsed.data;
   if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
   const existing = db.prepare(
     "SELECT request_digest, outcome_json, committed_event_sequence, operation_class FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?"
@@ -27393,9 +27467,15 @@ async function closeThreadlessPreparedAttempt(bb, db, input) {
   const originalReceipt = db.prepare(
     "SELECT request_digest, committed_event_sequence FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?"
   ).get(request.projectId, dispatchIntentIdempotencyKey);
-  if (!originalReceipt || originalReceipt.committed_event_sequence !== preparation.event_sequence || originalReceipt.request_digest === replayRequestDigest) {
-    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure requires a distinct recorded replay-conflict digest" };
+  if (!originalReceipt || originalReceipt.committed_event_sequence !== preparation.event_sequence) {
+    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure requires the exact durable dispatch intent receipt" };
   }
+  const replayRequestDigest = threadlessPreparedReplayProbeDigest({
+    projectId: request.projectId,
+    workItemId: request.workItemId,
+    executionAttemptId: request.executionAttemptId,
+    idempotencyKey: dispatchIntentIdempotencyKey
+  });
   return serializeDispatchRecovery(request, async () => {
     let threads;
     try {
@@ -27651,6 +27731,13 @@ function nativeEventData(event) {
 function liveTerminalReader(sdk, db, request) {
   const report = request.terminalReport;
   if (!report || !request.workItemId || !request.executionAttemptId) return Promise.resolve(evidenceUnavailable(request.projectId, "terminal report identity is unavailable"));
+  return liveTerminalEvidenceReader(sdk, db, {
+    projectId: request.projectId,
+    workItemId: request.workItemId,
+    executionAttemptId: request.executionAttemptId
+  }, report);
+}
+function liveTerminalEvidenceReader(sdk, db, request, report) {
   const workItemId = request.workItemId;
   const executionAttemptId = request.executionAttemptId;
   const attempt = db.prepare("SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(request.projectId, request.executionAttemptId);
@@ -27774,6 +27861,29 @@ function liveTerminalReader(sdk, db, request) {
       return evidenceUnavailable(request.projectId, `authoritative terminal evidence unavailable: ${String(error48)}`);
     }
   })();
+}
+async function buildLiveTerminalReport(bb, db, input, callerThreadId) {
+  if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: input.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
+  const attempt = db.prepare(
+    "SELECT thread_id FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ? AND work_item_id = ?"
+  ).get(input.projectId, input.executionAttemptId, input.workItemId);
+  if (!attempt || attempt.thread_id !== callerThreadId) {
+    return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: input.projectId, expected: 1, attempted: 0, verified: 0, message: "terminal report builder caller thread does not match the canonical attempt" };
+  }
+  const resolved = await liveTerminalEvidenceReader(bb.sdk, db, input, {
+    nativeEventId: input.nativeEventId,
+    nativeEventSeq: input.nativeEventSeq,
+    nativeTurnId: input.nativeTurnId
+  });
+  if ("outcome" in resolved) return resolved;
+  return buildTerminalReport({ evidence: resolved.terminal({
+    projectId: input.projectId,
+    workItemId: input.workItemId,
+    executionAttemptId: input.executionAttemptId,
+    nativeEventId: input.nativeEventId,
+    nativeEventSeq: input.nativeEventSeq,
+    nativeTurnId: input.nativeTurnId
+  }), outcome: input.outcome, reasonCode: input.reasonCode });
 }
 async function liveZeroRealWriterGuard(bb, db, projectId, workItemId) {
   const active = db.prepare(
@@ -27904,6 +28014,17 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
   const parsed = applyRequestSchema.safeParse(input);
   if (parsed.success && parsed.data.threadlessPreparedClosure !== void 0 && !allowThreadlessPreparedClosure) {
     return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less prepared closure is accepted only through the governed live inventory seam" };
+  }
+  if (parsed.success && db) {
+    let request = null;
+    try {
+      request = parseApplyRequest(input);
+    } catch {
+    }
+    if (request) {
+      const replay = checkMutationIdempotency(db, request);
+      if (replay) return replay;
+    }
   }
   if (parsed.success && terminalizationPolicy === "stop-active") {
     const authorized = applyAuthorizedMutation(db, input, githubAdapter, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, null, true);
@@ -31337,6 +31458,16 @@ ${thread.titleFallback ?? ""}`);
     }
   });
   bb.agents.registerTool({
+    name: "build_terminal_report",
+    description: "Build a terminal report from the exact native completion and canonical attempt.",
+    instructions: "Use the returned JSON as terminalReport in the execution_attempt_terminal_report request. The builder supplies the native environment, authoritative digests, and evidence; submission owns receipt timing and identity. Canonical digests are defined by canonical JSON \u2014 sorted keys, JSON.stringify, no trailing newline. Hand-computed digests (e.g. jq | shasum) silently diverge and will be refused; if you must compute one, strip the trailing newline (jq -j, or printf %s).",
+    parameters: terminalReportBuilderInputSchema,
+    async execute(input, context) {
+      if (input.projectId !== context.projectId) throw new Error("projectId must exactly match the current thread project");
+      return JSON.stringify(await buildLiveTerminalReport(bb, db, input, context.threadId));
+    }
+  });
+  bb.agents.registerTool({
     name: "dispatch_lane",
     description: "Dispatch one writing lane through the canonical registration seam.",
     instructions: "Use this instead of spawning a lane directly. The request projectId must match the current thread project.",
@@ -31380,7 +31511,7 @@ ${thread.titleFallback ?? ""}`);
       return registration === "already_satisfied" ? "already_satisfied" : registration === "registered" ? "registered" : "refused";
     }
   });
-  bb.agents.configure(() => ({ tools: ["dispatch_lane", "close_threadless_prepared_attempt", "send_to_operator", "register_external_wait"], skills: [] }));
+  bb.agents.configure(() => ({ tools: ["build_terminal_report", "dispatch_lane", "close_threadless_prepared_attempt", "send_to_operator", "register_external_wait"], skills: [] }));
   bb.cli.register({
     name: "collab",
     summary: "Inspect the bb-collab foundation and guarded conformance boundary",

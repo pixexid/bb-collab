@@ -2816,10 +2816,10 @@ const terminalReportSchema = z
     nativeEventSeq: z.number().int().positive(),
     nativeTurnId: id,
     evidence: z.array(terminalEvidenceSchema).min(1).max(64),
-    reportedAtMs: z.number().int().nonnegative(),
-    receiptEventId: id,
-    receiptEventSeq: z.number().int().positive(),
-    receivedAtMs: z.number().int().nonnegative(),
+    reportedAtMs: z.number().int().nonnegative().optional(),
+    receiptEventId: id.optional(),
+    receiptEventSeq: z.number().int().positive().optional(),
+    receivedAtMs: z.number().int().nonnegative().optional(),
   })
   .strict();
 const interruptionEvidenceSchema = z
@@ -3244,6 +3244,49 @@ export type AuthoritativeTerminalEvidence = {
   nativeTurnId: string;
   evidence: Array<{ kind: string; digest: string; ref: string }>;
 };
+
+export function threadlessPreparedReplayProbeDigest(input: {
+  projectId: string;
+  workItemId: string;
+  executionAttemptId: string;
+  idempotencyKey: string;
+}): string {
+  return sha256(canonicalJson({
+    kind: "threadless-prepared-closure-replay-probe",
+    ...input,
+  }));
+}
+
+export function buildTerminalReport(input: {
+  evidence: AuthoritativeTerminalEvidence;
+  outcome: "DONE" | "BLOCKED";
+  reasonCode: string;
+}): TerminalReport {
+  return {
+    receiptVersion: 1,
+    outcome: input.outcome,
+    projectId: input.evidence.projectId,
+    assignmentId: input.evidence.assignmentId,
+    executionAttemptId: input.evidence.executionAttemptId,
+    workItemId: input.evidence.workItemId,
+    roleId: input.evidence.roleId,
+    roleGeneration: input.evidence.roleGeneration,
+    repoTargetId: input.evidence.repoTargetId,
+    environmentId: input.evidence.environmentId,
+    threadId: input.evidence.threadId,
+    branchName: input.evidence.branchName,
+    baseSha: input.evidence.baseSha,
+    candidateSha: input.evidence.candidateSha,
+    nativeReceiptDigest: input.evidence.nativeReceiptDigest,
+    actualProfileDigest: input.evidence.actualProfileDigest,
+    candidateObservationDigest: input.evidence.candidateObservationDigest,
+    reasonCode: input.reasonCode,
+    nativeEventId: input.evidence.nativeEventId,
+    nativeEventSeq: input.evidence.nativeEventSeq,
+    nativeTurnId: input.evidence.nativeTurnId,
+    evidence: input.evidence.evidence,
+  };
+}
 
 export type AuthoritativeHistoricalInterruption = {
   projectId: string;
@@ -4644,6 +4687,15 @@ function requireTarget(
   if (sameProject && allowStaleTarget) return sameProject;
   if (sameProject) throw refusal("REPO_TARGET_STALE", "repository target is not registered in the expected config revision");
   throw refusal("REPO_TARGET_FOREIGN", "repository target is not registered for this project");
+}
+
+export function checkMutationIdempotency(db: SqliteDatabase, request: ApplyRequest): FoundationResult | null {
+  try {
+    return checkIdempotency(db, request, mutationRequestDigest(request));
+  } catch (error) {
+    if (isRefusal(error)) return refusalResult(request.projectId, error.data);
+    throw error;
+  }
 }
 
 function checkIdempotency(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult | null {
@@ -8447,6 +8499,30 @@ function applyThreadlessPreparedClosure(
   ) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure dispatch-refusal evidence is not the exact durable intent receipt");
   }
+  const replayRequestDigest = threadlessPreparedReplayProbeDigest({
+    projectId: request.projectId,
+    workItemId: workItem.work_item_id,
+    executionAttemptId: attempt.execution_attempt_id,
+    idempotencyKey: preparationEvent.idempotency_key,
+  });
+  const replayProbe = {
+    projectId: request.projectId,
+    operationClass: "work_item_transition" as const,
+    idempotencyKey: preparationEvent.idempotency_key,
+  } as ApplyRequest;
+  let replayConflictObserved = false;
+  try {
+    if (checkIdempotency(db, replayProbe, replayRequestDigest) !== null) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure replay probe did not conflict");
+    }
+  } catch (error) {
+    if (!isRefusal(error)) throw refusal("CANONICAL_STORE_UNAVAILABLE", "thread-less closure replay probe could not read the durable idempotency receipt");
+    if (error.data.code !== "IDEMPOTENCY_KEY_CONFLICT") throw error;
+    replayConflictObserved = true;
+  }
+  if (!replayConflictObserved) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure replay probe did not conflict");
+  }
   const expectedDispatchRefusal = sha256(canonicalJson({
     kind: "dispatch_refusal",
     projectId: request.projectId,
@@ -8460,7 +8536,7 @@ function applyThreadlessPreparedClosure(
   }
   if (
     replayConflict.reference !== `replay:${preparationEvent.idempotency_key}` ||
-    replayConflict.requestDigest === originalReceipt.request_digest ||
+    replayConflict.requestDigest !== replayRequestDigest ||
     replayConflict.digest !== sha256(canonicalJson({
       kind: "replay_conflict",
       projectId: request.projectId,
@@ -10791,7 +10867,7 @@ async function applyGithubIssueProjectionAsync(
 }
 
 type AssignmentIntent = z.infer<typeof assignmentIntentSchema>;
-type TerminalReport = z.infer<typeof terminalReportSchema>;
+export type TerminalReport = z.infer<typeof terminalReportSchema>;
 
 function requireAssignmentWritingCapacity(requirement: RoleRequirement, assignmentKind: AssignmentIntent["assignmentKind"]): void {
   if (assignmentKind === "write" && requirement.writingLaneCapacity === 0) {
