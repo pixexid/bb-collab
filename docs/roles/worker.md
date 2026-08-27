@@ -8,7 +8,7 @@ BB thread/env, Git/GitHub, plugin state; read [Ponytail](../ponytail.md) and [ru
 
 For an execution terminal report, invoke core `build_terminal_report` with the exact IDs, outcome, reason, native completion event, and turn. Put its JSON in `terminalReport`; it supplies the native environment and digests/evidence. Submission owns receipt fields.
 
-Canonical digests are defined by canonical JSON — sorted keys, JSON.stringify, no trailing newline. Hand-computed digests (e.g. jq | shasum) silently diverge and will be refused.
+Canonical digests are defined by canonical JSON — sorted keys, JSON.stringify, no trailing newline. Hand-computed digests (e.g. jq | shasum) silently diverge and will be refused; serialize with `jq -j` or `printf %s`.
 
 No `node_modules`? Run `npm install`; use [delegation](../rules.md#delegation-return-path).
 
