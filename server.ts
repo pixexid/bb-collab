@@ -2074,18 +2074,9 @@ function recoveryCallerRefusal(
   db: SqliteDatabase,
   projectId: string,
   callerThreadId: string,
-  actorReceiptId: string | null | undefined,
 ): FoundationResult | null {
-  if (!actorReceiptId) return { outcome: "ACTOR_RECEIPT_REQUIRED", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "stranded execution closure requires a current director or orchestrator actor receipt" };
-  const actor = db.prepare(
-    "SELECT actor_kind, subject_id, role_id, role_generation FROM actor_receipts WHERE project_id = ? AND receipt_id = ?",
-  ).get(projectId, actorReceiptId) as { actor_kind: string; subject_id: string; role_id: string | null; role_generation: number | null } | undefined;
-  if (!actor) return { outcome: "ACTOR_RECEIPT_UNKNOWN", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "recovery actor receipt is not known for this project" };
-  if (actor.actor_kind !== "role" || !["director", "project-orchestrator"].includes(actor.role_id ?? "")) {
-    return { outcome: "ROLE_HOLDER_MISMATCH", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "stranded execution closure requires the current director or project-orchestrator seat" };
-  }
-  const holder = (readRoleHolderStates(db) as unknown as Array<Record<string, unknown>>).find((candidate) =>
-    candidate.project_id === projectId && candidate.thread_id === callerThreadId && candidate.role_id === actor.role_id && candidate.role_generation === actor.role_generation && candidate.execution_attempt_id === actor.subject_id,
+  const holder = readRoleHolderStates(db).find((candidate) =>
+    candidate.project_id === projectId && candidate.thread_id === callerThreadId && ["director", "project-orchestrator"].includes(candidate.role_id),
   );
   if (!holder) return { outcome: "ROLE_HOLDER_MISMATCH", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "recovery caller is not the current director or project-orchestrator holder" };
   return null;
@@ -2149,7 +2140,7 @@ async function closeStrandedExecutionAttempt(
   if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "stranded-execution-closure", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
   const { request } = parsed.data;
   if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
-  const callerRefusal = recoveryCallerRefusal(db, request.projectId, callerThreadId, request.actorReceiptId);
+  const callerRefusal = recoveryCallerRefusal(db, request.projectId, callerThreadId);
   if (callerRefusal) return callerRefusal;
   const evidence = await strandedExecutionEvidence(bb, db, parsed.data);
   if ("outcome" in evidence) return evidence;
