@@ -3734,6 +3734,7 @@ export interface FoundationResult {
   expectedConfigRevision?: number;
   currentGovernanceEpoch?: number;
   expectedGovernanceEpoch?: number;
+  fenceMatched?: boolean;
   currentResourceRevision?: number;
   expectedResourceRevision?: number;
   mutationReceipt?: MutationReceipt;
@@ -3795,6 +3796,7 @@ interface RefusalData {
   expectedConfigRevision?: number;
   currentGovernanceEpoch?: number;
   expectedGovernanceEpoch?: number;
+  fenceMatched?: boolean;
   currentResourceRevision?: number;
   expectedResourceRevision?: number;
   expected?: number;
@@ -4200,6 +4202,7 @@ export function proveWorkItemDispatchConfig(
     throw refusal("GOVERNOR_EPOCH_STALE", "dispatch expected governorship epoch or fence token is stale", {
       currentGovernanceEpoch: governor?.governance_epoch,
       expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? undefined,
+      fenceMatched: governor !== undefined && request.expectedFenceToken === governor.fence_token,
     });
   }
   const workItem = asRow<{ config_revision: number; repo_target_id: string; domain_id: string; task_class: string }>(db.prepare(
@@ -4521,6 +4524,7 @@ function refusalResult(subject: string, data: RefusalData, expected = 1, attempt
     ...(data.expectedConfigRevision === undefined ? {} : { expectedConfigRevision: data.expectedConfigRevision }),
     ...(data.currentGovernanceEpoch === undefined ? {} : { currentGovernanceEpoch: data.currentGovernanceEpoch }),
     ...(data.expectedGovernanceEpoch === undefined ? {} : { expectedGovernanceEpoch: data.expectedGovernanceEpoch }),
+    ...(data.fenceMatched === undefined ? {} : { fenceMatched: data.fenceMatched }),
     ...(data.currentResourceRevision === undefined ? {} : { currentResourceRevision: data.currentResourceRevision }),
     ...(data.expectedResourceRevision === undefined ? {} : { expectedResourceRevision: data.expectedResourceRevision }),
   });
@@ -4645,6 +4649,7 @@ function requireGovernor(db: SqliteDatabase, request: ApplyRequest): { governanc
     throw refusal("GOVERNOR_EPOCH_STALE", "expected governorship epoch or fence token is stale", {
       currentGovernanceEpoch: head.governance_epoch,
       expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? undefined,
+      fenceMatched: request.expectedFenceToken === head.fence_token,
     });
   }
   // Deferred ceiling: issue #3 has no sanctioned freeze/cutover operation; PROJECT_FROZEN is reserved for that later slice.
@@ -4847,6 +4852,7 @@ function deriveBootstrapActor(
     throw refusal("GOVERNOR_EPOCH_STALE", "bootstrap source governorship fence or epoch is stale", {
       currentGovernanceEpoch: sourceHead.governance_epoch,
       expectedGovernanceEpoch: authority.sourceGovernanceEpoch,
+      fenceMatched: authority.sourceFenceToken === sourceHead.fence_token,
     });
   }
   if (sourceHead.state !== "target_active") throw refusal("PROJECT_FROZEN", "bootstrap source governorship is not writable");
@@ -5198,6 +5204,7 @@ function applyGovernorClaim(db: SqliteDatabase, request: ApplyRequest, digest: s
     throw refusal("GOVERNOR_EPOCH_STALE", "governor claim requires an expected epoch and fence token", {
       currentGovernanceEpoch: currentHead.governance_epoch,
       expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? undefined,
+      fenceMatched: expectedToken === currentHead.fence_token,
     });
   }
   const actorReceiptId = requireActor(db, request);
@@ -5292,6 +5299,7 @@ function exactGovernor(
     throw refusal("GOVERNOR_EPOCH_STALE", "expected governorship epoch or fence token is stale", {
       currentGovernanceEpoch: head.governance_epoch,
       expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? undefined,
+      fenceMatched: request.expectedFenceToken === head.fence_token,
     });
   }
   return head;

@@ -3687,12 +3687,18 @@ else printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue:startable"}]}]]'; 
       }) as FoundationResult;
       expect(invalidAuthority).toMatchObject({ outcome: "BOOTSTRAP_AUTHORITY_INVALID", attempted: 0, verified: 0 });
     }
-    const stale = await host.harness.callRpc("registerProject", {
+    const staleEpoch = await host.harness.callRpc("registerProject", {
       ...input,
-      idempotencyKey: "register-stale-source",
-      bootstrapAuthority: { ...input.bootstrapAuthority, sourceGovernanceEpoch: 1, sourceFenceToken: sourceBootstrapFence },
+      idempotencyKey: "register-stale-source-epoch",
+      bootstrapAuthority: { ...input.bootstrapAuthority, sourceGovernanceEpoch: 1, sourceFenceToken: sourceFence },
     }) as FoundationResult;
-    expect(stale).toMatchObject({ outcome: "GOVERNOR_EPOCH_STALE", attempted: 0, verified: 0 });
+    expect(staleEpoch).toMatchObject({ outcome: "GOVERNOR_EPOCH_STALE", fenceMatched: true, attempted: 0, verified: 0 });
+    const staleFence = await host.harness.callRpc("registerProject", {
+      ...input,
+      idempotencyKey: "register-stale-source-fence",
+      bootstrapAuthority: { ...input.bootstrapAuthority, sourceGovernanceEpoch: 2, sourceFenceToken: sourceBootstrapFence },
+    }) as FoundationResult;
+    expect(staleFence).toMatchObject({ outcome: "GOVERNOR_EPOCH_STALE", fenceMatched: false, attempted: 0, verified: 0 });
     const unadopted = await host.harness.callRpc("registerProject", {
       ...input,
       idempotencyKey: "register-unadopted-decision",
@@ -6657,6 +6663,30 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(result).toMatchObject({ outcome: "PROJECT_CONFIG_STALE", attempted: 0, verified: 0 });
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
     expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("reports whether the dispatch fence matched when governorship validation refuses", async () => {
+    const fixture = await assignmentFixture({ withoutGithubIssues: true });
+    const dispatchRequest = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const prove = (expectedGovernanceEpoch: number, expectedFenceToken: string) => {
+      let error: unknown;
+      try {
+        proveWorkItemDispatchConfig(fixture.db, {
+          projectId: PROJECT_ID,
+          workItemId: WORK_ITEM_ID,
+          repoTargetId: TARGET_ID,
+          expectedConfigRevision: dispatchRequest.expectedConfigRevision,
+          expectedGovernanceEpoch,
+          expectedFenceToken,
+          requestedProfile: ROLE_PROFILE,
+        });
+      } catch (caught) {
+        error = caught;
+      }
+      return error;
+    };
+    expect(prove(99, fixture.fenceToken)).toMatchObject({ data: { code: "GOVERNOR_EPOCH_STALE", fenceMatched: true } });
+    expect(prove(1, "wrong-fence")).toMatchObject({ data: { code: "GOVERNOR_EPOCH_STALE", fenceMatched: false } });
   });
 
   it.each([
@@ -12873,7 +12903,20 @@ else printf '%s\\n' '[]'; fi
       const prepareA = migrationPrepareRequest(governor, { idempotencyKey: "prepare-race-a" });
       const prepareB = migrationPrepareRequest(governor, { idempotencyKey: "prepare-race-b", migration: { ...migrationPrepareRequest(governor).migration!, migrationId: "migration-race-b" } });
       expect(applyWithFixtureReceipt(firstDb, prepareA).outcome).toBe("OK");
-      expect(applyWithFixtureReceipt(secondDb, prepareB).outcome).toBe("GOVERNOR_EPOCH_STALE");
+      const current = currentGovernor(firstDb);
+      expect(applyWithFixtureReceipt(secondDb, {
+        ...prepareB,
+        idempotencyKey: "prepare-race-epoch",
+        expectedGovernanceEpoch: current.governance_epoch + 1,
+        expectedFenceToken: current.fence_token,
+      })).toMatchObject({ outcome: "GOVERNOR_EPOCH_STALE", fenceMatched: true });
+      expect(applyWithFixtureReceipt(secondDb, {
+        ...prepareB,
+        idempotencyKey: "prepare-race-fence",
+        expectedGovernanceEpoch: current.governance_epoch,
+        expectedFenceToken: "wrong-fence",
+      })).toMatchObject({ outcome: "GOVERNOR_EPOCH_STALE", fenceMatched: false });
+      expect(applyWithFixtureReceipt(secondDb, prepareB)).toMatchObject({ outcome: "GOVERNOR_EPOCH_STALE", fenceMatched: false });
       expect(firstDb.prepare("SELECT 1 FROM mutation_receipts WHERE idempotency_key = 'prepare-race-b'").get()).toBeUndefined();
 
       expect(applyWithFixtureReceipt(firstDb, migrationStepRequest(firstDb, "record_inventory", { proofDigest: sha256("inventory") })).outcome).toBe("OK");
@@ -12979,7 +13022,7 @@ else printf '%s\\n' '[]'; fi
       expectedGovernanceEpoch: 99,
       expectedFenceToken: fenceToken,
     });
-    expect(wrongEpoch.outcome).toBe("GOVERNOR_EPOCH_STALE");
+    expect(wrongEpoch).toMatchObject({ outcome: "GOVERNOR_EPOCH_STALE", fenceMatched: true });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
 
     const wrongToken = applyWithFixtureReceipt(db, {
@@ -12988,7 +13031,7 @@ else printf '%s\\n' '[]'; fi
       expectedGovernanceEpoch: 1,
       expectedFenceToken: "wrong-token",
     });
-    expect(wrongToken.outcome).toBe("GOVERNOR_EPOCH_STALE");
+    expect(wrongToken).toMatchObject({ outcome: "GOVERNOR_EPOCH_STALE", fenceMatched: false });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
   });
 
@@ -13012,6 +13055,31 @@ else printf '%s\\n' '[]'; fi
       db.close();
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+
+  it("reports a missing governor-claim fence as unmatched", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    const missingEpoch = applyWithFixtureReceipt(db, {
+      ...bootstrapRequest(),
+      operationClass: "governor_claim",
+      idempotencyKey: "governor-claim-missing-epoch",
+      expectedConfigRevision: 1,
+      expectedGovernanceEpoch: null,
+      expectedFenceToken: fenceToken,
+      repoTargetId: null,
+    });
+    expect(missingEpoch).toMatchObject({ outcome: "GOVERNOR_EPOCH_STALE", fenceMatched: true });
+    const missingFence = applyWithFixtureReceipt(db, {
+      ...bootstrapRequest(),
+      operationClass: "governor_claim",
+      idempotencyKey: "governor-claim-missing-fence",
+      expectedConfigRevision: 1,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: null,
+      repoTargetId: null,
+    });
+    expect(missingFence).toMatchObject({ outcome: "GOVERNOR_EPOCH_STALE", fenceMatched: false });
   });
 
   it("returns the original receipt on duplicate idempotency and refuses conflicting reuse", async () => {
