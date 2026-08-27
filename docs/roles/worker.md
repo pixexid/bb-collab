@@ -18,8 +18,6 @@ Use your BB thread/environment for assigned work, Git/GitHub for evidence, and p
 
 For an execution terminal report, invoke core `build_terminal_report` with the exact IDs, outcome, reason, native completion event, and turn. Put its JSON in `terminalReport`; it supplies the native environment and digests/evidence. Submission owns receipt fields.
 
-Canonical digests are defined by canonical JSON — sorted keys, JSON.stringify, no trailing newline. Hand-computed digests (e.g. jq | shasum) silently diverge and will be refused; if you must compute one, strip the trailing newline (jq -j, or printf %s).
-
 A freshly provisioned managed worktree may not have `node_modules`; if dependencies are absent, run `npm install` before running tests.
 
 Use the canonical [delegation return-path rule](../rules.md#delegation-return-path) for every work order.
