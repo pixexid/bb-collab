@@ -27068,8 +27068,22 @@ var threadlessPreparedClosureInputSchema = external_exports.object({
   dispatchIntentIdempotencyKey: external_exports.string().trim().min(1).max(256),
   replayRequestDigest: external_exports.string().regex(/^[0-9a-f]{64}$/u).optional()
 }).strict();
+var strandedExecutionAttemptClosureRequestSchema = external_exports.object({
+  projectId: projectIdSchema,
+  operationClass: external_exports.literal("work_item_transition"),
+  idempotencyKey: sidebarThreadIdSchema,
+  actorReceiptId: sidebarThreadIdSchema.nullable().optional(),
+  expectedConfigRevision: external_exports.number().int().nonnegative().nullable().optional(),
+  expectedGovernanceEpoch: external_exports.number().int().nonnegative().nullable().optional(),
+  expectedFenceToken: sidebarThreadIdSchema.nullable().optional(),
+  repoTargetId: sidebarThreadIdSchema.nullable().optional(),
+  domainId: sidebarThreadIdSchema.optional(),
+  expectedResourceRevision: external_exports.number().int().positive().nullable().optional(),
+  workItemId: sidebarThreadIdSchema,
+  executionAttemptId: sidebarThreadIdSchema
+}).strict();
 var strandedExecutionAttemptClosureInputSchema = external_exports.object({
-  request: applyRequestSchema,
+  request: strandedExecutionAttemptClosureRequestSchema,
   correctionId: external_exports.string().trim().min(1).max(256),
   threadId: sidebarThreadIdSchema,
   nativeEventId: sidebarThreadIdSchema,
@@ -27789,6 +27803,45 @@ async function closeThreadlessPreparedAttempt(bb, db, input) {
     return applyLiveAuthorizedMutation(bb, db, closureRequest, false, "refuse-active", readGithubIssueForBackfill, null, preMutationGuard, true);
   });
 }
+function isStructuredDestroyedEnvironmentError(error48) {
+  if (!error48 || typeof error48 !== "object" || Array.isArray(error48)) return false;
+  const value = error48;
+  return value.code === "ENVIRONMENT_DESTROYED" || value.code === "ENVIRONMENT_NOT_FOUND" || value.statusCode === 404 || value.httpStatusCode === 404;
+}
+async function readStrandedOwnerIncapacity(bb, projectId, attempt, input) {
+  let thread;
+  try {
+    thread = await bb.sdk.threads.get({ threadId: input.threadId });
+    if (thread.id !== input.threadId || thread.projectId !== projectId || thread.archivedAt !== null || thread.deletedAt !== null || thread.environmentId === null) {
+      return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "stranded execution closure owner thread is foreign, archived, deleted, or has no environment" };
+    }
+    if (attempt.thread_id !== input.threadId || typeof attempt.environment_id === "string" && attempt.environment_id !== thread.environmentId) {
+      return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "stranded execution closure environment does not match the canonical attempt" };
+    }
+    if (input.incapacity === "native-correlation-ambiguous") {
+      if (thread.status !== "idle") {
+        return { outcome: "WORK_ITEM_STATE_INVALID", subject: projectId, expected: 1, attempted: 1, verified: 0, message: `stranded native-correlation disposal requires an idle owner thread: status=${thread.status}` };
+      }
+      return null;
+    }
+    if (["active", "starting"].includes(thread.status)) {
+      return { outcome: "WORK_ITEM_STATE_INVALID", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "stranded execution disposal requires a non-executable owner thread" };
+    }
+    try {
+      const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId });
+      if (environment.id !== thread.environmentId || environment.projectId !== projectId) {
+        return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "stranded execution closure owner environment is foreign" };
+      }
+      if (environment.status === "destroyed") return null;
+      return { outcome: "WORK_ITEM_STATE_INVALID", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "stranded execution disposal requires a proven destroyed owner environment" };
+    } catch (error48) {
+      if (isStructuredDestroyedEnvironmentError(error48)) return null;
+      return { outcome: "EXTERNAL_UNAVAILABLE", subject: projectId, expected: 1, attempted: 1, verified: 0, message: `stranded owner environment availability is unproven: ${String(error48)}` };
+    }
+  } catch (error48) {
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: projectId, expected: 1, attempted: 1, verified: 0, message: `stranded owner incapacity evidence unavailable: ${String(error48)}` };
+  }
+}
 function recoveryCallerRefusal(db, projectId, callerThreadId, actorReceiptId) {
   if (!actorReceiptId) return { outcome: "ACTOR_RECEIPT_REQUIRED", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "stranded execution closure requires a current director or orchestrator actor receipt" };
   const actor = db.prepare(
@@ -27811,37 +27864,11 @@ async function strandedExecutionEvidence(bb, db, input) {
   ).get(request.projectId, request.executionAttemptId, request.workItemId);
   if (!attempt || typeof attempt.thread_id !== "string") return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "stranded execution closure requires the exact canonical native thread" };
   if (attempt.thread_id !== input.threadId) return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "stranded execution closure thread does not match the canonical attempt" };
-  let thread;
-  try {
-    thread = await bb.sdk.threads.get({ threadId: input.threadId });
-    if (thread.id !== input.threadId || thread.projectId !== request.projectId || thread.archivedAt !== null || thread.deletedAt !== null || thread.environmentId === null) {
-      return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "stranded execution closure owner thread is foreign, archived, deleted, or has no environment" };
-    }
-    if (typeof attempt.environment_id === "string" && attempt.environment_id !== thread.environmentId) {
-      return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "stranded execution closure environment does not match the canonical attempt" };
-    }
-    if (input.incapacity === "environment-unavailable") {
-      if (["active", "starting"].includes(thread.status)) {
-        return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "stranded execution disposal requires a non-executable owner thread" };
-      }
-      try {
-        const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId });
-        if (environment.id !== thread.environmentId || environment.projectId !== request.projectId) {
-          return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "stranded execution closure owner environment is foreign" };
-        }
-        return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "stranded execution disposal requires a proven unavailable owner environment" };
-      } catch (error48) {
-        const message = String(error48).toLowerCase();
-        if (!["destroy", "not found", "not_found", "missing", "unavailable", "404"].some((marker) => message.includes(marker))) {
-          return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `stranded owner environment availability is unproven: ${String(error48)}` };
-        }
-      }
-    } else if (thread.status !== "idle") {
-      return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `stranded native-correlation disposal requires an idle owner thread: status=${thread.status}` };
-    }
-  } catch (error48) {
-    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `stranded owner incapacity evidence unavailable: ${String(error48)}` };
-  }
+  const incapacity = await readStrandedOwnerIncapacity(bb, request.projectId, {
+    thread_id: attempt.thread_id,
+    environment_id: typeof attempt.environment_id === "string" ? attempt.environment_id : null
+  }, input);
+  if (incapacity) return incapacity;
   try {
     const events = await completeNativeThreadEvents(bb.sdk, input.threadId);
     const completions = events.filter((event) => event.type === "turn/completed" && nativeTurnId(event) === input.nativeTurnId);
@@ -27878,7 +27905,6 @@ async function closeStrandedExecutionAttempt(bb, db, input, callerThreadId) {
   if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "stranded-execution-closure", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
   const { request } = parsed.data;
   if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
-  if (request.operationClass !== "work_item_transition" || request.lifecycleState !== void 0 || request.strandedExecutionAttemptClosure !== void 0 || request.workAttempt !== void 0 || request.workItemWait !== void 0 || request.workItemUnblock !== void 0 || request.workItemExternalEvent !== void 0 || !request.workItemId || !request.executionAttemptId) return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "stranded execution closure requires one exact work item and execution attempt without ordinary transition fields" };
   const callerRefusal = recoveryCallerRefusal(db, request.projectId, callerThreadId, request.actorReceiptId);
   if (callerRefusal) return callerRefusal;
   const evidence = await strandedExecutionEvidence(bb, db, parsed.data);
@@ -27889,7 +27915,15 @@ async function closeStrandedExecutionAttempt(bb, db, input, callerThreadId) {
     reasonCode: "stranded-execution-closure",
     strandedExecutionAttemptClosure: { correctionId: parsed.data.correctionId, evidence: { kind: "stranded-execution-attempt", ...evidence } }
   };
-  return applyLiveAuthorizedMutation(bb, db, closureRequest, false, "refuse-active", readGithubIssueForBackfill, null, void 0, false, true);
+  const preMutationGuard = async () => {
+    const reread = await strandedExecutionEvidence(bb, db, parsed.data);
+    if ("outcome" in reread) return reread;
+    if (reread.digest !== evidence.digest) {
+      return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "stranded owner incapacity or native completion evidence changed before mutation" };
+    }
+    return null;
+  };
+  return applyLiveAuthorizedMutation(bb, db, closureRequest, false, "refuse-active", readGithubIssueForBackfill, null, preMutationGuard, false, true);
 }
 function dispatchRecoveryRefusal(projectId, message, evidence) {
   return {
