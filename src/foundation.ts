@@ -2226,6 +2226,8 @@ export const threadlessPreparedClosurePopulation = (projectId: string) => ({
   deleted: "excluded because threads.list does not expose deleted history",
 } as const);
 
+export const THREADLESS_PREPARED_INVENTORY_OBSERVATION_BOUND = "two complete project-scoped active/archive list reads; deleted, retitled, marker-truncated, and unsanctioned children are outside the observation" as const;
+
 export function parseWorkItemDispatchIntent(reasonCode: string | null): WorkItemDispatchIntent | null {
   const prefix = "work_item_dispatch_intent:";
   if (!reasonCode?.startsWith(prefix)) return null;
@@ -2876,7 +2878,7 @@ const threadlessPreparedClosureSchema = z
         digest: digestSchema,
       }).strict(),
       z.object({
-        kind: z.literal("dispatch_refusal"),
+        kind: z.enum(["dispatch_guard_proof", "dispatch_refusal"]),
         reference: id,
         digest: digestSchema,
       }).strict(),
@@ -2887,7 +2889,7 @@ const threadlessPreparedClosureSchema = z
         digest: digestSchema,
       }).strict(),
       z.object({
-        kind: z.literal("terminalization_refusal"),
+        kind: z.enum(["terminalization_guard_proof", "terminalization_refusal"]),
         reference: id,
         digest: digestSchema,
       }).strict(),
@@ -2904,6 +2906,9 @@ const threadlessPreparedClosureSchema = z
         activeCount: z.number().int().nonnegative(),
         archivedCount: z.number().int().nonnegative(),
         matchingCount: z.literal(0),
+        observationCount: z.literal(2).optional(),
+        observationBound: z.literal(THREADLESS_PREPARED_INVENTORY_OBSERVATION_BOUND).optional(),
+        snapshotDigest: digestSchema.optional(),
         digest: digestSchema,
       }).strict(),
     ]),
@@ -3291,6 +3296,85 @@ export function threadlessPreparedReplayProbeDigest(input: {
     kind: "threadless-prepared-closure-replay-probe",
     ...input,
   }));
+}
+
+export type ThreadlessPreparedOrigin = {
+  eventSequence: number;
+  eventType: "work_item_transitioned" | "work_item_attempt_registered";
+  eventJson: string;
+  idempotencyKey: string;
+  requestDigest: string;
+};
+
+export function resolveThreadlessPreparedOrigin(
+  db: SqliteDatabase,
+  input: { projectId: string; workItemId: string; executionAttemptId: string; idempotencyKey: string },
+): ThreadlessPreparedOrigin {
+  const rows = db.prepare(
+    `SELECT e.event_sequence, e.event_type, e.event_json, e.idempotency_key,
+            m.request_digest, m.committed_event_sequence, m.operation_class
+     FROM state_events e
+     LEFT JOIN mutation_receipts m
+       ON m.project_id = e.project_id AND m.idempotency_key = e.idempotency_key
+     WHERE e.project_id = ? AND e.aggregate_type = 'work_item' AND e.aggregate_id = ?
+       AND e.event_type IN ('work_item_transitioned', 'work_item_attempt_registered')
+       AND json_extract(e.event_json, '$.executionAttemptId') = ?
+     ORDER BY e.event_sequence`,
+  ).all(input.projectId, input.workItemId, input.executionAttemptId) as Array<{
+    event_sequence: number;
+    event_type: string;
+    event_json: string;
+    idempotency_key: string;
+    request_digest: string | null;
+    committed_event_sequence: number | null;
+    operation_class: string | null;
+  }>;
+  if (rows.length !== 1) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure requires one exact durable dispatch preparation and intent receipt");
+  }
+  const row = rows[0]!;
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(row.event_json) as Record<string, unknown>;
+  } catch {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure preparation event is malformed");
+  }
+  const workAttempt = payload.workAttempt;
+  const exactCommon = payload.workItemId === input.workItemId &&
+    payload.executionAttemptId === input.executionAttemptId &&
+    typeof workAttempt === "object" && workAttempt !== null &&
+    (workAttempt as Record<string, unknown>).assignmentKind === "write";
+  const exactOrigin = row.event_type === "work_item_transitioned"
+    ? exactCommon && (payload.from === "ready" || payload.from === "review_pending") && payload.to === "in_progress"
+    : row.event_type === "work_item_attempt_registered" && exactCommon && payload.from === undefined && payload.to === undefined;
+  if (
+    !exactOrigin || row.idempotency_key !== input.idempotencyKey || row.operation_class !== "work_item_transition" ||
+    row.committed_event_sequence !== row.event_sequence || row.request_digest === null
+  ) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure preparation origin is not the exact durable event and receipt pair");
+  }
+  return {
+    eventSequence: row.event_sequence,
+    eventType: row.event_type as ThreadlessPreparedOrigin["eventType"],
+    eventJson: row.event_json,
+    idempotencyKey: row.idempotency_key,
+    requestDigest: row.request_digest,
+  };
+}
+
+export function threadlessPreparedInventoryEvidenceDigest(input: {
+  projectId: string;
+  executionAttemptId: string;
+  dispatchMarker: string;
+  population: ReturnType<typeof threadlessPreparedClosurePopulation>;
+  activeCount: number;
+  archivedCount: number;
+  matchingCount: number;
+  observationCount: 2;
+  observationBound: typeof THREADLESS_PREPARED_INVENTORY_OBSERVATION_BOUND;
+  snapshotDigest: string;
+}): string {
+  return sha256(canonicalJson({ kind: "threadless-prepared-inventory-evidence", ...input }));
 }
 
 export function buildTerminalReport(input: {
@@ -8633,48 +8717,39 @@ function applyThreadlessPreparedClosure(
   if (nativeEvidence.some((column) => attempt[column] !== null)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure requires zero native request, content, and terminal evidence");
   }
-  const [preparation, dispatchRefusal, replayConflict, terminalizationRefusal, zeroThread] = closure.evidence;
+  const [preparation, dispatchGuardProof, replayConflict, terminalizationGuardProof, zeroThread] = closure.evidence;
   if (preparation.reference !== `state-event:${preparation.eventSequence}`) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure preparation evidence reference is not exact");
   }
-  const preparationEvent = asRow<{ event_type: string; event_json: string; idempotency_key: string }>(db.prepare(
-    `SELECT event_type, event_json, idempotency_key FROM state_events
-     WHERE project_id = ? AND event_sequence = ? AND aggregate_type = 'work_item' AND aggregate_id = ?`,
-  ).get(request.projectId, preparation.eventSequence, workItem.work_item_id));
-  if (!preparationEvent || preparationEvent.event_type !== "work_item_transitioned" || sha256(preparationEvent.event_json) !== preparation.digest) {
+  if (!closure.dispatchMarker.startsWith("[dispatch:") || !closure.dispatchMarker.endsWith("]")) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure dispatch marker is malformed");
+  }
+  const preparationEvent = resolveThreadlessPreparedOrigin(db, {
+    projectId: request.projectId,
+    workItemId: workItem.work_item_id,
+    executionAttemptId: attempt.execution_attempt_id,
+    idempotencyKey: closure.dispatchMarker.slice("[dispatch:".length, -1),
+  });
+  if (preparationEvent.eventSequence !== preparation.eventSequence || sha256(preparationEvent.eventJson) !== preparation.digest) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure preparation evidence is not the exact durable registration event");
   }
-  let preparationPayload: { workItemId?: unknown; executionAttemptId?: unknown };
-  try {
-    preparationPayload = JSON.parse(preparationEvent.event_json) as { workItemId?: unknown; executionAttemptId?: unknown };
-  } catch {
-    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure preparation event is malformed");
-  }
-  if (preparationPayload.workItemId !== workItem.work_item_id || preparationPayload.executionAttemptId !== attempt.execution_attempt_id) {
-    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure preparation event binds another work item or attempt");
-  }
-  const originalReceipt = asRow<{ request_digest: string; committed_event_sequence: number; operation_class: string }>(db.prepare(
-    "SELECT request_digest, committed_event_sequence, operation_class FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?",
-  ).get(request.projectId, preparationEvent.idempotency_key));
   if (
-    dispatchRefusal.reference !== `mutation:${preparationEvent.idempotency_key}` ||
-    !originalReceipt ||
-    originalReceipt.operation_class !== "work_item_transition" ||
-    originalReceipt.committed_event_sequence !== preparation.eventSequence ||
-    closure.dispatchMarker !== `[dispatch:${preparationEvent.idempotency_key}]`
+    dispatchGuardProof.kind !== "dispatch_guard_proof" ||
+    dispatchGuardProof.reference !== `mutation:${preparationEvent.idempotencyKey}` ||
+    closure.dispatchMarker !== `[dispatch:${preparationEvent.idempotencyKey}]`
   ) {
-    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure dispatch-refusal evidence is not the exact durable intent receipt");
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure dispatch-guard evidence is not the exact durable intent receipt");
   }
   const replayRequestDigest = threadlessPreparedReplayProbeDigest({
     projectId: request.projectId,
     workItemId: workItem.work_item_id,
     executionAttemptId: attempt.execution_attempt_id,
-    idempotencyKey: preparationEvent.idempotency_key,
+    idempotencyKey: preparationEvent.idempotencyKey,
   });
   const replayProbe = {
     projectId: request.projectId,
     operationClass: "work_item_transition" as const,
-    idempotencyKey: preparationEvent.idempotency_key,
+    idempotencyKey: preparationEvent.idempotencyKey,
   } as ApplyRequest;
   let replayConflictObserved = false;
   try {
@@ -8689,47 +8764,63 @@ function applyThreadlessPreparedClosure(
   if (!replayConflictObserved) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure replay probe did not conflict");
   }
-  const expectedDispatchRefusal = sha256(canonicalJson({
-    kind: "dispatch_refusal",
+  const expectedDispatchGuardProof = sha256(canonicalJson({
+    kind: "dispatch_guard_proof",
     projectId: request.projectId,
     workItemId: workItem.work_item_id,
     executionAttemptId: attempt.execution_attempt_id,
-    idempotencyKey: preparationEvent.idempotency_key,
+    idempotencyKey: preparationEvent.idempotencyKey,
     reasonCode: attempt.reason_code,
   }));
-  if (dispatchRefusal.digest !== expectedDispatchRefusal) {
-    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure dispatch-refusal evidence is not exact");
+  if (dispatchGuardProof.digest !== expectedDispatchGuardProof) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure dispatch-guard evidence is not exact");
   }
   if (
-    replayConflict.reference !== `replay:${preparationEvent.idempotency_key}` ||
+    replayConflict.reference !== `replay:${preparationEvent.idempotencyKey}` ||
     replayConflict.requestDigest !== replayRequestDigest ||
     replayConflict.digest !== sha256(canonicalJson({
       kind: "replay_conflict",
       projectId: request.projectId,
       workItemId: workItem.work_item_id,
       executionAttemptId: attempt.execution_attempt_id,
-      idempotencyKey: preparationEvent.idempotency_key,
+      idempotencyKey: preparationEvent.idempotencyKey,
       requestDigest: replayConflict.requestDigest,
     }))
   ) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure replay-conflict evidence is not exact");
   }
   if (
-    terminalizationRefusal.reference !== "terminalization-refusal" ||
-    terminalizationRefusal.digest !== sha256(canonicalJson({
-      kind: "terminalization_refusal",
+    terminalizationGuardProof.kind !== "terminalization_guard_proof" ||
+    terminalizationGuardProof.reference !== "terminalization-guard" ||
+    terminalizationGuardProof.digest !== sha256(canonicalJson({
+      kind: "terminalization_guard_proof",
       projectId: request.projectId,
       workItemId: workItem.work_item_id,
       executionAttemptId: attempt.execution_attempt_id,
       message: "writing attempt terminalization requires a bound lane with native stop evidence",
     }))
   ) {
-    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure terminalization-refusal evidence is not exact");
+    throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure terminalization-guard evidence is not exact");
   }
   if (
     zeroThread.reference !== "native-thread-inventory" ||
     zeroThread.matchingCount !== 0 ||
-    canonicalJson(zeroThread.population) !== canonicalJson(threadlessPreparedClosurePopulation(request.projectId))
+    zeroThread.observationCount !== 2 ||
+    zeroThread.observationBound !== THREADLESS_PREPARED_INVENTORY_OBSERVATION_BOUND ||
+    zeroThread.snapshotDigest === undefined ||
+    canonicalJson(zeroThread.population) !== canonicalJson(threadlessPreparedClosurePopulation(request.projectId)) ||
+    zeroThread.digest !== threadlessPreparedInventoryEvidenceDigest({
+      projectId: request.projectId,
+      executionAttemptId: attempt.execution_attempt_id,
+      dispatchMarker: closure.dispatchMarker,
+      population: zeroThread.population,
+      activeCount: zeroThread.activeCount,
+      archivedCount: zeroThread.archivedCount,
+      matchingCount: zeroThread.matchingCount,
+      observationCount: zeroThread.observationCount,
+      observationBound: zeroThread.observationBound,
+      snapshotDigest: zeroThread.snapshotDigest,
+    })
   ) {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less closure requires complete zero-thread inventory evidence");
   }

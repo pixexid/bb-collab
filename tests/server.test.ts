@@ -57,7 +57,9 @@ import {
   reconcilePreparedWorkItemDispatches,
   schemaDigest,
   sha256,
+  THREADLESS_PREPARED_INVENTORY_OBSERVATION_BOUND,
   threadlessPreparedClosurePopulation,
+  threadlessPreparedInventoryEvidenceDigest,
   threadlessPreparedReplayProbeDigest,
   workItemReconciliationIssues,
   type ApplyRequest,
@@ -8176,6 +8178,267 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     const second = JSON.parse(await fixture.host.harness.callAgentTool("close_threadless_prepared_attempt", input, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
     expect(second).toMatchObject({ outcome: "OK" });
     expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ?").get(PROJECT_ID)).toEqual({ count: eventCount });
+  });
+
+  it("#728 C2 closes a replacement-prepared attempt from its exact registration origin", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+    const replacement = transitionRequest(fixture.fenceToken, undefined, 3, {
+      idempotencyKey: "gh728-replacement-prepared",
+      reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}`,
+      workAttempt: { laneId: "lane-gh728-replacement", assignmentKind: "write", requestedProfile: ROLE_PROFILE },
+    });
+    expect(applyWithFixtureReceipt(fixture.db, replacement)).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    const attempt = fixture.db.prepare(
+      "SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state = 'prepared'",
+    ).get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string };
+    expect(fixture.db.prepare(
+      "SELECT event_type FROM state_events WHERE project_id = ? AND aggregate_id = ? AND json_extract(event_json, '$.executionAttemptId') = ?",
+    ).get(PROJECT_ID, WORK_ITEM_ID, attempt.execution_attempt_id)).toEqual({ event_type: "work_item_attempt_registered" });
+    fixture.host.harness.sdk.stub("threads.list", (async () => []) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("close_threadless_prepared_attempt", {
+      request: { ...replacement, idempotencyKey: "gh728-close-replacement", workAttempt: undefined, reasonCode: undefined, executionAttemptId: attempt.execution_attempt_id, expectedResourceRevision: 4 },
+      correctionId: "gh728-c2",
+      dispatchIntentIdempotencyKey: replacement.idempotencyKey,
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
+    const event = fixture.db.prepare(
+      "SELECT event_json FROM state_events WHERE project_id = ? AND event_type = 'work_item_threadless_prepared_closure'",
+    ).get(PROJECT_ID) as { event_json: string };
+    const evidence = JSON.parse(event.event_json).correction.evidence;
+    expect(evidence.map((item: { kind: string }) => item.kind)).toEqual([
+      "preparation", "dispatch_guard_proof", "replay_conflict", "terminalization_guard_proof", "zero_thread",
+    ]);
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE execution_attempt_id = ?").get(attempt.execution_attempt_id)).toEqual({ state: "failed" });
+  });
+
+  it.each(["wrong type", "duplicate", "foreign aggregate", "mismatched payload", "wrong operation", "reordered receipt"] as const)(
+    "#728 C8 refuses %s replacement origin evidence without mutation",
+    async (failure) => {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      const replacement = transitionRequest(fixture.fenceToken, undefined, 3, {
+        idempotencyKey: `gh728-origin-${failure.replaceAll(" ", "-")}`,
+        reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}`,
+        workAttempt: { laneId: "lane-gh728-origin", assignmentKind: "write", requestedProfile: ROLE_PROFILE },
+      });
+      expect(applyWithFixtureReceipt(fixture.db, replacement)).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+      const attempt = fixture.db.prepare(
+        "SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state = 'prepared'",
+      ).get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string };
+      const origin = fixture.db.prepare(
+        "SELECT event_sequence, event_json FROM state_events WHERE project_id = ? AND aggregate_id = ? AND event_type = 'work_item_attempt_registered'",
+      ).get(PROJECT_ID, WORK_ITEM_ID) as { event_sequence: number; event_json: string };
+      if (failure === "wrong type") {
+        fixture.db.prepare("UPDATE state_events SET event_type = 'work_item_attempt_armed' WHERE event_sequence = ?").run(origin.event_sequence);
+      } else if (failure === "duplicate") {
+        const initial = fixture.db.prepare(
+          "SELECT event_sequence FROM state_events WHERE project_id = ? AND aggregate_id = ? AND event_type = 'work_item_transitioned' AND json_extract(event_json, '$.to') = 'in_progress'",
+        ).get(PROJECT_ID, WORK_ITEM_ID) as { event_sequence: number };
+        fixture.db.prepare("UPDATE state_events SET event_json = ? WHERE event_sequence = ?").run(canonicalJson({ ...JSON.parse(origin.event_json), from: "ready", to: "in_progress" }), initial.event_sequence);
+      } else if (failure === "foreign aggregate") {
+        fixture.db.prepare("UPDATE state_events SET aggregate_id = 'foreign-work-item' WHERE event_sequence = ?").run(origin.event_sequence);
+      } else if (failure === "mismatched payload") {
+        fixture.db.prepare("UPDATE state_events SET event_json = json_set(event_json, '$.executionAttemptId', 'foreign-attempt') WHERE event_sequence = ?").run(origin.event_sequence);
+      } else if (failure === "wrong operation") {
+        fixture.db.prepare("UPDATE mutation_receipts SET operation_class = 'work_item_create' WHERE project_id = ? AND idempotency_key = ?").run(PROJECT_ID, replacement.idempotencyKey);
+      } else {
+        fixture.db.prepare("UPDATE mutation_receipts SET committed_event_sequence = committed_event_sequence - 1 WHERE project_id = ? AND idempotency_key = ?").run(PROJECT_ID, replacement.idempotencyKey);
+      }
+      const before = exportFoundation(fixture.db, PROJECT_ID);
+      fixture.host.harness.sdk.stub("threads.list", (async () => []) as never);
+      const result = JSON.parse(await fixture.host.harness.callAgentTool("close_threadless_prepared_attempt", {
+        request: { ...replacement, idempotencyKey: `gh728-close-origin-${failure.replaceAll(" ", "-")}`, workAttempt: undefined, reasonCode: undefined, executionAttemptId: attempt.execution_attempt_id, expectedResourceRevision: 4 },
+        correctionId: `gh728-c8-${failure.replaceAll(" ", "-")}`,
+        dispatchIntentIdempotencyKey: replacement.idempotencyKey,
+      }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+      expect(result).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
+      expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.list")).toHaveLength(0);
+    },
+  );
+
+  it.each(["work_item_transitioned", "work_item_attempt_registered"] as const)(
+    "#728 origin semantics independently reject a non-write %s payload",
+    async (originType) => {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+      const initial = transitionRequest(fixture.fenceToken, "in_progress", 2);
+      const { threadId: _threadId, ...preparedAttempt } = initial.workAttempt!;
+      let preparation: ApplyRequest = { ...initial, workAttempt: preparedAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+      expect(applyWithFixtureReceipt(fixture.db, preparation)).toMatchObject({ outcome: "OK" });
+      if (originType === "work_item_attempt_registered") {
+        preparation = transitionRequest(fixture.fenceToken, undefined, 3, {
+          idempotencyKey: "gh728-independent-replacement",
+          reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}`,
+          workAttempt: { laneId: "lane-gh728-independent", assignmentKind: "write", requestedProfile: ROLE_PROFILE },
+        });
+        expect(applyWithFixtureReceipt(fixture.db, preparation)).toMatchObject({ outcome: "OK" });
+      }
+      const attempt = fixture.db.prepare(
+        "SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state = 'prepared'",
+      ).get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string };
+      fixture.db.prepare(
+        "UPDATE state_events SET event_json = json_set(event_json, '$.workAttempt.assignmentKind', 'review') WHERE project_id = ? AND aggregate_id = ? AND event_type = ? AND json_extract(event_json, '$.executionAttemptId') = ?",
+      ).run(PROJECT_ID, WORK_ITEM_ID, originType, attempt.execution_attempt_id);
+      const before = exportFoundation(fixture.db, PROJECT_ID);
+      fixture.host.harness.sdk.stub("threads.list", (async () => []) as never);
+      const result = JSON.parse(await fixture.host.harness.callAgentTool("close_threadless_prepared_attempt", {
+        request: { ...preparation, idempotencyKey: `gh728-close-independent-${originType}`, lifecycleState: undefined, workAttempt: undefined, reasonCode: undefined, executionAttemptId: attempt.execution_attempt_id, expectedResourceRevision: originType === "work_item_transitioned" ? 3 : 4 },
+        correctionId: `gh728-independent-${originType}`,
+        dispatchIntentIdempotencyKey: preparation.idempotencyKey,
+      }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+      expect(result).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
+      expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+    },
+  );
+
+  it("#728 refuses an origin receipt raced between server and foundation resolution", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const { threadId: _threadId, ...preparedAttempt } = request.workAttempt!;
+    const preparation = { ...request, workAttempt: preparedAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+    expect(applyWithFixtureReceipt(fixture.db, preparation)).toMatchObject({ outcome: "OK" });
+    const attempt = fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE state = 'prepared'").get() as { execution_attempt_id: string };
+    let reads = 0;
+    let racedState: ReturnType<typeof exportFoundation> | undefined;
+    fixture.host.harness.sdk.stub("threads.list", (async () => {
+      reads += 1;
+      if (reads === 4) {
+        fixture.db.prepare("UPDATE mutation_receipts SET committed_event_sequence = committed_event_sequence - 1 WHERE project_id = ? AND idempotency_key = ?").run(PROJECT_ID, preparation.idempotencyKey);
+        racedState = exportFoundation(fixture.db, PROJECT_ID);
+      }
+      return [];
+    }) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("close_threadless_prepared_attempt", {
+      request: { ...request, idempotencyKey: "gh728-origin-race-close", lifecycleState: undefined, workAttempt: undefined, reasonCode: undefined, executionAttemptId: attempt.execution_attempt_id, expectedResourceRevision: 3 },
+      correctionId: "gh728-origin-race",
+      dispatchIntentIdempotencyKey: preparation.idempotencyKey,
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
+    expect(racedState).toBeDefined();
+    expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(racedState);
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE execution_attempt_id = ?").get(attempt.execution_attempt_id)).toEqual({ state: "prepared" });
+  });
+
+  it.each(["population", "activeCount", "archivedCount", "matchingCount", "snapshotDigest", "digest"] as const)(
+    "#728 C16 foundation rejects a single-variable %s inventory mutant without mutation",
+    async (field) => {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+      const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+      const { threadId: _threadId, ...preparedAttempt } = request.workAttempt!;
+      const preparation = { ...request, workAttempt: preparedAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+      expect(applyWithFixtureReceipt(fixture.db, preparation)).toMatchObject({ outcome: "OK" });
+      const attempt = fixture.db.prepare(
+        "SELECT execution_attempt_id, reason_code FROM execution_attempts WHERE state = 'prepared'",
+      ).get() as { execution_attempt_id: string; reason_code: string };
+      const origin = fixture.db.prepare(
+        "SELECT event_sequence, event_json FROM state_events WHERE project_id = ? AND aggregate_id = ? AND json_extract(event_json, '$.executionAttemptId') = ?",
+      ).get(PROJECT_ID, WORK_ITEM_ID, attempt.execution_attempt_id) as { event_sequence: number; event_json: string };
+      const dispatchMarker = `[dispatch:${preparation.idempotencyKey}]`;
+      const population = threadlessPreparedClosurePopulation(PROJECT_ID);
+      const snapshotDigest = sha256(canonicalJson({ projectId: PROJECT_ID, executionAttemptId: attempt.execution_attempt_id, dispatchMarker, population, active: [], archived: [] }));
+      const zeroThread = {
+        kind: "zero_thread" as const,
+        reference: "native-thread-inventory",
+        population,
+        activeCount: 0,
+        archivedCount: 0,
+        matchingCount: 0 as const,
+        observationCount: 2 as const,
+        observationBound: THREADLESS_PREPARED_INVENTORY_OBSERVATION_BOUND,
+        snapshotDigest,
+        digest: threadlessPreparedInventoryEvidenceDigest({
+          projectId: PROJECT_ID,
+          executionAttemptId: attempt.execution_attempt_id,
+          dispatchMarker,
+          population,
+          activeCount: 0,
+          archivedCount: 0,
+          matchingCount: 0,
+          observationCount: 2,
+          observationBound: THREADLESS_PREPARED_INVENTORY_OBSERVATION_BOUND,
+          snapshotDigest,
+        }),
+      };
+      const mutant = structuredClone(zeroThread) as Record<string, unknown>;
+      if (field === "population") mutant.population = threadlessPreparedClosurePopulation("foreign-project");
+      else if (field === "activeCount" || field === "archivedCount" || field === "matchingCount") mutant[field] = 1;
+      else mutant[field] = "f".repeat(64);
+      const replayRequestDigest = threadlessPreparedReplayProbeDigest({ projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: attempt.execution_attempt_id, idempotencyKey: preparation.idempotencyKey });
+      const closure = {
+        ...request,
+        idempotencyKey: `gh728-c16-${field}`,
+        lifecycleState: "failed" as const,
+        workAttempt: undefined,
+        reasonCode: "threadless-prepared-closure",
+        executionAttemptId: attempt.execution_attempt_id,
+        expectedResourceRevision: 3,
+        threadlessPreparedClosure: {
+          correctionId: `gh728-c16-${field}`,
+          dispatchMarker,
+          evidence: [
+            { kind: "preparation", eventSequence: origin.event_sequence, reference: `state-event:${origin.event_sequence}`, digest: sha256(origin.event_json) },
+            { kind: "dispatch_guard_proof", reference: `mutation:${preparation.idempotencyKey}`, digest: sha256(canonicalJson({ kind: "dispatch_guard_proof", projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: attempt.execution_attempt_id, idempotencyKey: preparation.idempotencyKey, reasonCode: attempt.reason_code })) },
+            { kind: "replay_conflict", reference: `replay:${preparation.idempotencyKey}`, requestDigest: replayRequestDigest, digest: sha256(canonicalJson({ kind: "replay_conflict", projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: attempt.execution_attempt_id, idempotencyKey: preparation.idempotencyKey, requestDigest: replayRequestDigest })) },
+            { kind: "terminalization_guard_proof", reference: "terminalization-guard", digest: sha256(canonicalJson({ kind: "terminalization_guard_proof", projectId: PROJECT_ID, workItemId: WORK_ITEM_ID, executionAttemptId: attempt.execution_attempt_id, message: "writing attempt terminalization requires a bound lane with native stop evidence" })) },
+            mutant,
+          ],
+        },
+      };
+      const before = exportFoundation(fixture.db, PROJECT_ID);
+      expect(applyWithFixtureReceipt(fixture.db, closure as ApplyRequest)).toMatchObject({
+        outcome: field === "matchingCount" ? "INVALID_INPUT" : "WORK_ITEM_STATE_INVALID",
+        attempted: 0,
+        verified: 0,
+      });
+      expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+    },
+  );
+
+  it("#728 C14-C15 keeps the committed claim bounded to two listable exact-marker observations", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2);
+    const { threadId: _threadId, ...preparedAttempt } = request.workAttempt!;
+    const preparation = { ...request, workAttempt: preparedAttempt, reasonCode: `dispatch_parent:${fixture.orchestratorThreadId}` };
+    expect(applyWithFixtureReceipt(fixture.db, preparation)).toMatchObject({ outcome: "OK" });
+    const attempt = fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE state = 'prepared'").get() as { execution_attempt_id: string };
+    const marker = `[dispatch:${preparation.idempotencyKey}]`;
+    const active = [makeThreadResponse({ id: "retitled-child", projectId: PROJECT_ID, title: `retitled ${marker.slice(0, -1)}` })];
+    fixture.host.harness.sdk.stub("threads.list", (async ({ archived }: { archived?: boolean }) => archived ? [] : active) as never);
+    const originalPrepare = fixture.db.prepare.bind(fixture.db);
+    let originReads = 0;
+    const prepareSpy = vi.spyOn(fixture.db, "prepare").mockImplementation(((sql: string) => {
+      if (sql.includes("SELECT e.event_sequence, e.event_type, e.event_json")) {
+        originReads += 1;
+        if (originReads === 2) active.push(makeThreadResponse({ id: "raw-commit-window-child", projectId: PROJECT_ID, title: `raw ${marker}` }));
+      }
+      return originalPrepare(sql);
+    }) as never);
+    try {
+      const result = JSON.parse(await fixture.host.harness.callAgentTool("close_threadless_prepared_attempt", {
+        request: { ...request, idempotencyKey: "gh728-c14-c15-close", lifecycleState: undefined, workAttempt: undefined, reasonCode: undefined, executionAttemptId: attempt.execution_attempt_id, expectedResourceRevision: 3 },
+        correctionId: "gh728-c14-c15",
+        dispatchIntentIdempotencyKey: preparation.idempotencyKey,
+      }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+      expect(result).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    } finally {
+      prepareSpy.mockRestore();
+    }
+    expect(active.map((thread) => thread.id)).toEqual(["retitled-child", "raw-commit-window-child"]);
+    const event = fixture.db.prepare("SELECT event_json FROM state_events WHERE event_type = 'work_item_threadless_prepared_closure'").get() as { event_json: string };
+    expect(JSON.parse(event.event_json).correction.evidence[4]).toMatchObject({
+      activeCount: 1,
+      archivedCount: 0,
+      matchingCount: 0,
+      observationCount: 2,
+      observationBound: THREADLESS_PREPARED_INVENTORY_OBSERVATION_BOUND,
+    });
   });
 
   it("records a real replay conflict before the threadless transition guard", async () => {

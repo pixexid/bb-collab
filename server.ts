@@ -56,7 +56,10 @@ import {
   WORK_ITEM_CAPACITY_LIFECYCLE_STATES,
   workItemCapacityLaneEvidence,
   parseWorkItemDispatchIntent,
+  resolveThreadlessPreparedOrigin,
+  THREADLESS_PREPARED_INVENTORY_OBSERVATION_BOUND,
   threadlessPreparedClosurePopulation,
+  threadlessPreparedInventoryEvidenceDigest,
   threadlessPreparedReplayProbeDigest,
   reconcilePreparedWorkItemDispatches,
   type ApplyRequest,
@@ -1869,7 +1872,7 @@ function dispatchInventoryEvidence(
     archived,
     matching: threads.filter((thread) => hasExactDispatchMarker(thread.title, dispatchMarker)),
     population,
-    digest: sha256(canonicalJson({ projectId, executionAttemptId, dispatchMarker, population, active, archived })),
+    snapshotDigest: sha256(canonicalJson({ projectId, executionAttemptId, dispatchMarker, population, active, archived })),
   };
 }
 
@@ -1927,23 +1930,17 @@ async function closeThreadlessPreparedAttempt(
     return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure marker does not match the exact canonical attempt" };
   }
   const dispatchMarker = `[dispatch:${dispatchIntentIdempotencyKey}]`;
-  const preparationRows = db.prepare(
-    `SELECT event_sequence, event_json, idempotency_key
-     FROM state_events
-     WHERE project_id = ? AND aggregate_type = 'work_item' AND aggregate_id = ?
-       AND event_type = 'work_item_transitioned'
-       AND json_extract(event_json, '$.executionAttemptId') = ?
-     ORDER BY event_sequence`,
-  ).all(request.projectId, request.workItemId, request.executionAttemptId) as Array<{ event_sequence: number; event_json: string; idempotency_key: string }>;
-  if (preparationRows.length !== 1 || preparationRows[0]!.idempotency_key !== dispatchIntentIdempotencyKey) {
-    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure requires one exact durable dispatch preparation and intent receipt" };
-  }
-  const preparation = preparationRows[0]!;
-  const originalReceipt = db.prepare(
-    "SELECT request_digest, committed_event_sequence FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?",
-  ).get(request.projectId, dispatchIntentIdempotencyKey) as { request_digest: string; committed_event_sequence: number } | undefined;
-  if (!originalReceipt || originalReceipt.committed_event_sequence !== preparation.event_sequence) {
-    return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure requires the exact durable dispatch intent receipt" };
+  let preparation: ReturnType<typeof resolveThreadlessPreparedOrigin>;
+  try {
+    preparation = resolveThreadlessPreparedOrigin(db, {
+      projectId: request.projectId,
+      workItemId: request.workItemId,
+      executionAttemptId: request.executionAttemptId,
+      idempotencyKey: dispatchIntentIdempotencyKey,
+    });
+  } catch (error) {
+    if (isRefusal(error)) return { outcome: error.data.code, subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: error.data.message };
+    return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure preparation origin is unavailable" };
   }
   const replayRequestDigest = threadlessPreparedReplayProbeDigest({
     projectId: request.projectId,
@@ -1967,19 +1964,18 @@ async function closeThreadlessPreparedAttempt(
     const preMutationGuard: PreMutationGuard = async () => {
       try {
         const reread = dispatchInventoryEvidence(await dispatchThreadInventory(bb, request.projectId), request.projectId, request.executionAttemptId!, dispatchMarker);
-        if (reread.digest === inventory.digest && reread.matching.length === 0) return null;
+        if (reread.snapshotDigest === inventory.snapshotDigest && reread.matching.length === 0) return null;
         return dispatchRecoveryRefusal(request.projectId, "native dispatch inventory changed before thread-less closure mutation", {
-          initialDigest: inventory.digest,
-          rereadDigest: reread.digest,
+          initialDigest: inventory.snapshotDigest,
+          rereadDigest: reread.snapshotDigest,
           matching: reread.matching.map((thread) => ({ id: thread.id, projectId: thread.projectId, parentThreadId: thread.parentThreadId, title: thread.title, archivedAt: thread.archivedAt, deletedAt: thread.deletedAt })),
         });
       } catch (error) {
         return dispatchRecoveryRefusal(request.projectId, `complete active and archived native inventory reread is unavailable: ${String(error)}`);
       }
     };
-    const inventoryDigest = inventory.digest;
     const dispatchEvidence = {
-      kind: "dispatch_refusal" as const,
+      kind: "dispatch_guard_proof" as const,
       projectId: request.projectId,
       workItemId: request.workItemId,
       executionAttemptId: request.executionAttemptId,
@@ -1995,7 +1991,7 @@ async function closeThreadlessPreparedAttempt(
       requestDigest: replayRequestDigest,
     };
     const terminalizationEvidence = {
-      kind: "terminalization_refusal" as const,
+      kind: "terminalization_guard_proof" as const,
       projectId: request.projectId,
       workItemId: request.workItemId,
       executionAttemptId: request.executionAttemptId,
@@ -2009,11 +2005,33 @@ async function closeThreadlessPreparedAttempt(
         correctionId,
         dispatchMarker,
         evidence: [
-          { kind: "preparation", eventSequence: preparation.event_sequence, reference: `state-event:${preparation.event_sequence}`, digest: sha256(preparation.event_json) },
-          { kind: "dispatch_refusal", reference: `mutation:${dispatchIntentIdempotencyKey}`, digest: sha256(canonicalJson(dispatchEvidence)) },
+          { kind: "preparation", eventSequence: preparation.eventSequence, reference: `state-event:${preparation.eventSequence}`, digest: sha256(preparation.eventJson) },
+          { kind: "dispatch_guard_proof", reference: `mutation:${dispatchIntentIdempotencyKey}`, digest: sha256(canonicalJson(dispatchEvidence)) },
           { kind: "replay_conflict", reference: `replay:${dispatchIntentIdempotencyKey}`, requestDigest: replayRequestDigest, digest: sha256(canonicalJson(replayEvidence)) },
-          { kind: "terminalization_refusal", reference: "terminalization-refusal", digest: sha256(canonicalJson(terminalizationEvidence)) },
-          { kind: "zero_thread", reference: "native-thread-inventory", population: inventory.population, activeCount: inventory.active.length, archivedCount: inventory.archived.length, matchingCount: 0, digest: inventoryDigest },
+          { kind: "terminalization_guard_proof", reference: "terminalization-guard", digest: sha256(canonicalJson(terminalizationEvidence)) },
+          {
+            kind: "zero_thread",
+            reference: "native-thread-inventory",
+            population: inventory.population,
+            activeCount: inventory.active.length,
+            archivedCount: inventory.archived.length,
+            matchingCount: 0,
+            observationCount: 2,
+            observationBound: THREADLESS_PREPARED_INVENTORY_OBSERVATION_BOUND,
+            snapshotDigest: inventory.snapshotDigest,
+            digest: threadlessPreparedInventoryEvidenceDigest({
+              projectId: request.projectId,
+              executionAttemptId: request.executionAttemptId!,
+              dispatchMarker,
+              population: inventory.population,
+              activeCount: inventory.active.length,
+              archivedCount: inventory.archived.length,
+              matchingCount: 0,
+              observationCount: 2,
+              observationBound: THREADLESS_PREPARED_INVENTORY_OBSERVATION_BOUND,
+              snapshotDigest: inventory.snapshotDigest,
+            }),
+          },
         ],
       },
     };
