@@ -29053,6 +29053,55 @@ async function plugin(bb, options = {}) {
   }
   const recoveryInFlight = /* @__PURE__ */ new Set();
   const RECOVERY_UNRECOVERABLE = "unrecoverable";
+  const recoveryEpisodeState = (input) => {
+    if (input === void 0 || input === null) return {};
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("invalid error-recovery episode state");
+    const state = {};
+    for (const [key, target] of Object.entries(input)) {
+      if (typeof target !== "string" || target.length === 0) throw new Error("invalid error-recovery episode target");
+      state[key] = target;
+    }
+    return state;
+  };
+  let recoveryEpisodes = {};
+  let recoveryEpisodesLoaded = false;
+  let recoveryEpisodeQueue = Promise.resolve();
+  const enqueueRecoveryEpisode = (work) => {
+    const result2 = recoveryEpisodeQueue.then(work);
+    recoveryEpisodeQueue = result2.then(() => void 0, () => void 0);
+    return result2;
+  };
+  const loadRecoveryEpisodes = async () => {
+    if (recoveryEpisodesLoaded) return;
+    recoveryEpisodes = recoveryEpisodeState(await bb.storage.kv.get("error-recovery.episodes"));
+    recoveryEpisodesLoaded = true;
+  };
+  const recoverySendTimeouts = /* @__PURE__ */ new WeakSet();
+  const reserveRecoveryEpisode = (key) => enqueueRecoveryEpisode(async () => {
+    await loadRecoveryEpisodes();
+    if (key in recoveryEpisodes) return false;
+    const next = { ...recoveryEpisodes, [key]: "native-error-episode" };
+    await bb.storage.kv.set("error-recovery.episodes", next);
+    recoveryEpisodes = next;
+    return true;
+  });
+  const releaseRecoveryEpisode = (key) => enqueueRecoveryEpisode(async () => {
+    await loadRecoveryEpisodes();
+    if (!(key in recoveryEpisodes)) return;
+    const next = { ...recoveryEpisodes };
+    delete next[key];
+    await bb.storage.kv.set("error-recovery.episodes", next);
+    recoveryEpisodes = next;
+  });
+  const clearRecoveryEpisode = (projectId, threadId) => enqueueRecoveryEpisode(async () => {
+    await loadRecoveryEpisodes();
+    const key = JSON.stringify([projectId, threadId]);
+    if (!(key in recoveryEpisodes)) return;
+    const next = { ...recoveryEpisodes };
+    delete next[key];
+    await bb.storage.kv.set("error-recovery.episodes", next);
+    recoveryEpisodes = next;
+  });
   const withRecoveryTimeout = async (label, operation) => {
     const controller = new AbortController();
     let timer;
@@ -29111,7 +29160,9 @@ async function plugin(bb, options = {}) {
         new Promise((_, reject) => {
           timer = setTimeout(() => {
             timedOut = true;
-            reject(new Error(`error-recovery threads.send timed out after ${ERROR_RECOVERY_IO_TIMEOUT_MS}ms`));
+            const error48 = new Error(`error-recovery threads.send timed out after ${ERROR_RECOVERY_IO_TIMEOUT_MS}ms`);
+            recoverySendTimeouts.add(error48);
+            reject(error48);
           }, ERROR_RECOVERY_IO_TIMEOUT_MS);
         })
       ]);
@@ -29391,16 +29442,37 @@ async function plugin(bb, options = {}) {
         bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=lane-no-longer-current`);
         return false;
       }
-      await withRecoverySendTimeout(threadId, () => bb.sdk.threads.send({
-        threadId,
-        mode: "auto",
-        input: [{
-          type: "text",
-          visibility: "agent-only",
-          text: `RECOVERY WAKE \u2014 reconcile state before resuming. The workspace and recorded conversation survived the daemon interruption, but the interrupted turn may have half-applied intent and a composed instruction may not have been delivered. Observed checkout head: ${head}. Re-fetch and confirm the current head, reconcile the frozen work order and canonical state against the conversation, identify any half-applied mutation or lost delivery, and re-run every pre-crash measurement whose command and output are not visible before continuing.`,
-          mentions: []
-        }]
-      }));
+      const latestThread = await withRecoveryTimeout("threads.get", (signal) => bb.sdk.threads.get({ threadId, signal }));
+      if (latestThread.id !== threadId || latestThread.projectId !== projectId || latestThread.archivedAt !== null || latestThread.deletedAt !== null) {
+        bb.log.error(`error-recovery target unrecoverable: project=${projectId} thread=${threadId} reason=canonical-target-invalid`);
+        return RECOVERY_UNRECOVERABLE;
+      }
+      if (latestThread.status === "idle") {
+        await clearRecoveryEpisode(projectId, threadId);
+        return false;
+      }
+      if (latestThread.status !== "error") return false;
+      if (!await reserveRecoveryEpisode(recoveryKey)) {
+        bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=error-episode-already-recovered`);
+        return false;
+      }
+      try {
+        await withRecoverySendTimeout(threadId, () => bb.sdk.threads.send({
+          threadId,
+          mode: "auto",
+          input: [{
+            type: "text",
+            visibility: "agent-only",
+            text: `RECOVERY WAKE \u2014 reconcile state before resuming. The workspace and recorded conversation survived the daemon interruption, but the interrupted turn may have half-applied intent and a composed instruction may not have been delivered. Observed checkout head: ${head}. Re-fetch and confirm the current head, reconcile the frozen work order and canonical state against the conversation, identify any half-applied mutation or lost delivery, and re-run every pre-crash measurement whose command and output are not visible before continuing.`,
+            mentions: []
+          }]
+        }));
+      } catch (error48) {
+        if (!(typeof error48 === "object" && error48 !== null && recoverySendTimeouts.has(error48))) {
+          await releaseRecoveryEpisode(recoveryKey);
+        }
+        throw error48;
+      }
       bb.log.warn(`error-recovery wake sent: project=${projectId} thread=${threadId} mode=auto head=${head}`);
       return true;
     } catch (error48) {
@@ -30225,8 +30297,9 @@ ${thread.titleFallback ?? ""}`);
       write: (state) => bb.storage.kv.set(STALL_GUARD_KV_KEY, state)
     }
   });
-  const observe = (payload) => {
+  const observe = async (payload) => {
     const { id: id2, status } = threadEventStatus(payload);
+    if (status === "idle") await clearRecoveryEpisode(payload.thread.projectId, id2);
     return watcher.observe(id2, status);
   };
   const observeCapacityAfter = async (payload) => {
@@ -30255,23 +30328,27 @@ ${thread.titleFallback ?? ""}`);
   });
   bb.events.on("thread.archived", async (payload) => {
     await (async () => {
+      await clearRecoveryEpisode(payload.thread.projectId, payload.thread.id);
       await watcher.observe(payload.thread.id, payload.thread.status, false, true);
       if (payload.thread.parentThreadId != null) await idleFleetDetector.observeCapacity(payload.thread.projectId);
     })().catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`));
   });
   bb.events.on("thread.deleted", async (payload) => {
     await (async () => {
+      await clearRecoveryEpisode(payload.thread.projectId, payload.thread.id);
       await watcher.observe(payload.thread.id, payload.thread.status, false, true);
       if (payload.thread.parentThreadId != null) await idleFleetDetector.observeCapacity(payload.thread.projectId);
     })().catch((error48) => bb.log.warn(`lane observation failed: ${String(error48)}`));
   });
   const unsubscribe = subscribeToThreadChanges(bb.sdk, async (threadId, status, archived = false, projectId, parentThreadId) => {
+    if (status === "idle" && projectId) await clearRecoveryEpisode(projectId, threadId);
     await watcher.observe(threadId, status, void 0, archived);
     if (projectId && parentThreadId != null) await idleFleetDetector.observeCapacity(projectId);
   });
   bb.onDispose(unsubscribe);
   bb.background.service("lane-watcher", {
     async start(signal) {
+      await loadRecoveryEpisodes().catch((error48) => bb.log.warn(`error-recovery episode state unreadable: ${String(error48)}`));
       void idleFleetDetector.rearm();
       void reconcileErrorRecovery().catch((error48) => bb.log.warn(`error-recovery reconcile failed: ${String(error48)}`));
       while (!signal.aborted) {

@@ -3678,6 +3678,56 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
 
   const recoveryInFlight = new Set<string>();
   const RECOVERY_UNRECOVERABLE = "unrecoverable" as const;
+  type RecoveryEpisodeLedger = Record<string, string>;
+  const recoveryEpisodeState = (input: unknown): RecoveryEpisodeLedger => {
+    if (input === undefined || input === null) return {};
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("invalid error-recovery episode state");
+    const state: RecoveryEpisodeLedger = {};
+    for (const [key, target] of Object.entries(input)) {
+      if (typeof target !== "string" || target.length === 0) throw new Error("invalid error-recovery episode target");
+      state[key] = target;
+    }
+    return state;
+  };
+  let recoveryEpisodes: RecoveryEpisodeLedger = {};
+  let recoveryEpisodesLoaded = false;
+  let recoveryEpisodeQueue = Promise.resolve();
+  const enqueueRecoveryEpisode = <T>(work: () => Promise<T>): Promise<T> => {
+    const result = recoveryEpisodeQueue.then(work);
+    recoveryEpisodeQueue = result.then(() => undefined, () => undefined);
+    return result;
+  };
+  const loadRecoveryEpisodes = async () => {
+    if (recoveryEpisodesLoaded) return;
+    recoveryEpisodes = recoveryEpisodeState(await bb.storage.kv.get<unknown>("error-recovery.episodes"));
+    recoveryEpisodesLoaded = true;
+  };
+  const recoverySendTimeouts = new WeakSet<object>();
+  const reserveRecoveryEpisode = (key: string) => enqueueRecoveryEpisode(async () => {
+    await loadRecoveryEpisodes();
+    if (key in recoveryEpisodes) return false;
+    const next = { ...recoveryEpisodes, [key]: "native-error-episode" };
+    await bb.storage.kv.set("error-recovery.episodes", next);
+    recoveryEpisodes = next;
+    return true;
+  });
+  const releaseRecoveryEpisode = (key: string) => enqueueRecoveryEpisode(async () => {
+    await loadRecoveryEpisodes();
+    if (!(key in recoveryEpisodes)) return;
+    const next = { ...recoveryEpisodes };
+    delete next[key];
+    await bb.storage.kv.set("error-recovery.episodes", next);
+    recoveryEpisodes = next;
+  });
+  const clearRecoveryEpisode = (projectId: string, threadId: string) => enqueueRecoveryEpisode(async () => {
+    await loadRecoveryEpisodes();
+    const key = JSON.stringify([projectId, threadId]);
+    if (!(key in recoveryEpisodes)) return;
+    const next = { ...recoveryEpisodes };
+    delete next[key];
+    await bb.storage.kv.set("error-recovery.episodes", next);
+    recoveryEpisodes = next;
+  });
   const withRecoveryTimeout = async <T>(label: string, operation: (signal: AbortSignal) => Promise<T>): Promise<T> => {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -3740,7 +3790,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
             timedOut = true;
-            reject(new Error(`error-recovery threads.send timed out after ${ERROR_RECOVERY_IO_TIMEOUT_MS}ms`));
+            const error = new Error(`error-recovery threads.send timed out after ${ERROR_RECOVERY_IO_TIMEOUT_MS}ms`);
+            recoverySendTimeouts.add(error);
+            reject(error);
           }, ERROR_RECOVERY_IO_TIMEOUT_MS);
         }),
       ]);
@@ -4026,18 +4078,39 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
         bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=lane-no-longer-current`);
         return false;
       }
+      const latestThread = await withRecoveryTimeout("threads.get", (signal) => bb.sdk.threads.get({ threadId, signal }));
+      if (latestThread.id !== threadId || latestThread.projectId !== projectId || latestThread.archivedAt !== null || latestThread.deletedAt !== null) {
+        bb.log.error(`error-recovery target unrecoverable: project=${projectId} thread=${threadId} reason=canonical-target-invalid`);
+        return RECOVERY_UNRECOVERABLE;
+      }
+      if (latestThread.status === "idle") {
+        await clearRecoveryEpisode(projectId, threadId);
+        return false;
+      }
+      if (latestThread.status !== "error") return false;
+      if (!await reserveRecoveryEpisode(recoveryKey)) {
+        bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=error-episode-already-recovered`);
+        return false;
+      }
       // The SDK cannot cancel threads.send. Bound only the duplicate-suppression guard;
       // an expired send remains outstanding and is reported as an anomaly.
-      await withRecoverySendTimeout(threadId, () => bb.sdk.threads.send({
-        threadId,
-        mode: "auto",
-        input: [{
-          type: "text",
-          visibility: "agent-only",
-          text: `RECOVERY WAKE — reconcile state before resuming. The workspace and recorded conversation survived the daemon interruption, but the interrupted turn may have half-applied intent and a composed instruction may not have been delivered. Observed checkout head: ${head}. Re-fetch and confirm the current head, reconcile the frozen work order and canonical state against the conversation, identify any half-applied mutation or lost delivery, and re-run every pre-crash measurement whose command and output are not visible before continuing.`,
-          mentions: [],
-        }],
-      }));
+      try {
+        await withRecoverySendTimeout(threadId, () => bb.sdk.threads.send({
+          threadId,
+          mode: "auto",
+          input: [{
+            type: "text",
+            visibility: "agent-only",
+            text: `RECOVERY WAKE — reconcile state before resuming. The workspace and recorded conversation survived the daemon interruption, but the interrupted turn may have half-applied intent and a composed instruction may not have been delivered. Observed checkout head: ${head}. Re-fetch and confirm the current head, reconcile the frozen work order and canonical state against the conversation, identify any half-applied mutation or lost delivery, and re-run every pre-crash measurement whose command and output are not visible before continuing.`,
+            mentions: [],
+          }],
+        }));
+      } catch (error) {
+        if (!(typeof error === "object" && error !== null && recoverySendTimeouts.has(error))) {
+          await releaseRecoveryEpisode(recoveryKey);
+        }
+        throw error;
+      }
       bb.log.warn(`error-recovery wake sent: project=${projectId} thread=${threadId} mode=auto head=${head}`);
       return true;
     } catch (error) {
@@ -4947,8 +5020,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     },
   });
 
-  const observe = (payload: Parameters<typeof threadEventStatus>[0]) => {
+  const observe = async (payload: Parameters<typeof threadEventStatus>[0]) => {
     const { id, status } = threadEventStatus(payload);
+    if (status === "idle") await clearRecoveryEpisode(payload.thread.projectId, id);
     return watcher.observe(id, status);
   };
   const observeCapacityAfter = async (payload: Parameters<typeof threadEventStatus>[0]) => {
@@ -4977,23 +5051,27 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   });
   bb.events.on("thread.archived", async (payload) => {
     await (async () => {
+      await clearRecoveryEpisode(payload.thread.projectId, payload.thread.id);
       await watcher.observe(payload.thread.id, payload.thread.status, false, true);
       if (payload.thread.parentThreadId != null) await idleFleetDetector.observeCapacity(payload.thread.projectId);
     })().catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`));
   });
   bb.events.on("thread.deleted", async (payload) => {
     await (async () => {
+      await clearRecoveryEpisode(payload.thread.projectId, payload.thread.id);
       await watcher.observe(payload.thread.id, payload.thread.status, false, true);
       if (payload.thread.parentThreadId != null) await idleFleetDetector.observeCapacity(payload.thread.projectId);
     })().catch((error) => bb.log.warn(`lane observation failed: ${String(error)}`));
   });
   const unsubscribe = subscribeToThreadChanges(bb.sdk, async (threadId, status, archived = false, projectId, parentThreadId) => {
+    if (status === "idle" && projectId) await clearRecoveryEpisode(projectId, threadId);
     await watcher.observe(threadId, status, undefined, archived);
     if (projectId && parentThreadId != null) await idleFleetDetector.observeCapacity(projectId);
   });
   bb.onDispose(unsubscribe);
   bb.background.service("lane-watcher", {
     async start(signal) {
+      await loadRecoveryEpisodes().catch((error) => bb.log.warn(`error-recovery episode state unreadable: ${String(error)}`));
       void idleFleetDetector.rearm();
       void reconcileErrorRecovery().catch((error) => bb.log.warn(`error-recovery reconcile failed: ${String(error)}`));
       while (!signal.aborted) {
