@@ -85,7 +85,7 @@ explicit `DONE`/`BLOCKED`/`WAITING` return path, and native input digest. The
 candidate is re-observed immediately before every native spawn or retry; any
 movement retires the spawn opportunity while preserving the prepared intent.
 
-Enter it from `in_progress` only while an active writing attempt exists; that attempt is closed as `done`. Omitting a work attempt is legal for the orchestrator-verifies-the-fixed-head shape. If supplied, the attempt must be `review` with a lane, requested profile, and one explicit candidate kind; its initial thread ID is optional. These requirements and the registration are enforced by [`workAttemptSchema` and `applyWorkItemTransition`](../src/foundation.ts).
+Enter it from `in_progress` with an exact accepted-DONE writing-attempt handoff; the completed attempt is retained as `done` and is never re-terminalized. An explicit legacy/recovery handoff is available only under its dedicated reason. Omitting a work attempt is legal for the orchestrator-verifies-the-fixed-head shape. If supplied, the attempt must be `review` with a lane, requested profile, and one explicit candidate kind; its initial thread ID is optional. These requirements and the registration are enforced by [`workAttemptSchema` and `applyWorkItemTransition`](../src/foundation.ts).
 
 The canonical exits are [`WORK_ITEM_TRANSITIONS`](../src/foundation.ts):
 
