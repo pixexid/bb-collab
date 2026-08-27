@@ -8,13 +8,7 @@ BB thread/env, Git/GitHub, plugin state; read [Ponytail](../ponytail.md) and [ru
 
 For an execution terminal report, invoke core `build_terminal_report` with the exact IDs, outcome, reason, native completion event, and turn. Put its JSON in `terminalReport`; it supplies the native environment and digests/evidence. Submission owns receipt fields.
 
-## Receipt
-
-`terminalReport` (`src/foundation.ts:2795-2824`) builder keys `{receiptVersion:1,outcome,projectId,assignmentId,executionAttemptId,workItemId,roleId,roleGeneration,repoTargetId,environmentId,threadId,branchName,baseSha,candidateSha,nativeReceiptDigest,actualProfileDigest,candidateObservationDigest,reasonCode,nativeEventId,nativeEventSeq,nativeTurnId,evidence:[{kind,digest,ref}]}`; assignment, role, generation, environment, branch, base, candidate may be null. Submission owns optional `reportedAtMs`, `receiptEventId`, `receiptEventSeq`, `receivedAtMs`.
-
-Candidate (`server.ts:2335-2346`): `{projectId,workItemId,executionAttemptId,repoTargetId,resourceRevision,environmentId,branchName,baseSha,candidateSha,checkout,workingTree}`. Checkout: `{kind:"branch",branchName,headSha}|{kind:"detached",headSha}|{kind:"unborn",branchName}|{kind:"unknown",reason}`. Working tree: `{deletions,files:[{deletions,insertions,path,status}],hasUncommittedChanges,insertions,lineStatsComplete,state}`; nullability/enums: `types/bb-plugin-sdk.d.ts:3005-3083`.
-
-Profile (`server.ts:2319-2326`; `src/foundation.ts:2467-2475`): `{providerId,model,reasoningLevel,permissionMode,serviceTier,visibility}`. `canonicalJson` is `JSON.stringify(stableValue(value))` (`src/foundation.ts:3811-3837`): sorted keys, compact JSON, no trailing newline. Use `jq -j`, never `jq -c`: its newline makes the digest wrong. Four wrong digests occurred.
+Canonical digests are defined by canonical JSON — sorted keys, JSON.stringify, no trailing newline. Hand-computed digests (e.g. jq | shasum) silently diverge and will be refused.
 
 No `node_modules`? Run `npm install`; use [delegation](../rules.md#delegation-return-path).
 
