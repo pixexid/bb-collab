@@ -1364,7 +1364,7 @@ function githubPrChecksWait(executionAttemptId: string, overrides: Partial<Githu
     declaredBySeat: "worker-seat",
     executionAttemptId,
     waitingThreadId: "thread-work-item-1",
-    waitingRoleId: "worker",
+    waitingRoleId: "project-orchestrator",
     waitingRoleGeneration: 1,
     wakerSchedule: "fleet-watchdog",
     deadlineAtMs: Date.now() + 60_000,
@@ -1375,7 +1375,8 @@ function githubPrChecksWait(executionAttemptId: string, overrides: Partial<Githu
 async function githubPrBaseFixture() {
   const fixture = await assignmentFixture({ targetRemoteUrl: `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git` });
   const started = applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
-    roleId: "worker",
+    actorReceiptId: "role-actor-assignment",
+    roleId: "project-orchestrator",
     expectedGeneration: 1,
   }));
   expect(started.outcome).toBe("OK");
@@ -1594,6 +1595,119 @@ describe("GH-658 canonical GitHub PR waits", () => {
       const result = applyWithFixtureReceipt(fixture.fixture.db, item.mutate(request));
       expect(result.outcome, item.name).toBe(item.expectedRefusal);
       expect(exportFoundation(fixture.fixture.db, PROJECT_ID), item.name).toEqual(before);
+    }
+  });
+});
+
+describe("GH-733 authoritative WorkItem wait role identity", () => {
+  async function correctionAttemptFixture(actorReceiptId = "role-actor-assignment") {
+    const fixture = await assignmentFixture({ targetRemoteUrl: `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git` });
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, undefined, 3, {
+      idempotencyKey: `gh733-correction-${actorReceiptId}`,
+      actorReceiptId,
+      workAttempt: { laneId: "lane-gh733-correction", threadId: "thread-gh733-correction", assignmentKind: "write", requestedProfile: ROLE_PROFILE },
+    });
+    expect(applyWithFixtureReceipt(fixture.db, request)).toMatchObject({ outcome: "OK" });
+    const attempt = fixture.db.prepare(
+      "SELECT execution_attempt_id, thread_id, role_id, role_generation FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND assignment_kind = 'write' ORDER BY attempt_ordinal DESC LIMIT 1",
+    ).get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string; thread_id: string; role_id: string | null; role_generation: number | null };
+    const revision = (fixture.db.prepare("SELECT resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID) as { resource_revision: number }).resource_revision;
+    return { fixture, attempt, revision };
+  }
+
+  function exactWaitRequest(
+    fixture: Awaited<ReturnType<typeof correctionAttemptFixture>>,
+    overrides: Partial<ApplyRequest> = {},
+  ): ApplyRequest {
+    return transitionRequest(fixture.fixture.fenceToken, "blocked", fixture.revision, {
+      idempotencyKey: "gh733-wait",
+      actorReceiptId: "role-actor-assignment",
+      roleId: "project-orchestrator",
+      expectedGeneration: 1,
+      workItemWait: githubPrChecksWait(fixture.attempt.execution_attempt_id, {
+        waitingThreadId: fixture.attempt.thread_id,
+        waitingRoleId: "project-orchestrator",
+        waitingRoleGeneration: 1,
+      }),
+      githubPrObservation: githubPrObservation(),
+      ...overrides,
+    });
+  }
+
+  async function registerExternalWait(
+    fixture: Awaited<ReturnType<typeof correctionAttemptFixture>>,
+    request: ApplyRequest,
+  ) {
+    return fixture.fixture.host.harness.callAgentTool("register_external_wait", { request }, { projectId: request.projectId, threadId: fixture.attempt.thread_id });
+  }
+
+  it("persists the verified actor identity for correction write and review attempts and registers both exact waits", async () => {
+    const correction = await correctionAttemptFixture();
+    expect(correction.attempt).toMatchObject({ role_id: "project-orchestrator", role_generation: 1 });
+    expect(await registerExternalWait(correction, exactWaitRequest(correction))).toBe("registered");
+
+    const review = await assignmentFixture({ targetRemoteUrl: `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git` });
+    expect(applyWithFixtureReceipt(review.db, transitionRequest(review.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+    const inserted = applyWithFixtureReceipt(review.db, legacyReviewPendingRequest(review.db, review.fenceToken, 3, {
+      idempotencyKey: "gh733-review-insertion",
+      actorReceiptId: "role-actor-assignment",
+      workAttempt: {
+        laneId: "lane-gh733-review",
+        threadId: "thread-gh733-review",
+        assignmentKind: "review",
+        requestedProfile: ROLE_PROFILE,
+        candidateKind: "pull-request",
+        reviewPrNumber: 658,
+        reviewPrHeadSha: CANDIDATE_SHA,
+      },
+    }));
+    expect(inserted).toMatchObject({ outcome: "OK" });
+    const attempt = review.db.prepare(
+      "SELECT execution_attempt_id, thread_id, role_id, role_generation FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND assignment_kind = 'review'",
+    ).get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string; thread_id: string; role_id: string; role_generation: number };
+    expect(attempt).toMatchObject({ role_id: "project-orchestrator", role_generation: 1 });
+    const revision = (review.db.prepare("SELECT resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID) as { resource_revision: number }).resource_revision;
+    const reviewFixture = { fixture: review, attempt, revision };
+    expect(await registerExternalWait(reviewFixture, exactWaitRequest(reviewFixture))).toBe("registered");
+  });
+
+  it.each([
+    ["role", { roleId: "director" as const }, "ROLE_HOLDER_MISMATCH"],
+    ["generation", { expectedGeneration: 2 }, "ROLE_GENERATION_STALE"],
+  ] as const)("refuses a caller-declared top-level %s mismatch before correction attempt creation", async (_name, mismatch, expected) => {
+    const fixture = await assignmentFixture({ targetRemoteUrl: `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git` });
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, undefined, 3, {
+      idempotencyKey: `gh733-top-level-${_name}-mismatch`,
+      actorReceiptId: "role-actor-assignment",
+      workAttempt: { laneId: "lane-gh733-mismatch", threadId: "thread-gh733-mismatch", assignmentKind: "write", requestedProfile: ROLE_PROFILE },
+      ...mismatch,
+    });
+    const before = exportFoundation(fixture.db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(fixture.db, request).outcome).toBe(expected);
+    expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("refuses every null or foreign exact binding through register_external_wait without mutation", async () => {
+    const cases: Array<{ name: string; expected: string; nullActor?: boolean; mutate: (request: ApplyRequest) => ApplyRequest }> = [
+      { name: "null role identity", expected: "ROLE_CONTEXT_FOREIGN", nullActor: true, mutate: (request) => request },
+      { name: "foreign role", expected: "ROLE_CONTEXT_FOREIGN", mutate: (request) => ({ ...request, workItemWait: { ...(request.workItemWait as GithubPrWaitRegistration), waitingRoleId: "director" } }) },
+      { name: "foreign generation", expected: "ROLE_CONTEXT_FOREIGN", mutate: (request) => ({ ...request, workItemWait: { ...(request.workItemWait as GithubPrWaitRegistration), waitingRoleGeneration: 2 } }) },
+      { name: "foreign thread", expected: "ROLE_CONTEXT_FOREIGN", mutate: (request) => ({ ...request, workItemWait: { ...(request.workItemWait as GithubPrWaitRegistration), waitingThreadId: "thread-foreign" } }) },
+      { name: "foreign attempt", expected: "EXECUTION_CONTEXT_FOREIGN", mutate: (request) => ({ ...request, workItemWait: { ...(request.workItemWait as GithubPrWaitRegistration), executionAttemptId: "attempt-foreign" } }) },
+      { name: "foreign WorkItem", expected: "WORK_ITEM_UNKNOWN", mutate: (request) => ({ ...request, workItemId: "work-item-foreign" }) },
+      { name: "foreign repo", expected: "REPO_TARGET_FOREIGN", mutate: (request) => ({ ...request, workItemWait: { ...(request.workItemWait as GithubPrWaitRegistration), repo: "foreign-repo" } }) },
+      { name: "foreign PR", expected: "EXTERNAL_RESPONSE_INVALID", mutate: (request) => ({ ...request, githubPrObservation: githubPrObservation({ pullRequestNumber: 659 }) }) },
+      { name: "foreign head", expected: "EXTERNAL_RESPONSE_INVALID", mutate: (request) => ({ ...request, githubPrObservation: githubPrObservation({ headSha: "c".repeat(40) }) }) },
+    ];
+    for (const testCase of cases) {
+      const fixture = await correctionAttemptFixture(testCase.nullActor ? RECEIPT_ID : "role-actor-assignment");
+      const request = testCase.mutate(exactWaitRequest(fixture));
+      const before = exportFoundation(fixture.fixture.db, PROJECT_ID);
+      expect(await registerExternalWait(fixture, request), testCase.name).toBe("refused");
+      expect(applyFixtureMutation(fixture.fixture.db, request, null, null, null, null, null, null, true).outcome, testCase.name).toBe(testCase.expected);
+      expect(exportFoundation(fixture.fixture.db, PROJECT_ID), testCase.name).toEqual(before);
     }
   });
 });
