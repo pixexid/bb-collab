@@ -2907,6 +2907,23 @@ const threadlessPreparedClosureSchema = z
     ]),
   })
   .strict();
+const strandedExecutionAttemptClosureSchema = z
+  .object({
+    correctionId: id,
+    evidence: z.object({
+      kind: z.literal("stranded-execution-attempt"),
+      projectId: id,
+      workItemId: id,
+      executionAttemptId: id,
+      threadId: id,
+      nativeEventId: id,
+      nativeEventSeq: z.number().int().positive(),
+      nativeTurnId: id,
+      incapacity: z.enum(["environment-unavailable", "native-correlation-ambiguous"]),
+      digest: digestSchema,
+    }).strict(),
+  })
+  .strict();
 
 export const applyRequestSchema = z
   .object({
@@ -2976,6 +2993,7 @@ export const applyRequestSchema = z
     interruption: interruptionEvidenceSchema.optional(),
     historicalCorrection: historicalCorrectionSchema.optional(),
     threadlessPreparedClosure: threadlessPreparedClosureSchema.optional(),
+    strandedExecutionAttemptClosure: strandedExecutionAttemptClosureSchema.optional(),
     migration: migrationPrepareSchema.optional(),
     migrationStep: migrationStepSchema.optional(),
   })
@@ -8757,6 +8775,124 @@ function applyThreadlessPreparedClosure(
   );
 }
 
+function applyStrandedExecutionAttemptClosure(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  digest: string,
+): FoundationResult {
+  const closure = request.strandedExecutionAttemptClosure;
+  if (!closure || request.lifecycleState !== "failed" || !request.executionAttemptId || request.workAttempt !== undefined || request.workItemWait !== undefined || request.workItemUnblock !== undefined || request.workItemExternalEvent !== undefined) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "stranded execution closure requires a failed lifecycle transition without a work attempt or wait");
+  }
+  const workItemConfigRevision = request.workItemId === undefined
+    ? undefined
+    : asRow<{ config_revision: number }>(db.prepare(
+      "SELECT config_revision FROM work_items WHERE project_id = ? AND work_item_id = ?",
+    ).get(request.projectId, request.workItemId))?.config_revision;
+  const configRevision = requireConfig(db, request, workItemConfigRevision);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request, true);
+  const workItem = requireWorkItem(db, request, configRevision, undefined, true);
+  if (workItem.lifecycle_state !== "in_progress") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "stranded execution closure requires an in-progress work item");
+  }
+  const attempt = requireAttemptForMutation(db, request, request.executionAttemptId);
+  const evidence = closure.evidence;
+  if (
+    attempt.work_item_id !== workItem.work_item_id ||
+    attempt.repo_target_id !== workItem.repo_target_id ||
+    attempt.origin !== "work_item" ||
+    attempt.assignment_kind !== "write" ||
+    !WORK_ITEM_CAPACITY_ATTEMPT_STATES.includes(attempt.state as typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES[number]) ||
+    attempt.thread_id === null ||
+    evidence.projectId !== request.projectId ||
+    evidence.workItemId !== workItem.work_item_id ||
+    evidence.executionAttemptId !== attempt.execution_attempt_id ||
+    evidence.threadId !== attempt.thread_id
+  ) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "stranded execution closure does not match the exact active writing attempt");
+  }
+  const terminalFields: Array<keyof ExecutionAttemptRow> = [
+    "terminal_result", "reported_outcome", "terminal_report_digest", "terminal_report_json",
+    "terminal_actual_profile_digest", "terminal_event_id", "terminal_event_seq", "completed_at_ms",
+  ];
+  if (terminalFields.some((field) => attempt[field] !== null)) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "stranded execution closure requires an unterminalized writing attempt");
+  }
+  const expectedEvidenceDigest = sha256(canonicalJson({
+    kind: evidence.kind,
+    projectId: evidence.projectId,
+    workItemId: evidence.workItemId,
+    executionAttemptId: evidence.executionAttemptId,
+    threadId: evidence.threadId,
+    nativeEventId: evidence.nativeEventId,
+    nativeEventSeq: evidence.nativeEventSeq,
+    nativeTurnId: evidence.nativeTurnId,
+    incapacity: evidence.incapacity,
+  }));
+  if (evidence.digest !== expectedEvidenceDigest) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "stranded execution closure evidence digest is not exact");
+  }
+  const nextRevision = workItem.resource_revision + 1;
+  const completedAtMs = now();
+  const attemptUpdated = db.prepare(
+    `UPDATE execution_attempts
+     SET state = 'failed', terminal_result = 'BLOCKED', reported_outcome = 'BLOCKED',
+         terminal_event_id = ?, terminal_event_seq = ?, observed_at_ms = ?, completed_at_ms = ?,
+         lease_owner_thread_id = NULL, progress_json = '{}',
+         terminalization_class = 'stranded-execution-closure', reason_code = ?
+     WHERE project_id = ? AND execution_attempt_id = ? AND state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+       AND terminal_event_id IS NULL AND terminal_event_seq IS NULL AND terminal_report_digest IS NULL`,
+  ).run(
+    evidence.nativeEventId,
+    evidence.nativeEventSeq,
+    completedAtMs,
+    completedAtMs,
+    `stranded-execution-closure:${closure.correctionId}`,
+    request.projectId,
+    attempt.execution_attempt_id,
+    ...WORK_ITEM_CAPACITY_ATTEMPT_STATES,
+  );
+  if (attemptUpdated.changes !== 1) throw refusal("WORK_ITEM_STATE_INVALID", "stranded execution attempt changed before closure");
+  const workItemUpdated = db.prepare(
+    `UPDATE work_items SET lifecycle_state = 'failed', resource_revision = ?, updated_at_ms = ?
+     WHERE project_id = ? AND work_item_id = ? AND lifecycle_state = 'in_progress' AND resource_revision = ?`,
+  ).run(nextRevision, completedAtMs, request.projectId, workItem.work_item_id, workItem.resource_revision);
+  if (workItemUpdated.changes !== 1) throw refusal("WORK_ITEM_REVISION_STALE", "work item compare-and-swap failed during stranded execution closure", {
+    currentResourceRevision: workItem.resource_revision,
+    expectedResourceRevision: request.expectedResourceRevision ?? undefined,
+  });
+  dischargeTerminalWorkItemWait(db, request.projectId, workItem.work_item_id);
+  return commitMutation(
+    db,
+    request,
+    digest,
+    actorReceiptId,
+    {
+      aggregateType: "work_item",
+      aggregateId: workItem.work_item_id,
+      aggregateRevision: nextRevision,
+      eventType: "work_item_stranded_execution_attempt_closure",
+      event: {
+        workItemId: workItem.work_item_id,
+        executionAttemptId: attempt.execution_attempt_id,
+        from: "in_progress",
+        to: "failed",
+        correction: { ...closure, evidence },
+      },
+    },
+    { expected: 1, attempted: 1, verified: 1 },
+    {
+      currentConfigRevision: configRevision,
+      currentGovernanceEpoch: governor.governance_epoch,
+      currentResourceRevision: nextRevision,
+      expectedResourceRevision: request.expectedResourceRevision ?? undefined,
+      evidence: { workItemId: workItem.work_item_id, executionAttemptId: attempt.execution_attempt_id, correction: closure },
+    },
+  );
+}
+
 function applyWorkItemCreate(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
@@ -9117,6 +9253,7 @@ function applyWorkItemTransition(
   githubPrObservation: GithubPrObservation | undefined,
 ): FoundationResult {
   if (request.threadlessPreparedClosure !== undefined) return applyThreadlessPreparedClosure(db, request, digest);
+  if (request.strandedExecutionAttemptClosure !== undefined) return applyStrandedExecutionAttemptClosure(db, request, digest);
   const committedDispatchIntent = request.reasonCode === "dispatch_intent_finalize" && request.lifecycleState === undefined && request.workAttempt?.threadId !== undefined;
   let configRevision: number;
   if (committedDispatchIntent) {

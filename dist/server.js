@@ -17466,6 +17466,21 @@ var threadlessPreparedClosureSchema = external_exports.object({
     }).strict()
   ])
 }).strict();
+var strandedExecutionAttemptClosureSchema = external_exports.object({
+  correctionId: id,
+  evidence: external_exports.object({
+    kind: external_exports.literal("stranded-execution-attempt"),
+    projectId: id,
+    workItemId: id,
+    executionAttemptId: id,
+    threadId: id,
+    nativeEventId: id,
+    nativeEventSeq: external_exports.number().int().positive(),
+    nativeTurnId: id,
+    incapacity: external_exports.enum(["environment-unavailable", "native-correlation-ambiguous"]),
+    digest: digestSchema
+  }).strict()
+}).strict();
 var applyRequestSchema = external_exports.object({
   projectId: id,
   operationClass: external_exports.enum(CANONICAL_MUTATION_CLASSES),
@@ -17531,6 +17546,7 @@ var applyRequestSchema = external_exports.object({
   interruption: interruptionEvidenceSchema.optional(),
   historicalCorrection: historicalCorrectionSchema.optional(),
   threadlessPreparedClosure: threadlessPreparedClosureSchema.optional(),
+  strandedExecutionAttemptClosure: strandedExecutionAttemptClosureSchema.optional(),
   migration: migrationPrepareSchema.optional(),
   migrationStep: migrationStepSchema.optional()
 }).strict();
@@ -21856,6 +21872,112 @@ function applyThreadlessPreparedClosure(db, request, digest2) {
     }
   );
 }
+function applyStrandedExecutionAttemptClosure(db, request, digest2) {
+  const closure = request.strandedExecutionAttemptClosure;
+  if (!closure || request.lifecycleState !== "failed" || !request.executionAttemptId || request.workAttempt !== void 0 || request.workItemWait !== void 0 || request.workItemUnblock !== void 0 || request.workItemExternalEvent !== void 0) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "stranded execution closure requires a failed lifecycle transition without a work attempt or wait");
+  }
+  const workItemConfigRevision = request.workItemId === void 0 ? void 0 : asRow(db.prepare(
+    "SELECT config_revision FROM work_items WHERE project_id = ? AND work_item_id = ?"
+  ).get(request.projectId, request.workItemId))?.config_revision;
+  const configRevision = requireConfig(db, request, workItemConfigRevision);
+  const governor = requireGovernor(db, request);
+  const actorReceiptId = requireActor(db, request);
+  requireRoleActorBinding(db, request, true);
+  const workItem = requireWorkItem(db, request, configRevision, void 0, true);
+  if (workItem.lifecycle_state !== "in_progress") {
+    throw refusal("WORK_ITEM_STATE_INVALID", "stranded execution closure requires an in-progress work item");
+  }
+  const attempt = requireAttemptForMutation(db, request, request.executionAttemptId);
+  const evidence = closure.evidence;
+  if (attempt.work_item_id !== workItem.work_item_id || attempt.repo_target_id !== workItem.repo_target_id || attempt.origin !== "work_item" || attempt.assignment_kind !== "write" || !WORK_ITEM_CAPACITY_ATTEMPT_STATES.includes(attempt.state) || attempt.thread_id === null || evidence.projectId !== request.projectId || evidence.workItemId !== workItem.work_item_id || evidence.executionAttemptId !== attempt.execution_attempt_id || evidence.threadId !== attempt.thread_id) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "stranded execution closure does not match the exact active writing attempt");
+  }
+  const terminalFields = [
+    "terminal_result",
+    "reported_outcome",
+    "terminal_report_digest",
+    "terminal_report_json",
+    "terminal_actual_profile_digest",
+    "terminal_event_id",
+    "terminal_event_seq",
+    "completed_at_ms"
+  ];
+  if (terminalFields.some((field) => attempt[field] !== null)) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "stranded execution closure requires an unterminalized writing attempt");
+  }
+  const expectedEvidenceDigest = sha256(canonicalJson({
+    kind: evidence.kind,
+    projectId: evidence.projectId,
+    workItemId: evidence.workItemId,
+    executionAttemptId: evidence.executionAttemptId,
+    threadId: evidence.threadId,
+    nativeEventId: evidence.nativeEventId,
+    nativeEventSeq: evidence.nativeEventSeq,
+    nativeTurnId: evidence.nativeTurnId,
+    incapacity: evidence.incapacity
+  }));
+  if (evidence.digest !== expectedEvidenceDigest) {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", "stranded execution closure evidence digest is not exact");
+  }
+  const nextRevision = workItem.resource_revision + 1;
+  const completedAtMs = now();
+  const attemptUpdated = db.prepare(
+    `UPDATE execution_attempts
+     SET state = 'failed', terminal_result = 'BLOCKED', reported_outcome = 'BLOCKED',
+         terminal_event_id = ?, terminal_event_seq = ?, observed_at_ms = ?, completed_at_ms = ?,
+         lease_owner_thread_id = NULL, progress_json = '{}',
+         terminalization_class = 'stranded-execution-closure', reason_code = ?
+     WHERE project_id = ? AND execution_attempt_id = ? AND state IN (${WORK_ITEM_CAPACITY_ATTEMPT_STATES.map(() => "?").join(", ")})
+       AND terminal_event_id IS NULL AND terminal_event_seq IS NULL AND terminal_report_digest IS NULL`
+  ).run(
+    evidence.nativeEventId,
+    evidence.nativeEventSeq,
+    completedAtMs,
+    completedAtMs,
+    `stranded-execution-closure:${closure.correctionId}`,
+    request.projectId,
+    attempt.execution_attempt_id,
+    ...WORK_ITEM_CAPACITY_ATTEMPT_STATES
+  );
+  if (attemptUpdated.changes !== 1) throw refusal("WORK_ITEM_STATE_INVALID", "stranded execution attempt changed before closure");
+  const workItemUpdated = db.prepare(
+    `UPDATE work_items SET lifecycle_state = 'failed', resource_revision = ?, updated_at_ms = ?
+     WHERE project_id = ? AND work_item_id = ? AND lifecycle_state = 'in_progress' AND resource_revision = ?`
+  ).run(nextRevision, completedAtMs, request.projectId, workItem.work_item_id, workItem.resource_revision);
+  if (workItemUpdated.changes !== 1) throw refusal("WORK_ITEM_REVISION_STALE", "work item compare-and-swap failed during stranded execution closure", {
+    currentResourceRevision: workItem.resource_revision,
+    expectedResourceRevision: request.expectedResourceRevision ?? void 0
+  });
+  dischargeTerminalWorkItemWait(db, request.projectId, workItem.work_item_id);
+  return commitMutation(
+    db,
+    request,
+    digest2,
+    actorReceiptId,
+    {
+      aggregateType: "work_item",
+      aggregateId: workItem.work_item_id,
+      aggregateRevision: nextRevision,
+      eventType: "work_item_stranded_execution_attempt_closure",
+      event: {
+        workItemId: workItem.work_item_id,
+        executionAttemptId: attempt.execution_attempt_id,
+        from: "in_progress",
+        to: "failed",
+        correction: { ...closure, evidence }
+      }
+    },
+    { expected: 1, attempted: 1, verified: 1 },
+    {
+      currentConfigRevision: configRevision,
+      currentGovernanceEpoch: governor.governance_epoch,
+      currentResourceRevision: nextRevision,
+      expectedResourceRevision: request.expectedResourceRevision ?? void 0,
+      evidence: { workItemId: workItem.work_item_id, executionAttemptId: attempt.execution_attempt_id, correction: closure }
+    }
+  );
+}
 function applyWorkItemCreate(db, request, digest2) {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
@@ -22170,6 +22292,7 @@ function applyGithubPrObservation(db, request, digest2) {
 }
 function applyWorkItemTransition(db, request, digest2, githubObservation, githubPrObservation) {
   if (request.threadlessPreparedClosure !== void 0) return applyThreadlessPreparedClosure(db, request, digest2);
+  if (request.strandedExecutionAttemptClosure !== void 0) return applyStrandedExecutionAttemptClosure(db, request, digest2);
   const committedDispatchIntent = request.reasonCode === "dispatch_intent_finalize" && request.lifecycleState === void 0 && request.workAttempt?.threadId !== void 0;
   let configRevision;
   if (committedDispatchIntent) {
@@ -26945,6 +27068,15 @@ var threadlessPreparedClosureInputSchema = external_exports.object({
   dispatchIntentIdempotencyKey: external_exports.string().trim().min(1).max(256),
   replayRequestDigest: external_exports.string().regex(/^[0-9a-f]{64}$/u).optional()
 }).strict();
+var strandedExecutionAttemptClosureInputSchema = external_exports.object({
+  request: applyRequestSchema,
+  correctionId: external_exports.string().trim().min(1).max(256),
+  threadId: sidebarThreadIdSchema,
+  nativeEventId: sidebarThreadIdSchema,
+  nativeEventSeq: external_exports.number().int().positive(),
+  nativeTurnId: sidebarThreadIdSchema,
+  incapacity: external_exports.enum(["environment-unavailable", "native-correlation-ambiguous"])
+}).strict();
 var terminalReportBuilderInputSchema = external_exports.object({
   projectId: projectIdSchema,
   workItemId: sidebarThreadIdSchema,
@@ -27657,6 +27789,108 @@ async function closeThreadlessPreparedAttempt(bb, db, input) {
     return applyLiveAuthorizedMutation(bb, db, closureRequest, false, "refuse-active", readGithubIssueForBackfill, null, preMutationGuard, true);
   });
 }
+function recoveryCallerRefusal(db, projectId, callerThreadId, actorReceiptId) {
+  if (!actorReceiptId) return { outcome: "ACTOR_RECEIPT_REQUIRED", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "stranded execution closure requires a current director or orchestrator actor receipt" };
+  const actor = db.prepare(
+    "SELECT actor_kind, subject_id, role_id, role_generation FROM actor_receipts WHERE project_id = ? AND receipt_id = ?"
+  ).get(projectId, actorReceiptId);
+  if (!actor) return { outcome: "ACTOR_RECEIPT_UNKNOWN", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "recovery actor receipt is not known for this project" };
+  if (actor.actor_kind !== "role" || !["director", "project-orchestrator"].includes(actor.role_id ?? "")) {
+    return { outcome: "ROLE_HOLDER_MISMATCH", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "stranded execution closure requires the current director or project-orchestrator seat" };
+  }
+  const holder = readRoleHolderStates(db).find(
+    (candidate) => candidate.project_id === projectId && candidate.thread_id === callerThreadId && candidate.role_id === actor.role_id && candidate.role_generation === actor.role_generation && candidate.execution_attempt_id === actor.subject_id
+  );
+  if (!holder) return { outcome: "ROLE_HOLDER_MISMATCH", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "recovery caller is not the current director or project-orchestrator holder" };
+  return null;
+}
+async function strandedExecutionEvidence(bb, db, input) {
+  const request = input.request;
+  const attempt = db.prepare(
+    "SELECT * FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ? AND work_item_id = ?"
+  ).get(request.projectId, request.executionAttemptId, request.workItemId);
+  if (!attempt || typeof attempt.thread_id !== "string") return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "stranded execution closure requires the exact canonical native thread" };
+  if (attempt.thread_id !== input.threadId) return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "stranded execution closure thread does not match the canonical attempt" };
+  let thread;
+  try {
+    thread = await bb.sdk.threads.get({ threadId: input.threadId });
+    if (thread.id !== input.threadId || thread.projectId !== request.projectId || thread.archivedAt !== null || thread.deletedAt !== null || thread.environmentId === null) {
+      return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "stranded execution closure owner thread is foreign, archived, deleted, or has no environment" };
+    }
+    if (typeof attempt.environment_id === "string" && attempt.environment_id !== thread.environmentId) {
+      return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "stranded execution closure environment does not match the canonical attempt" };
+    }
+    if (input.incapacity === "environment-unavailable") {
+      if (["active", "starting"].includes(thread.status)) {
+        return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "stranded execution disposal requires a non-executable owner thread" };
+      }
+      try {
+        const environment = await bb.sdk.environments.get({ environmentId: thread.environmentId });
+        if (environment.id !== thread.environmentId || environment.projectId !== request.projectId) {
+          return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "stranded execution closure owner environment is foreign" };
+        }
+        return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: "stranded execution disposal requires a proven unavailable owner environment" };
+      } catch (error48) {
+        const message = String(error48).toLowerCase();
+        if (!["destroy", "not found", "not_found", "missing", "unavailable", "404"].some((marker) => message.includes(marker))) {
+          return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `stranded owner environment availability is unproven: ${String(error48)}` };
+        }
+      }
+    } else if (thread.status !== "idle") {
+      return { outcome: "WORK_ITEM_STATE_INVALID", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `stranded native-correlation disposal requires an idle owner thread: status=${thread.status}` };
+    }
+  } catch (error48) {
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `stranded owner incapacity evidence unavailable: ${String(error48)}` };
+  }
+  try {
+    const events = await completeNativeThreadEvents(bb.sdk, input.threadId);
+    const completions = events.filter((event) => event.type === "turn/completed" && nativeTurnId(event) === input.nativeTurnId);
+    if (completions.length !== 1) throw new Error("exact native completion is missing or ambiguous");
+    const completion = completions[0];
+    const completionData = nativeEventData(completion);
+    if (completion.id !== input.nativeEventId || completion.seq !== input.nativeEventSeq || completionData.status !== "completed") throw new Error("exact native completion is not the cited completed event");
+    const providerThreadId = typeof completionData.providerThreadId === "string" && completionData.providerThreadId.length > 0 ? completionData.providerThreadId : null;
+    if (!providerThreadId) throw new Error("exact native completion provider thread is unavailable");
+    const starts = events.filter((event) => event.type === "turn/started" && nativeTurnId(event) === input.nativeTurnId && nativeEventData(event).providerThreadId === providerThreadId);
+    if (starts.length !== 1 || starts[0].seq >= completion.seq) throw new Error("exact native completion start correlation is missing or ambiguous");
+    if (input.incapacity === "native-correlation-ambiguous") {
+      const accepted = events.filter((event) => event.type === "turn/input/accepted" && nativeTurnId(event) === input.nativeTurnId);
+      if (accepted.length === 1) throw new Error("native completion input correlation is exact, not missing or ambiguous");
+    }
+    const evidence = {
+      kind: "stranded-execution-attempt",
+      projectId: request.projectId,
+      workItemId: request.workItemId,
+      executionAttemptId: request.executionAttemptId,
+      threadId: input.threadId,
+      nativeEventId: input.nativeEventId,
+      nativeEventSeq: input.nativeEventSeq,
+      nativeTurnId: input.nativeTurnId,
+      incapacity: input.incapacity
+    };
+    return { ...evidence, digest: sha256(canonicalJson(evidence)) };
+  } catch (error48) {
+    return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `stranded native completion evidence unavailable or foreign: ${String(error48)}` };
+  }
+}
+async function closeStrandedExecutionAttempt(bb, db, input, callerThreadId) {
+  const parsed = strandedExecutionAttemptClosureInputSchema.safeParse(input);
+  if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "stranded-execution-closure", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
+  const { request } = parsed.data;
+  if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
+  if (request.operationClass !== "work_item_transition" || request.lifecycleState !== void 0 || request.strandedExecutionAttemptClosure !== void 0 || request.workAttempt !== void 0 || request.workItemWait !== void 0 || request.workItemUnblock !== void 0 || request.workItemExternalEvent !== void 0 || !request.workItemId || !request.executionAttemptId) return { outcome: "INVALID_INPUT", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "stranded execution closure requires one exact work item and execution attempt without ordinary transition fields" };
+  const callerRefusal = recoveryCallerRefusal(db, request.projectId, callerThreadId, request.actorReceiptId);
+  if (callerRefusal) return callerRefusal;
+  const evidence = await strandedExecutionEvidence(bb, db, parsed.data);
+  if ("outcome" in evidence) return evidence;
+  const closureRequest = {
+    ...request,
+    lifecycleState: "failed",
+    reasonCode: "stranded-execution-closure",
+    strandedExecutionAttemptClosure: { correctionId: parsed.data.correctionId, evidence: { kind: "stranded-execution-attempt", ...evidence } }
+  };
+  return applyLiveAuthorizedMutation(bb, db, closureRequest, false, "refuse-active", readGithubIssueForBackfill, null, void 0, false, true);
+}
 function dispatchRecoveryRefusal(projectId, message, evidence) {
   return {
     outcome: "EXTERNAL_DELIVERY_AMBIGUOUS",
@@ -28122,10 +28356,13 @@ async function prepareWorkItemAttemptTerminalization(bb, db, request, policy) {
   }
   return null;
 }
-async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = null, githubAdapter = null, preMutationGuard, allowThreadlessPreparedClosure = false) {
+async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = null, githubAdapter = null, preMutationGuard, allowThreadlessPreparedClosure = false, allowStrandedExecutionAttemptClosure = false) {
   const parsed = applyRequestSchema.safeParse(input);
   if (parsed.success && parsed.data.threadlessPreparedClosure !== void 0 && !allowThreadlessPreparedClosure) {
     return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less prepared closure is accepted only through the governed live inventory seam" };
+  }
+  if (parsed.success && parsed.data.strandedExecutionAttemptClosure !== void 0 && !allowStrandedExecutionAttemptClosure) {
+    return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: "stranded execution closure is accepted only through the governed native evidence seam" };
   }
   if (parsed.success && db) {
     let request = null;
@@ -28142,7 +28379,7 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
     const authorized = applyAuthorizedMutation(db, input, githubAdapter, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, null, true);
     if (authorized.outcome !== "OK" || authorized.replay) return authorized;
   }
-  if (parsed.success && parsed.data.threadlessPreparedClosure === void 0) {
+  if (parsed.success && parsed.data.threadlessPreparedClosure === void 0 && parsed.data.strandedExecutionAttemptClosure === void 0) {
     const laneGuard = await prepareWorkItemAttemptTerminalization(bb, db, parsed.data, terminalizationPolicy);
     if (laneGuard) return laneGuard;
   }
@@ -28178,8 +28415,8 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
 }
 async function applyLiveAuthorizedMutationAsync(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = null, githubAdapter = null) {
   const parsed = applyRequestSchema.safeParse(input);
-  if (parsed.success && parsed.data.threadlessPreparedClosure !== void 0) {
-    return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less prepared closure is accepted only through the governed live inventory seam" };
+  if (parsed.success && (parsed.data.threadlessPreparedClosure !== void 0 || parsed.data.strandedExecutionAttemptClosure !== void 0)) {
+    return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: "specialized execution closure is accepted only through its governed live evidence seam" };
   }
   if (parsed.success && parsed.data.threadlessPreparedClosure === void 0) {
     const laneGuard = await prepareWorkItemAttemptTerminalization(bb, db, parsed.data, terminalizationPolicy);
@@ -31677,6 +31914,16 @@ ${thread.titleFallback ?? ""}`);
     }
   });
   bb.agents.registerTool({
+    name: "close_stranded_execution_attempt",
+    description: "Dispose one exact active writing attempt only after independent native completion and owner-incapacity evidence.",
+    instructions: "Use only from the current director or project-orchestrator seat. This path records a conservative BLOCKED/failed terminalization and never fabricates a terminal report.",
+    parameters: strandedExecutionAttemptClosureInputSchema,
+    async execute(input, context) {
+      if (input.request.projectId !== context.projectId) throw new Error("request projectId must exactly match the current thread project");
+      return JSON.stringify(await closeStrandedExecutionAttempt(bb, db, input, context.threadId));
+    }
+  });
+  bb.agents.registerTool({
     name: "send_to_operator",
     description: "Send a durable project-scoped message to the operator or supervisor without a model relay.",
     instructions: "Use this for actionable content directed to an external non-bb party. project_id must be the current thread's exact registered project.",
@@ -31700,7 +31947,7 @@ ${thread.titleFallback ?? ""}`);
       return registration === "already_satisfied" ? "already_satisfied" : registration === "registered" ? "registered" : "refused";
     }
   });
-  bb.agents.configure(() => ({ tools: ["build_terminal_report", "dispatch_lane", "close_threadless_prepared_attempt", "send_to_operator", "register_external_wait"], skills: [] }));
+  bb.agents.configure(() => ({ tools: ["build_terminal_report", "dispatch_lane", "close_threadless_prepared_attempt", "close_stranded_execution_attempt", "send_to_operator", "register_external_wait"], skills: [] }));
   bb.cli.register({
     name: "collab",
     summary: "Inspect the bb-collab foundation and guarded conformance boundary",

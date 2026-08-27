@@ -3524,7 +3524,7 @@ else printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue:startable"}]}]]'; 
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["idle-fleet-detector", "lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "fleet-watchdog", "worktree-cleanup", "thread-archive-sweep"]);
     expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "closeThreadlessPreparedAttempt", "dispatchLane", "doctor", "export", "registerProject", "registerWait", "roleBrief", "v1-inbox-archive", "v1-inbox-mark-read", "v1-inbox-read", "v1-inbox-reply", "v1-lanes"]);
-    expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["build_terminal_report", "dispatch_lane", "close_threadless_prepared_attempt", "send_to_operator", "register_external_wait"]);
+    expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["build_terminal_report", "dispatch_lane", "close_threadless_prepared_attempt", "close_stranded_execution_attempt", "send_to_operator", "register_external_wait"]);
   });
 
   it("evaluates a GitHub blocker through the CLI apply reader", async () => {
@@ -18382,5 +18382,68 @@ exit 1
       expect(result).toMatchObject({ outcome: expect.stringMatching(/AMBIGUOUS|UNKNOWN|FOREIGN|EXTERNAL/), verified: 0 });
       expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
     }
+  });
+
+  it("closes stranded completed attempts only through independent native evidence", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
+      idempotencyKey: "gh736-in-progress",
+      workAttempt: { laneId: "gh736-lane", threadId: "gh736-owner", assignmentKind: "write" },
+    })).outcome).toBe("OK");
+    const attempt = fixture.db.prepare(
+      "SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state = 'running'",
+    ).get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string };
+    const environmentId = "gh736-owner-environment";
+    const owner = makeThreadResponse({ id: "gh736-owner", projectId: PROJECT_ID, environmentId, status: "idle", archivedAt: null, deletedAt: null });
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => threadId === owner.id ? owner : makeThreadResponse({ id: threadId, projectId: PROJECT_ID, status: "idle", environmentId: ROLE_ENVIRONMENT_ID })) as never);
+    fixture.host.harness.sdk.stub("environments.get", (async ({ environmentId: requested }: { environmentId: string }) => {
+      if (requested === environmentId) throw new Error("environment destroyed");
+      return { id: requested, projectId: PROJECT_ID };
+    }) as never);
+    fixture.recordNativeEvent(owner.id, { id: "gh736-started", seq: 20, type: "turn/started", scope: { kind: "turn", turnId: "gh736-turn" }, data: { providerThreadId: "gh736-provider" } });
+    fixture.recordNativeEvent(owner.id, { id: "gh736-completed", seq: 30, type: "turn/completed", scope: { kind: "turn", turnId: "gh736-turn" }, data: { providerThreadId: "gh736-provider", status: "completed" } });
+    const request = transitionRequest(fixture.fenceToken, undefined, 3, {
+      idempotencyKey: "gh736-close",
+      actorReceiptId: "role-actor-assignment",
+      executionAttemptId: attempt.execution_attempt_id,
+      workItemId: WORK_ITEM_ID,
+      workAttempt: undefined,
+    });
+    const input = { request, correctionId: "gh736-environment-disposal", threadId: owner.id, nativeEventId: "gh736-completed", nativeEventSeq: 30, nativeTurnId: "gh736-turn", incapacity: "environment-unavailable" as const };
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("close_stranded_execution_attempt", input, { projectId: PROJECT_ID, threadId: ROLE_THREAD_ID }) as string);
+    expect(result).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    expect(fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "failed" });
+    expect(fixture.db.prepare("SELECT state, terminal_result, reported_outcome, terminalization_class, terminal_event_id, terminal_report_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(PROJECT_ID, attempt.execution_attempt_id)).toEqual({ state: "failed", terminal_result: "BLOCKED", reported_outcome: "BLOCKED", terminalization_class: "stranded-execution-closure", terminal_event_id: "gh736-completed", terminal_report_digest: null });
+    expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM state_events WHERE project_id = ? AND event_type = 'work_item_stranded_execution_attempt_closure'").get(PROJECT_ID)).toEqual({ count: 1 });
+  });
+
+  it.each([
+    ["capable owner", "environment-unavailable" as const, "WORK_ITEM_STATE_INVALID" as const],
+    ["foreign caller", "environment-unavailable" as const, "ROLE_HOLDER_MISMATCH" as const],
+    ["exact input correlation", "native-correlation-ambiguous" as const, "TERMINAL_REPORT_AMBIGUOUS" as const],
+    ["wrong completion", "environment-unavailable" as const, "TERMINAL_REPORT_AMBIGUOUS" as const],
+  ])("refuses stranded disposal near miss: %s", async (name, incapacity, expectedOutcome) => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
+      idempotencyKey: `gh736-near-${name}`,
+      workAttempt: { laneId: `gh736-${name}`, threadId: `gh736-owner-${name}`, assignmentKind: "write" },
+    })).outcome).toBe("OK");
+    const attempt = fixture.db.prepare("SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state = 'running'").get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string };
+    const ownerId = `gh736-owner-${name}`;
+    const environmentId = `gh736-environment-${name}`;
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({ id: threadId, projectId: PROJECT_ID, environmentId, status: "idle", archivedAt: null, deletedAt: null })) as never);
+    fixture.host.harness.sdk.stub("environments.get", (async ({ environmentId: requested }: { environmentId: string }) => {
+      if (name === "wrong completion") throw new Error("environment destroyed");
+      return { id: requested, projectId: PROJECT_ID };
+    }) as never);
+    fixture.recordNativeEvent(ownerId, { id: `gh736-started-${name}`, seq: 20, type: "turn/started", scope: { kind: "turn", turnId: `gh736-turn-${name}` }, data: { providerThreadId: `gh736-provider-${name}` } });
+    fixture.recordNativeEvent(ownerId, { id: `gh736-completed-${name}`, seq: 30, type: "turn/completed", scope: { kind: "turn", turnId: `gh736-turn-${name}` }, data: { providerThreadId: `gh736-provider-${name}`, status: "completed" } });
+    if (incapacity === "native-correlation-ambiguous") fixture.recordNativeEvent(ownerId, { id: `gh736-accepted-${name}`, seq: 25, type: "turn/input/accepted", scope: { kind: "turn", turnId: `gh736-turn-${name}` }, data: { providerThreadId: `gh736-provider-${name}`, clientRequestId: `gh736-request-${name}` } });
+    const request = transitionRequest(fixture.fenceToken, undefined, 3, { idempotencyKey: `gh736-close-${name}`, actorReceiptId: "role-actor-assignment", executionAttemptId: attempt.execution_attempt_id, workItemId: WORK_ITEM_ID, workAttempt: undefined });
+    const caller = name === "foreign caller" ? "foreign-same-project-worker" : ROLE_THREAD_ID;
+    const eventId = name === "wrong completion" ? "foreign-completion" : `gh736-completed-${name}`;
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("close_stranded_execution_attempt", { request, correctionId: `gh736-correction-${name}`, threadId: ownerId, nativeEventId: eventId, nativeEventSeq: 30, nativeTurnId: `gh736-turn-${name}`, incapacity }, { projectId: PROJECT_ID, threadId: caller }) as string);
+    expect(result.outcome, name).toBe(expectedOutcome);
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(PROJECT_ID, attempt.execution_attempt_id)).toEqual({ state: "running" });
   });
 });
