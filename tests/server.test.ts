@@ -182,6 +182,7 @@ const REVIEW_AUTHORS = [{ name: "Writer", email: "writer@example.test" }];
 const REVIEW_COMMITTERS = [{ name: "Committer", email: "committer@example.test" }];
 const FROZEN_BRIEF = "# Frozen assignment\nImplement the exact bounded change.";
 const FROZEN_BRIEF_DIGEST = sha256(FROZEN_BRIEF);
+const ROLE_QUEUE_WAIT_TIMEOUT_MS = 3_000;
 
 function checkoutFixture(diverged: boolean) {
   const directory = mkdtempSync(join(tmpdir(), "bb-collab-checkout-divergence-"));
@@ -1183,12 +1184,13 @@ exit 1
   };
 }
 
-function installStartableQueueFixture(issueNumber: number) {
+function installStartableQueueFixture(issueNumber: number, delayMs = 0) {
   const bin = mkdtempSync(join(tmpdir(), "bb-collab-role-queue-"));
   const gh = join(bin, "gh");
   const issue = JSON.stringify({ number: issueNumber, labels: [{ name: "queue:startable" }] });
+  const delay = delayMs > 0 ? `sleep ${delayMs / 1_000}\n` : "";
   writeFileSync(gh, `#!/bin/sh
-if [ -z "\${GH_HOST:-}" ]; then exit 65; fi
+${delay}if [ -z "\${GH_HOST:-}" ]; then exit 65; fi
 if [ "$1" = "api" ]; then printf '%s\\n' '[[${issue}]]'; else printf '%s\\n' '[${issue}]'; fi
 `);
   chmodSync(gh, 0o755);
@@ -5521,7 +5523,7 @@ fi
       service = fixture.host.harness.runService("lane-watcher");
       const orchestrator = readRoleHolderStates(fixture.db).find((holder) => holder.role_id === "project-orchestrator")!;
       await vi.waitFor(async () => expect(await fixture.host.bb.storage.kv.get<Record<string, RoleIdleRecord>>("lane-watcher.role-idle"))
-        .toHaveProperty(roleIdleKey(orchestrator, WORK_ITEM_ID)));
+        .toHaveProperty(roleIdleKey(orchestrator, WORK_ITEM_ID)), { timeout: ROLE_QUEUE_WAIT_TIMEOUT_MS });
       expect(Object.keys(await fixture.host.bb.storage.kv.get<Record<string, RoleIdleRecord>>("lane-watcher.role-idle") ?? {}))
         .toEqual([roleIdleKey(orchestrator, WORK_ITEM_ID)]);
       clock.mockReturnValue(ROLE_QUEUE_IDLE_THRESHOLD_MS);
@@ -5529,7 +5531,7 @@ fi
         (request as { input: Array<{ text: string }> }).input[0]?.text.startsWith("Wrongful idle:"),
       )).toEqual([[
         expect.objectContaining({ threadId: fixture.orchestratorThreadId }),
-      ]]), { timeout: 3_000 });
+      ]]), { timeout: ROLE_QUEUE_WAIT_TIMEOUT_MS });
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send").some(([request]) =>
         [fixture.directorThreadId, "thread-reviewer-successor", workerThreadId].includes((request as { threadId: string }).threadId)
         && (request as { input: Array<{ text: string }> }).input[0]?.text.startsWith("Wrongful idle:"),
@@ -5563,14 +5565,14 @@ exec /bin/cat '${inventory}'
       service = fixture.host.harness.runService("lane-watcher");
       const orchestrator = readRoleHolderStates(fixture.db).find((holder) => holder.role_id === "project-orchestrator")!;
       await vi.waitFor(async () => expect(await fixture.host.bb.storage.kv.get<Record<string, RoleIdleRecord>>("lane-watcher.role-idle"))
-        .toHaveProperty(roleIdleKey(orchestrator, WORK_ITEM_ID)));
+        .toHaveProperty(roleIdleKey(orchestrator, WORK_ITEM_ID)), { timeout: ROLE_QUEUE_WAIT_TIMEOUT_MS });
       clock.mockReturnValue(ROLE_QUEUE_IDLE_THRESHOLD_MS);
       await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toContainEqual([
         expect.objectContaining({
           threadId: fixture.orchestratorThreadId,
           input: [expect.objectContaining({ text: `Wrongful idle: queue head ${WORK_ITEM_ID} is startable. Inspect the queue and act or record the blocker.` })],
         }),
-      ]), { timeout: 3_000 });
+      ]), { timeout: ROLE_QUEUE_WAIT_TIMEOUT_MS });
     } finally {
       service?.controller.abort();
       await service?.done;
@@ -5597,7 +5599,7 @@ exec /bin/cat '${inventory}'
       await vi.waitFor(() => expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
         level: "warn",
         message: `role queue coverage=degraded project=${PROJECT_ID} reason=startable-queue-unreadable`,
-      })));
+      })), { timeout: ROLE_QUEUE_WAIT_TIMEOUT_MS });
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
     } finally {
       service?.controller.abort();
@@ -5606,6 +5608,26 @@ exec /bin/cat '${inventory}'
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
       rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps role-queue observation live under deterministic connector contention", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    const restoreGithub = installStartableQueueFixture(205, 1_100);
+    let service: ReturnType<Awaited<ReturnType<typeof fleetWatchdogFixture>>["host"]["harness"]["runService"]> | undefined;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true);
+      bindFixtureGithubIssue(fixture.db, 205);
+      fixture.host.harness.sdk.stub("threads.wait", (async () => ({ matched: true })) as never);
+      service = fixture.host.harness.runService("lane-watcher");
+      const orchestrator = readRoleHolderStates(fixture.db).find((holder) => holder.role_id === "project-orchestrator")!;
+      await vi.waitFor(async () => expect(await fixture.host.bb.storage.kv.get<Record<string, RoleIdleRecord>>("lane-watcher.role-idle"))
+        .toHaveProperty(roleIdleKey(orchestrator, WORK_ITEM_ID)), { timeout: ROLE_QUEUE_WAIT_TIMEOUT_MS });
+    } finally {
+      service?.controller.abort();
+      await service?.done;
+      restoreGithub();
+      clock.mockRestore();
     }
   });
 
