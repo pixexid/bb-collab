@@ -60,6 +60,7 @@ import {
   threadlessPreparedReplayProbeDigest,
   reconcilePreparedWorkItemDispatches,
   type ApplyRequest,
+  type AuthenticatedNativeCaller,
   type FoundationCode,
   type FoundationResult,
   type GitHubIssueAdapter,
@@ -1583,6 +1584,7 @@ async function dispatchLane(
   bb: BbPluginApi,
   db: SqliteDatabase | null,
   input: unknown,
+  authenticatedNativeCaller: AuthenticatedNativeCaller | null = null,
 ): Promise<FoundationResult> {
   const parsed = dispatchLaneInputSchema.safeParse(input);
   if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "dispatch", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
@@ -1693,7 +1695,7 @@ async function dispatchLane(
       ? `dispatch_parent:${dispatchParentThreadId}`
       : `dispatch_parent:${dispatchParentThreadId}:title=${encodeURIComponent(dispatchTitle)}`,
     workAttempt: intentAttempt,
-  }, false, "stop-active", githubAdapter?.read ?? projectGithubIssueReader(db, request.projectId), githubAdapter);
+  }, false, "stop-active", githubAdapter?.read ?? projectGithubIssueReader(db, request.projectId), githubAdapter, undefined, false, false, authenticatedNativeCaller);
   if (intent.outcome !== "OK") return intent;
   return serializeDispatchRecovery(request, async () => {
     let dispatchSpawn = preparedDispatchSpawn;
@@ -2753,6 +2755,7 @@ async function applyLiveAuthorizedMutation(
   preMutationGuard?: PreMutationGuard,
   allowThreadlessPreparedClosure = false,
   allowStrandedExecutionAttemptClosure = false,
+  authenticatedNativeCaller: AuthenticatedNativeCaller | null = null,
 ): Promise<FoundationResult> {
   const parsed = applyRequestSchema.safeParse(input);
   if (parsed.success && parsed.data.threadlessPreparedClosure !== undefined && !allowThreadlessPreparedClosure) {
@@ -2770,11 +2773,11 @@ async function applyLiveAuthorizedMutation(
     }
     if (request) {
       const replay = checkMutationIdempotency(db, request);
-      if (replay) return replay;
+      if (replay && !authenticatedNativeCaller) return replay;
     }
   }
   if (parsed.success && terminalizationPolicy === "stop-active") {
-    const authorized = applyAuthorizedMutation(db, input, githubAdapter, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, null, true);
+    const authorized = applyAuthorizedMutation(db, input, githubAdapter, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, null, true, authenticatedNativeCaller);
     if (authorized.outcome !== "OK" || authorized.replay) return authorized;
   }
   if (parsed.success && parsed.data.threadlessPreparedClosure === undefined && parsed.data.strandedExecutionAttemptClosure === undefined) {
@@ -2808,7 +2811,7 @@ async function applyLiveAuthorizedMutation(
     if ("outcome" in resolved) return resolved;
     evidenceReader = resolved;
   }
-  const result = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader ?? (parsed.success ? projectGithubIssueReader(db, parsed.data.projectId) : readGithubIssueForBackfill), evidenceReader);
+  const result = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader ?? (parsed.success ? projectGithubIssueReader(db, parsed.data.projectId) : readGithubIssueForBackfill), evidenceReader, false, authenticatedNativeCaller);
   await deliverSucceededRoleGenerationBrief(bb, db, input, result);
   return result;
 }
@@ -6691,7 +6694,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     parameters: dispatchLaneInputSchema,
     async execute(input, context) {
       if (input.request.projectId !== context.projectId) throw new Error("request projectId must exactly match the current thread project");
-      return JSON.stringify(await dispatchLane(bb, db, input));
+      return JSON.stringify(await dispatchLane(bb, db, input, { projectId: context.projectId, threadId: context.threadId }));
     },
   });
   bb.agents.registerTool({

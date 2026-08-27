@@ -22291,7 +22291,17 @@ function applyGithubPrObservation(db, request, digest2) {
     }
   );
 }
-function applyWorkItemTransition(db, request, digest2, githubObservation, githubPrObservation) {
+function resolveAuthenticatedNativeAttemptRole(db, request, authenticatedNativeCaller) {
+  const committedDispatchIntent = request.reasonCode === "dispatch_intent_finalize" && request.lifecycleState === void 0 && request.workAttempt?.threadId !== void 0;
+  if (!request.workAttempt || !authenticatedNativeCaller || committedDispatchIntent) return null;
+  if (authenticatedNativeCaller.projectId !== request.projectId) {
+    throw refusal("ROLE_CONTEXT_FOREIGN", "authenticated native caller belongs to a different project");
+  }
+  const holders = readRoleHolderStates(db).filter((holder) => holder.project_id === request.projectId && (holder.domain_id ?? "default") === (request.domainId ?? "default") && holder.thread_id === authenticatedNativeCaller.threadId && (holder.role_id === "director" || holder.role_id === "project-orchestrator"));
+  if (holders.length !== 1) throw refusal("ROLE_HOLDER_MISMATCH", "authenticated native caller is not the unique current director or project-orchestrator holder");
+  return { roleId: holders[0].role_id, roleGeneration: holders[0].role_generation };
+}
+function applyWorkItemTransition(db, request, digest2, githubObservation, githubPrObservation, nativeRole) {
   if (request.threadlessPreparedClosure !== void 0) return applyThreadlessPreparedClosure(db, request, digest2);
   if (request.strandedExecutionAttemptClosure !== void 0) return applyStrandedExecutionAttemptClosure(db, request, digest2);
   const committedDispatchIntent = request.reasonCode === "dispatch_intent_finalize" && request.lifecycleState === void 0 && request.workAttempt?.threadId !== void 0;
@@ -22308,11 +22318,17 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
   const roleActor = requireRoleActorBinding(db, request, false);
-  if (request.workAttempt && roleActor && request.roleId !== void 0 && request.roleId !== roleActor.roleId) {
-    throw refusal("ROLE_HOLDER_MISMATCH", "work attempt role does not match the verified actor receipt");
+  if (roleActor && nativeRole && (roleActor.roleId !== nativeRole.roleId || roleActor.roleGeneration !== nativeRole.roleGeneration)) {
+    throw refusal("ROLE_HOLDER_MISMATCH", "verified actor receipt and authenticated native caller disagree");
   }
-  if (request.workAttempt && roleActor && request.expectedGeneration !== null && request.expectedGeneration !== roleActor.roleGeneration) {
-    throw refusal("ROLE_GENERATION_STALE", "work attempt generation does not match the verified actor receipt");
+  const attemptRole = nativeRole ?? roleActor;
+  const writeAttemptRole = attemptRole;
+  const reviewAttemptRole = attemptRole;
+  if (request.workAttempt && attemptRole && request.roleId !== void 0 && request.roleId !== attemptRole.roleId) {
+    throw refusal("ROLE_HOLDER_MISMATCH", "work attempt role does not match the authoritative role binding");
+  }
+  if (request.workAttempt && attemptRole && request.expectedGeneration !== null && request.expectedGeneration !== attemptRole.roleGeneration) {
+    throw refusal("ROLE_GENERATION_STALE", "work attempt generation does not match the authoritative role binding");
   }
   let nextState = request.lifecycleState;
   let configContinuation = null;
@@ -22585,8 +22601,8 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
         repoTargetId: workItem.repo_target_id,
         laneId: workAttempt.laneId,
         threadId: null,
-        roleId: roleActor?.roleId ?? null,
-        roleGeneration: roleActor?.roleGeneration ?? null,
+        roleId: reviewAttemptRole?.roleId ?? null,
+        roleGeneration: reviewAttemptRole?.roleGeneration ?? null,
         leaseOwnerThreadId: null,
         assignmentKind: "review",
         requestedProfile: requireWorkAttemptProfile(workAttempt),
@@ -22653,8 +22669,8 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
       repoTargetId: workItem.repo_target_id,
       laneId: workAttempt.laneId,
       threadId: workAttempt.threadId ?? null,
-      roleId: roleActor?.roleId ?? null,
-      roleGeneration: roleActor?.roleGeneration ?? null,
+      roleId: writeAttemptRole?.roleId ?? null,
+      roleGeneration: writeAttemptRole?.roleGeneration ?? null,
       leaseOwnerThreadId: workAttempt.threadId ?? null,
       assignmentKind: workAttempt.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt),
@@ -22877,8 +22893,8 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
       repoTargetId: workItem.repo_target_id,
       laneId: workAttempt.laneId,
       threadId: workAttempt.threadId ?? null,
-      roleId: roleActor?.roleId ?? null,
-      roleGeneration: roleActor?.roleGeneration ?? null,
+      roleId: writeAttemptRole?.roleId ?? null,
+      roleGeneration: writeAttemptRole?.roleGeneration ?? null,
       leaseOwnerThreadId: workAttempt.threadId ?? null,
       assignmentKind: workAttempt.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt),
@@ -22905,8 +22921,8 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
         repoTargetId: workItem.repo_target_id,
         laneId: workAttempt.laneId,
         threadId: workAttempt.threadId ?? null,
-        roleId: roleActor?.roleId ?? null,
-        roleGeneration: roleActor?.roleGeneration ?? null,
+        roleId: reviewAttemptRole?.roleId ?? null,
+        roleGeneration: reviewAttemptRole?.roleGeneration ?? null,
         leaseOwnerThreadId: workAttempt.threadId ?? null,
         assignmentKind: "review",
         requestedProfile: requireWorkAttemptProfile(workAttempt),
@@ -23966,7 +23982,7 @@ function isConstraintError(error48) {
 function unavailableResult(subject, message) {
   return result("CANONICAL_STORE_UNAVAILABLE", subject, 1, 0, 0, { message });
 }
-function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, executionAttemptEvidenceReader = null, dryRun = false) {
+function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, executionAttemptEvidenceReader = null, dryRun = false, authenticatedNativeCaller = null) {
   let request;
   try {
     request = parseApplyRequest(input);
@@ -23975,7 +23991,7 @@ function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader
     return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error48) });
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun, authenticatedNativeCaller);
 }
 async function applyAuthorizedMutationAsync(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, executionAttemptEvidenceReader = null, dryRun = false) {
   let request;
@@ -23996,7 +24012,7 @@ async function applyAuthorizedMutationAsync(db, input, githubAdapter = null, rol
     return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
   }
 }
-function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, executionAttemptEvidenceReader = null, dryRun = false) {
+function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, executionAttemptEvidenceReader = null, dryRun = false, authenticatedNativeCaller = null) {
   let request;
   try {
     request = parseApplyRequest(input);
@@ -24037,6 +24053,7 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
       githubObservation = replacement && replacement.kind === "github_issue_closed" ? observations.find((observation2) => observation2.owner === replacement.owner && observation2.repo === replacement.repo && observation2.issueNumber === replacement.issueNumber) ?? null : observations[0] ?? null;
     }
     const mutate = () => {
+      const nativeRole = request.operationClass === "work_item_transition" ? resolveAuthenticatedNativeAttemptRole(db, request, authenticatedNativeCaller) : null;
       const replay = checkIdempotency(db, request, digest2);
       if (replay) return replay;
       switch (request.operationClass) {
@@ -24057,7 +24074,7 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
         case "work_item_create":
           return applyWorkItemCreate(db, request, digest2);
         case "work_item_transition":
-          return applyWorkItemTransition(db, request, digest2, githubObservation, request.githubPrObservation);
+          return applyWorkItemTransition(db, request, digest2, githubObservation, request.githubPrObservation, nativeRole);
         case "github_pr_observation_record":
           return applyGithubPrObservation(db, request, digest2);
         case "execution_attempt_terminal_report":
@@ -27441,7 +27458,7 @@ async function readLiveRoleFactReader(sdk, serverId, request) {
     return unavailableRoleFactReader(serverId);
   }
 }
-async function dispatchLane(bb, db, input) {
+async function dispatchLane(bb, db, input, authenticatedNativeCaller = null) {
   const parsed = dispatchLaneInputSchema.safeParse(input);
   if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "dispatch", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
   const { request, spawn } = parsed.data;
@@ -27535,7 +27552,7 @@ async function dispatchLane(bb, db, input) {
     ...configProof.continued ? { configRevision: configProof.currentConfigRevision, fixtureContextDigest: configProof.proofDigest } : {},
     reasonCode: legacyReplay ? `dispatch_parent:${dispatchParentThreadId}` : `dispatch_parent:${dispatchParentThreadId}:title=${encodeURIComponent(dispatchTitle)}`,
     workAttempt: intentAttempt
-  }, false, "stop-active", githubAdapter?.read ?? projectGithubIssueReader(db, request.projectId), githubAdapter);
+  }, false, "stop-active", githubAdapter?.read ?? projectGithubIssueReader(db, request.projectId), githubAdapter, void 0, false, false, authenticatedNativeCaller);
   if (intent.outcome !== "OK") return intent;
   return serializeDispatchRecovery(request, async () => {
     let dispatchSpawn = preparedDispatchSpawn;
@@ -28398,7 +28415,7 @@ async function prepareWorkItemAttemptTerminalization(bb, db, request, policy) {
   }
   return null;
 }
-async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = null, githubAdapter = null, preMutationGuard, allowThreadlessPreparedClosure = false, allowStrandedExecutionAttemptClosure = false) {
+async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = null, githubAdapter = null, preMutationGuard, allowThreadlessPreparedClosure = false, allowStrandedExecutionAttemptClosure = false, authenticatedNativeCaller = null) {
   const parsed = applyRequestSchema.safeParse(input);
   if (parsed.success && parsed.data.threadlessPreparedClosure !== void 0 && !allowThreadlessPreparedClosure) {
     return { outcome: "INVALID_INPUT", subject: parsed.data.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less prepared closure is accepted only through the governed live inventory seam" };
@@ -28414,11 +28431,11 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
     }
     if (request) {
       const replay = checkMutationIdempotency(db, request);
-      if (replay) return replay;
+      if (replay && !authenticatedNativeCaller) return replay;
     }
   }
   if (parsed.success && terminalizationPolicy === "stop-active") {
-    const authorized = applyAuthorizedMutation(db, input, githubAdapter, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, null, true);
+    const authorized = applyAuthorizedMutation(db, input, githubAdapter, await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data), null, null, githubIssueReader, null, true, authenticatedNativeCaller);
     if (authorized.outcome !== "OK" || authorized.replay) return authorized;
   }
   if (parsed.success && parsed.data.threadlessPreparedClosure === void 0 && parsed.data.strandedExecutionAttemptClosure === void 0) {
@@ -28451,7 +28468,7 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
     if ("outcome" in resolved) return resolved;
     evidenceReader = resolved;
   }
-  const result2 = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader ?? (parsed.success ? projectGithubIssueReader(db, parsed.data.projectId) : readGithubIssueForBackfill), evidenceReader);
+  const result2 = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader ?? (parsed.success ? projectGithubIssueReader(db, parsed.data.projectId) : readGithubIssueForBackfill), evidenceReader, false, authenticatedNativeCaller);
   await deliverSucceededRoleGenerationBrief(bb, db, input, result2);
   return result2;
 }
@@ -31942,7 +31959,7 @@ ${thread.titleFallback ?? ""}`);
     parameters: dispatchLaneInputSchema,
     async execute(input, context) {
       if (input.request.projectId !== context.projectId) throw new Error("request projectId must exactly match the current thread project");
-      return JSON.stringify(await dispatchLane(bb, db, input));
+      return JSON.stringify(await dispatchLane(bb, db, input, { projectId: context.projectId, threadId: context.threadId }));
     }
   });
   bb.agents.registerTool({
