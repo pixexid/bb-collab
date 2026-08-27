@@ -6422,7 +6422,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   bb.agents.registerTool({
     name: "build_terminal_report",
     description: "Build a terminal report from the exact native completion and canonical attempt.",
-    instructions: "Use the returned JSON as terminalReport in the execution_attempt_terminal_report request. The builder supplies the native environment, authoritative digests, and evidence; submission owns receipt timing and identity.",
+    instructions: "Use the returned JSON as terminalReport in the execution_attempt_terminal_report request. The builder supplies the native environment, authoritative digests, and evidence; submission owns receipt timing and identity. Canonical digests are defined by canonical JSON \u2014 sorted keys, JSON.stringify, no trailing newline. Hand-computed digests (e.g. jq | shasum) silently diverge and will be refused; if you must compute one, strip the trailing newline (jq -j, or printf %s).",
     parameters: terminalReportBuilderInputSchema,
     async execute(input, context) {
       if (input.projectId !== context.projectId) throw new Error("projectId must exactly match the current thread project");
