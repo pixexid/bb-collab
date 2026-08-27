@@ -1,1 +1,37 @@
-var i=globalThis.__bbPluginRuntime;if(i==null||i.pluginSdkApp==null)throw new Error('Cannot load "@bb/plugin-sdk/app": this bundle must be loaded by the BB app, which provides the shared plugin runtime (globalThis.__bbPluginRuntime).');var e=i.pluginSdkApp,l="default"in e?e.default:e,{Markdown:a,ThreadChat:s,UrlLink:o,definePluginApp:t,experimental_Diff:p,experimental_FileLink:u,experimental_NewThreadComposer:d,experimental_PermissionModePicker:m,experimental_ProviderModelPicker:b,experimental_SourceCode:_,experimental_useAppPanel:x,experimental_useFixedTabTarget:g,experimental_useProviders:h,experimental_useSidebarThreadActions:S,experimental_useSidebarThreadPullRequest:c,experimental_useSidebarThreadSplit:P,experimental_useSidebarThreads:T,useBbContext:f,useBbNavigate:C,useComposer:k,useComposerView:A,useRealtime:w,useRealtimeConnectionState:R,useRpc:v,useSettings:B}=e;var M=t(n=>{n.slots.sidebarFooterAction({id:"bb-collab-settings",title:"bb-collab settings",icon:"Settings",run:({openSettings:r})=>r()})});export{M as default};
+// bb-plugin-runtime-shim:@bb/plugin-sdk/app
+var runtime = globalThis.__bbPluginRuntime;
+if (runtime == null || runtime.pluginSdkApp == null) {
+  throw new Error('Cannot load "@bb/plugin-sdk/app": this bundle must be loaded by the BB app, which provides the shared plugin runtime (globalThis.__bbPluginRuntime).');
+}
+var mod = runtime.pluginSdkApp;
+var {
+  Markdown,
+  ThreadChat,
+  definePluginApp,
+  experimental_NewThreadComposer,
+  experimental_useSidebarThreadActions,
+  experimental_useSidebarThreadPullRequest,
+  experimental_useSidebarThreadSplit,
+  experimental_useSidebarThreads,
+  useBbContext,
+  useBbNavigate,
+  useComposer,
+  useComposerView,
+  useRealtime,
+  useRealtimeConnectionState,
+  useRpc,
+  useSettings
+} = mod;
+
+// app.tsx
+var app_default = definePluginApp((app) => {
+  app.slots.sidebarFooterAction({
+    id: "bb-collab-settings",
+    title: "bb-collab settings",
+    icon: "Settings",
+    run: ({ openSettings }) => openSettings()
+  });
+});
+export {
+  app_default as default
+};
