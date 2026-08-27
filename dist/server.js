@@ -29076,33 +29076,18 @@ async function plugin(bb, options = {}) {
     recoveryEpisodes = recoveryEpisodeState(await bb.storage.kv.get("error-recovery.episodes"));
     recoveryEpisodesLoaded = true;
   };
-  const recoveryEpisodeTarget = (holder, lane) => JSON.stringify({
-    holder: holder ? {
-      project_id: holder.project_id,
-      role_id: holder.role_id,
-      domain_id: holder.domain_id ?? "default",
-      role_generation: holder.role_generation,
-      execution_attempt_id: holder.execution_attempt_id,
-      thread_id: holder.thread_id
-    } : null,
-    lane: lane ? {
-      project_id: lane.project_id,
-      execution_attempt_id: lane.execution_attempt_id,
-      thread_id: lane.thread_id
-    } : null
-  });
   const recoverySendTimeouts = /* @__PURE__ */ new WeakSet();
-  const reserveRecoveryEpisode = (key, target) => enqueueRecoveryEpisode(async () => {
+  const reserveRecoveryEpisode = (key) => enqueueRecoveryEpisode(async () => {
     await loadRecoveryEpisodes();
-    if (recoveryEpisodes[key] === target) return false;
-    const next = { ...recoveryEpisodes, [key]: target };
+    if (key in recoveryEpisodes) return false;
+    const next = { ...recoveryEpisodes, [key]: "native-error-episode" };
     await bb.storage.kv.set("error-recovery.episodes", next);
     recoveryEpisodes = next;
     return true;
   });
-  const releaseRecoveryEpisode = (key, target) => enqueueRecoveryEpisode(async () => {
+  const releaseRecoveryEpisode = (key) => enqueueRecoveryEpisode(async () => {
     await loadRecoveryEpisodes();
-    if (recoveryEpisodes[key] !== target) return;
+    if (!(key in recoveryEpisodes)) return;
     const next = { ...recoveryEpisodes };
     delete next[key];
     await bb.storage.kv.set("error-recovery.episodes", next);
@@ -29457,8 +29442,17 @@ async function plugin(bb, options = {}) {
         bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=lane-no-longer-current`);
         return false;
       }
-      const episodeTarget = recoveryEpisodeTarget(holder, lane);
-      if (!await reserveRecoveryEpisode(recoveryKey, episodeTarget)) {
+      const latestThread = await withRecoveryTimeout("threads.get", (signal) => bb.sdk.threads.get({ threadId, signal }));
+      if (latestThread.id !== threadId || latestThread.projectId !== projectId || latestThread.archivedAt !== null || latestThread.deletedAt !== null) {
+        bb.log.error(`error-recovery target unrecoverable: project=${projectId} thread=${threadId} reason=canonical-target-invalid`);
+        return RECOVERY_UNRECOVERABLE;
+      }
+      if (latestThread.status === "idle") {
+        await clearRecoveryEpisode(projectId, threadId);
+        return false;
+      }
+      if (latestThread.status !== "error") return false;
+      if (!await reserveRecoveryEpisode(recoveryKey)) {
         bb.log.warn(`error-recovery wake suppressed: project=${projectId} thread=${threadId} reason=error-episode-already-recovered`);
         return false;
       }
@@ -29475,7 +29469,7 @@ async function plugin(bb, options = {}) {
         }));
       } catch (error48) {
         if (!(typeof error48 === "object" && error48 !== null && recoverySendTimeouts.has(error48))) {
-          await releaseRecoveryEpisode(recoveryKey, episodeTarget);
+          await releaseRecoveryEpisode(recoveryKey);
         }
         throw error48;
       }
