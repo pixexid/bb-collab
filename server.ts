@@ -2773,7 +2773,7 @@ async function applyLiveAuthorizedMutation(
     }
     if (request) {
       const replay = checkMutationIdempotency(db, request);
-      if (replay) return replay;
+      if (replay && !authenticatedNativeCaller) return replay;
     }
   }
   if (parsed.success && terminalizationPolicy === "stop-active") {

@@ -1813,6 +1813,43 @@ describe("GH-746 authenticated native dispatch role identity", () => {
     })).toMatchObject({ outcome: "ROLE_CONTEXT_FOREIGN", attempted: 0, verified: 0 });
     expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
   });
+
+  it("revalidates the native holder before recovering an exact prepared dispatch replay", async () => {
+    const fixture = await dispatchFixture();
+    const request = transitionRequest(fixture.fenceToken, "in_progress", 2, { idempotencyKey: "gh746-replay-holder" });
+    const spawn = dispatchSpawn(fixture.orchestratorThreadId);
+    let inventoryUnavailable = true;
+    let spawnCalls = 0;
+    fixture.host.harness.sdk.stub("threads.list", (async () => {
+      if (inventoryUnavailable) throw new Error("recovery inventory unavailable");
+      return [];
+    }) as never);
+    fixture.host.harness.sdk.stub("threads.spawn", (async (input: { title?: string }) => {
+      spawnCalls += 1;
+      if (spawnCalls === 1) throw new Error("native refusal before create");
+      return makeThreadResponse({ id: "unauthorized-retry", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, title: input.title ?? null });
+    }) as never);
+
+    const first = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", { request, spawn }, {
+      projectId: PROJECT_ID,
+      threadId: fixture.orchestratorThreadId,
+    }) as string);
+    expect(first.outcome).toBe("EXTERNAL_DELIVERY_AMBIGUOUS");
+    expect(spawnCalls).toBe(1);
+    const prepared = latestAttempt(fixture);
+    expect(prepared).toMatchObject({ thread_id: null, role_id: "project-orchestrator", role_generation: 1, state: "prepared" });
+    const beforeReplay = exportFoundation(fixture.db, PROJECT_ID);
+
+    inventoryUnavailable = false;
+    const replay = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", { request, spawn }, {
+      projectId: PROJECT_ID,
+      threadId: "thread-not-a-holder",
+    }) as string);
+    expect(replay.outcome).toBe("ROLE_HOLDER_MISMATCH");
+    expect(spawnCalls).toBe(1);
+    expect(latestAttempt(fixture)).toEqual(prepared);
+    expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(beforeReplay);
+  });
 });
 
 describe("GH-658 scheduled PR observer integration", () => {
