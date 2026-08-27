@@ -1,41 +1,27 @@
 # Worker
 
-## What this is
+Frozen order. Blocks -> orchestrator -> director outside authority. Operator: creds/accounts, spend, legal, product, destructive irreversible.
 
-bb-collab keeps canonical work state; BB supplies native threads, environments, and events. This page is the worker brief, not live state.
+Use [matrix](../operations-model.md#role-matrix).
 
-## Authority
-
-Workers act only within their frozen order. Blocks go to the orchestrator, then the director when outside orchestrator authority. The director approves its class and tells the operator why; only credentials/accounts, spend, legal matters, product direction, and destructive-irreversible actions go to the operator as questions.
-
-## Matrix
-
-Use the [Merge-bound worker rows](../operations-model.md#role-matrix). Do not copy their model or tier values into a brief.
-
-## Tools and surfaces
-
-Use your BB thread/environment for assigned work, Git/GitHub for evidence, and plugin read-only surfaces for named state. Use [Ponytail](../ponytail.md) and the [working rules](../rules.md).
+BB thread/env, Git/GitHub, plugin state; read [Ponytail](../ponytail.md) and [rules](../rules.md).
 
 For an execution terminal report, invoke core `build_terminal_report` with the exact IDs, outcome, reason, native completion event, and turn. Put its JSON in `terminalReport`; it supplies the native environment and digests/evidence. Submission owns receipt fields.
 
-A freshly provisioned managed worktree may not have `node_modules`; if dependencies are absent, run `npm install` before running tests.
+## Receipt
 
-Use the canonical [delegation return-path rule](../rules.md#delegation-return-path) for every work order.
+`terminalReport` (`src/foundation.ts:2795-2824`) builder keys `{receiptVersion:1,outcome,projectId,assignmentId,executionAttemptId,workItemId,roleId,roleGeneration,repoTargetId,environmentId,threadId,branchName,baseSha,candidateSha,nativeReceiptDigest,actualProfileDigest,candidateObservationDigest,reasonCode,nativeEventId,nativeEventSeq,nativeTurnId,evidence:[{kind,digest,ref}]}`; assignment, role, generation, environment, branch, base, candidate may be null. Submission owns optional `reportedAtMs`, `receiptEventId`, `receiptEventSeq`, `receivedAtMs`.
 
-## Independent review seat
+Candidate (`server.ts:2335-2346`): `{projectId,workItemId,executionAttemptId,repoTargetId,resourceRevision,environmentId,branchName,baseSha,candidateSha,checkout,workingTree}`. Checkout: `{kind:"branch",branchName,headSha}|{kind:"detached",headSha}|{kind:"unborn",branchName}|{kind:"unknown",reason}`. Working tree: `{deletions,files:[{deletions,insertions,path,status}],hasUncommittedChanges,insertions,lineStatsComplete,state}`; nullability/enums: `types/bb-plugin-sdk.d.ts:3005-3083`.
 
-Inspect the frozen exact head read-only and return a `PROVISIONAL` verdict with native evidence and the actual-profile claim. Do not require pre-inspection proof; the parent owns post-idle acceptance through the [canonical gate](../operations-model.md#provisional-tier-a-verdict-acceptance).
+Profile (`server.ts:2319-2326`; `src/foundation.ts:2467-2475`): `{providerId,model,reasoningLevel,permissionMode,serviceTier,visibility}`. `canonicalJson` is `JSON.stringify(stableValue(value))` (`src/foundation.ts:3811-3837`): sorted keys, compact JSON, no trailing newline. Use `jq -j`, never `jq -c`: its newline makes the digest wrong. Four wrong digests occurred.
 
-## Live state
+No `node_modules`? Run `npm install`; use [delegation](../rules.md#delegation-return-path).
 
-Live state is never this page. Query the plugin database’s `role_generation_heads` joined to `role_generations` for current worker/orchestrator records. An unseated dispatch may have no worker seat or handoff. If a worker generation exists, resolve its predecessor thread from that query and read its `handoff.md` from thread storage, not a checked-in copy; write your own there before retiring.
+Read frozen head; return `PROVISIONAL` with native evidence/profile. Parent uses the [gate](../operations-model.md#provisional-tier-a-verdict-acceptance).
 
-## First actions
+Not here: query `role_generation_heads` joined to `role_generations`; resolve predecessor, read `handoff.md`, write yours before retiring.
 
-1. If the live query returns a worker generation, read the predecessor handoff file and compare its claims with the live queries; otherwise continue without one.
-2. Use the frozen work order as this lane’s boundary; coordinate with neighboring lanes only when they are explicitly named.
-3. Begin only the frozen work order; ask the orchestrator when it is blocked.
+First: compare predecessor handoff with live state; keep frozen order; coordinate only with named neighbors; begin only that order; ask orchestrator if blocked.
 
-## Silence is a defect signal
-
-Use the canonical [waiting-subscription rule](../rules.md#waiting-is-a-subscription).
+Use [waiting-subscription](../rules.md#waiting-is-a-subscription).
