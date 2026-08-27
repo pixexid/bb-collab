@@ -20317,7 +20317,7 @@ function requireRoleTargetContext(db, request, resolved, context) {
   }
 }
 function requireRoleActorBinding(db, request, required2 = false) {
-  if (!request.actorReceiptId) return;
+  if (!request.actorReceiptId) return null;
   const actor = asRow(
     db.prepare("SELECT actor_kind, subject_id, role_id, role_generation, domain_id FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(
       request.projectId,
@@ -20325,7 +20325,7 @@ function requireRoleActorBinding(db, request, required2 = false) {
     )
   );
   if (!actor || actor.actor_kind !== "role") {
-    if (!required2) return;
+    if (!required2) return null;
     throw refusal("ACTOR_RECEIPT_UNVERIFIED", "current role actor receipt is required");
   }
   if (!actor.role_id || actor.role_generation === null) throw refusal("ROLE_HOLDER_MISMATCH", "role actor receipt has no exact generation");
@@ -20365,6 +20365,7 @@ function requireRoleActorBinding(db, request, required2 = false) {
   if (!eligibility || eligibility.current_qualification_id !== generation.qualification_id || eligibility.effective_status !== "eligible" || eligibility.config_revision !== generation.config_revision || eligibility.derivation_digest !== generation.eligibility_derivation_digest || eligibility.expires_at_ms !== null && eligibility.expires_at_ms <= now()) {
     throw refusal("ROLE_UNQUALIFIED", "role actor no longer has current eligible qualification evidence");
   }
+  return { roleId: actor.role_id, roleGeneration: actor.role_generation };
 }
 function profileEquals(left, right) {
   return canonicalJson(left) === canonicalJson(right);
@@ -22306,7 +22307,13 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
   }
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
-  requireRoleActorBinding(db, request, false);
+  const roleActor = requireRoleActorBinding(db, request, false);
+  if (request.workAttempt && roleActor && request.roleId !== void 0 && request.roleId !== roleActor.roleId) {
+    throw refusal("ROLE_HOLDER_MISMATCH", "work attempt role does not match the verified actor receipt");
+  }
+  if (request.workAttempt && roleActor && request.expectedGeneration !== null && request.expectedGeneration !== roleActor.roleGeneration) {
+    throw refusal("ROLE_GENERATION_STALE", "work attempt generation does not match the verified actor receipt");
+  }
   let nextState = request.lifecycleState;
   let configContinuation = null;
   let dispatchIntentEvidence = null;
@@ -22578,6 +22585,8 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
         repoTargetId: workItem.repo_target_id,
         laneId: workAttempt.laneId,
         threadId: null,
+        roleId: roleActor?.roleId ?? null,
+        roleGeneration: roleActor?.roleGeneration ?? null,
         leaseOwnerThreadId: null,
         assignmentKind: "review",
         requestedProfile: requireWorkAttemptProfile(workAttempt),
@@ -22644,8 +22653,8 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
       repoTargetId: workItem.repo_target_id,
       laneId: workAttempt.laneId,
       threadId: workAttempt.threadId ?? null,
-      roleId: request.roleId ?? null,
-      roleGeneration: request.expectedGeneration ?? null,
+      roleId: roleActor?.roleId ?? null,
+      roleGeneration: roleActor?.roleGeneration ?? null,
       leaseOwnerThreadId: workAttempt.threadId ?? null,
       assignmentKind: workAttempt.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt),
@@ -22868,8 +22877,8 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
       repoTargetId: workItem.repo_target_id,
       laneId: workAttempt.laneId,
       threadId: workAttempt.threadId ?? null,
-      roleId: request.roleId ?? null,
-      roleGeneration: request.expectedGeneration ?? null,
+      roleId: roleActor?.roleId ?? null,
+      roleGeneration: roleActor?.roleGeneration ?? null,
       leaseOwnerThreadId: workAttempt.threadId ?? null,
       assignmentKind: workAttempt.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt),
@@ -22896,6 +22905,8 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
         repoTargetId: workItem.repo_target_id,
         laneId: workAttempt.laneId,
         threadId: workAttempt.threadId ?? null,
+        roleId: roleActor?.roleId ?? null,
+        roleGeneration: roleActor?.roleGeneration ?? null,
         leaseOwnerThreadId: workAttempt.threadId ?? null,
         assignmentKind: "review",
         requestedProfile: requireWorkAttemptProfile(workAttempt),

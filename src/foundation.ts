@@ -6756,8 +6756,12 @@ function requireRoleTargetContext(
 
 // Role standing is an optional stronger check for role-aware paths. Canonical
 // mutation authority is the verified actor receipt, not an unmintable role kind.
-function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest, required = false): void {
-  if (!request.actorReceiptId) return;
+function requireRoleActorBinding(
+  db: SqliteDatabase,
+  request: ApplyRequest,
+  required = false,
+): { roleId: (typeof ROLE_IDS)[number]; roleGeneration: number } | null {
+  if (!request.actorReceiptId) return null;
   const actor = asRow<{ actor_kind: string; subject_id: string; role_id: string | null; role_generation: number | null; domain_id: string | null }>(
     db.prepare("SELECT actor_kind, subject_id, role_id, role_generation, domain_id FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(
       request.projectId,
@@ -6765,7 +6769,7 @@ function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest, requ
     ),
   );
   if (!actor || actor.actor_kind !== "role") {
-    if (!required) return;
+    if (!required) return null;
     throw refusal("ACTOR_RECEIPT_UNVERIFIED", "current role actor receipt is required");
   }
   if (!actor.role_id || actor.role_generation === null) throw refusal("ROLE_HOLDER_MISMATCH", "role actor receipt has no exact generation");
@@ -6832,6 +6836,7 @@ function requireRoleActorBinding(db: SqliteDatabase, request: ApplyRequest, requ
   ) {
     throw refusal("ROLE_UNQUALIFIED", "role actor no longer has current eligible qualification evidence");
   }
+  return { roleId: actor.role_id as (typeof ROLE_IDS)[number], roleGeneration: actor.role_generation };
 }
 
 function profileEquals(left: ExecutionProfile, right: ExecutionProfile): boolean {
@@ -9269,7 +9274,13 @@ function applyWorkItemTransition(
   const actorReceiptId = requireActor(db, request);
   // The watchdog uses a verified plugin actor rather than a role holder; role actors
   // must still prove current standing on every revalidation, including after stop.
-  requireRoleActorBinding(db, request, false);
+  const roleActor = requireRoleActorBinding(db, request, false);
+  if (request.workAttempt && roleActor && request.roleId !== undefined && request.roleId !== roleActor.roleId) {
+    throw refusal("ROLE_HOLDER_MISMATCH", "work attempt role does not match the verified actor receipt");
+  }
+  if (request.workAttempt && roleActor && request.expectedGeneration !== null && request.expectedGeneration !== roleActor.roleGeneration) {
+    throw refusal("ROLE_GENERATION_STALE", "work attempt generation does not match the verified actor receipt");
+  }
   let nextState = request.lifecycleState;
   let configContinuation: WorkItemDispatchConfigProof | null = null;
   let dispatchIntentEvidence: { committedConfigRevision: number; observedConfigRevision: number; proofDigest: string; disposition: "bound_to_durable_intent" } | null = null;
@@ -9567,6 +9578,8 @@ function applyWorkItemTransition(
         repoTargetId: workItem.repo_target_id,
         laneId: workAttempt.laneId,
         threadId: null,
+        roleId: roleActor?.roleId ?? null,
+        roleGeneration: roleActor?.roleGeneration ?? null,
         leaseOwnerThreadId: null,
         assignmentKind: "review",
         requestedProfile: requireWorkAttemptProfile(workAttempt),
@@ -9633,8 +9646,8 @@ function applyWorkItemTransition(
       repoTargetId: workItem.repo_target_id,
       laneId: workAttempt.laneId,
       threadId: workAttempt.threadId ?? null,
-      roleId: request.roleId ?? null,
-      roleGeneration: request.expectedGeneration ?? null,
+      roleId: roleActor?.roleId ?? null,
+      roleGeneration: roleActor?.roleGeneration ?? null,
       leaseOwnerThreadId: workAttempt.threadId ?? null,
       assignmentKind: workAttempt.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt),
@@ -9839,8 +9852,8 @@ function applyWorkItemTransition(
       repoTargetId: workItem.repo_target_id,
       laneId: workAttempt!.laneId,
       threadId: workAttempt!.threadId ?? null,
-      roleId: request.roleId ?? null,
-      roleGeneration: request.expectedGeneration ?? null,
+      roleId: roleActor?.roleId ?? null,
+      roleGeneration: roleActor?.roleGeneration ?? null,
       leaseOwnerThreadId: workAttempt!.threadId ?? null,
       assignmentKind: workAttempt!.assignmentKind,
       requestedProfile: requireWorkAttemptProfile(workAttempt!),
@@ -9871,6 +9884,8 @@ function applyWorkItemTransition(
         repoTargetId: workItem.repo_target_id,
         laneId: workAttempt.laneId,
         threadId: workAttempt.threadId ?? null,
+        roleId: roleActor?.roleId ?? null,
+        roleGeneration: roleActor?.roleGeneration ?? null,
         leaseOwnerThreadId: workAttempt.threadId ?? null,
         assignmentKind: "review",
         requestedProfile: requireWorkAttemptProfile(workAttempt),
