@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { expect, it } from "vitest";
 import { RUNTIME_CONTRACT_VERSION } from "../src/foundation.js";
 
-it("bumps the runtime contract for canonical GitHub PR waits", () => {
-  expect(readFileSync(join(process.cwd(), "AGENTS.md"), "utf8")).toMatch(/INSTRUCTION_CONTRACT_VERSION:\s*46/u);
-  expect(RUNTIME_CONTRACT_VERSION).toBe(31);
+it("bumps the instruction and runtime contracts for delegated native completion", () => {
+  expect(readFileSync(join(process.cwd(), "AGENTS.md"), "utf8")).toMatch(/INSTRUCTION_CONTRACT_VERSION:\s*47/u);
+  expect(RUNTIME_CONTRACT_VERSION).toBe(32);
 });

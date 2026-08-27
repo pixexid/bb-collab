@@ -58,6 +58,10 @@ Labels are queue truth: an unlabelled issue is not in the queue, so labelling is
 
 > bb natively emits `child-completed`, `child-failed`, `child-interrupted`, and `child-outcome-batch`; `threads.childSummary` reads the same ground. Never build completion notification — wire the native signal. bb tells you a child finished; it does not tell you whether the child succeeded. The notification is native; the verdict is ours, and it is what the `DONE | BLOCKED | WAITING` return path carries.
 
+If the exact completed owner cannot invoke `build_terminal_report`, the current director or project-orchestrator supplies only the governed verdict and exact native completion identity through `consume_execution_attempt_completion`. The plugin independently derives and rereads the owner, native correlation, executed profile, environment, candidate, evidence, report, and consuming seat before one canonical acceptance. The owner builder remains owner-bound; ordinary foreign callers remain refused; healthy-environment destruction and the failure-only stranded closure are never the normal completion path.
+
+Static next-session tool configuration is not proof that the resolved provider session received a tool. The exact-session effective-catalog primitive needed for a universal pre-activation guarantee is tracked upstream in [get-bb/bb#2608](https://github.com/get-bb/bb/issues/2608); until it exists, the sanctioned current-holder consumer is the reachable recovery path, not a caller capability claim.
+
 ## Waiting is a subscription
 
 > Waiting is a subscription, not a loop. Every seat — director, project-orchestrator, worker, and reviewer — ends its turn when it needs another thread's outcome; the completion or report wakes it through the native push path. `bb thread wait` or status polling is permitted only as one bounded, named, same-turn verification read by a director or orchestrator for one ruling or recovery forensic incident. It is never a loop, never a worker's way to await a result, and never a substitute for a return path. A seat that catches itself needing a poll reports the missing return path as the defect.

@@ -3782,7 +3782,7 @@ else printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue:startable"}]}]]'; 
     expect(host.harness.inspection.registrations.services.map((service) => service.name)).toEqual(["idle-fleet-detector", "lane-watcher"]);
     expect(host.harness.inspection.registrations.schedules.map((schedule) => schedule.name)).toEqual(["wait-validator-liveness", "stall-guard-liveness", "fleet-watchdog", "worktree-cleanup", "thread-archive-sweep"]);
     expect(host.harness.inspection.registrations.rpcMethods.sort()).toEqual(["apply", "cachedConsumerRollout", "closeThreadlessPreparedAttempt", "dispatchLane", "doctor", "export", "registerProject", "registerWait", "roleBrief", "v1-inbox-archive", "v1-inbox-mark-read", "v1-inbox-read", "v1-inbox-reply", "v1-lanes"]);
-    expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["build_terminal_report", "dispatch_lane", "close_threadless_prepared_attempt", "close_stranded_execution_attempt", "send_to_operator", "register_external_wait"]);
+    expect(host.harness.inspection.registrations.agentTools.map((tool) => tool.name)).toEqual(["build_terminal_report", "consume_execution_attempt_completion", "dispatch_lane", "close_threadless_prepared_attempt", "close_stranded_execution_attempt", "send_to_operator", "register_external_wait"]);
   });
 
   it("evaluates a GitHub blocker through the CLI apply reader", async () => {
@@ -12022,7 +12022,7 @@ else printf '%s\\n' '[]'; fi
 
   it("appends authority-root schema and bumps the runtime contract", () => {
     expect(SCHEMA_VERSION).toBe(35);
-    expect(RUNTIME_CONTRACT_VERSION).toBe(31);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(32);
     expect(MIGRATIONS).toHaveLength(48);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
@@ -12049,7 +12049,7 @@ else printf '%s\\n' '[]'; fi
       oldSchemaVersion: 32,
       newSchemaVersion: 35,
       oldContractVersion: 27,
-      newContractVersion: 31,
+      newContractVersion: 32,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -12059,20 +12059,21 @@ else printf '%s\\n' '[]'; fi
       oldSchemaVersion: 32,
       newSchemaVersion: 35,
       oldContractVersion: 27,
-      newContractVersion: 31,
+      newContractVersion: 32,
       action: "refused",
       expected: 4,
       attempted: 4,
       verified: 0,
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ action: "refused", verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 31))).toMatchObject({ action: "reread", verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 31))).toMatchObject({ action: "refused", verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 32))).toMatchObject({ action: "reread", verified: 4 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 32,
       newSchemaVersion: 35,
       oldContractVersion: 27,
-      newContractVersion: 31,
+      newContractVersion: 32,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -12344,7 +12345,7 @@ else printf '%s\\n' '[]'; fi
   });
 
   it("assembles the production v22 cached-consumer rollout receipt with stale-v21 refusal semantics", async () => {
-    expect(RUNTIME_CONTRACT_VERSION).toBe(31);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(32);
     expect(SCHEMA_VERSION).toBe(35);
     expect(MIGRATIONS).toHaveLength(48);
     expect(contractDigest).not.toBe("d4e51b0b1fd68957120cea5febb7762d6c3b9eddab76f67916e556830b062b83");
@@ -12363,7 +12364,7 @@ else printf '%s\\n' '[]'; fi
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 35, observedContractVersion: 31 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 35, observedContractVersion: 32 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -12989,7 +12990,7 @@ else printf '%s\\n' '[]'; fi
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
       observedSchemaVersion: 35,
-      observedContractVersion: 31,
+      observedContractVersion: 32,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -13071,7 +13072,7 @@ else printf '%s\\n' '[]'; fi
       evidence: {
         cachedConsumers: {
           oldContractVersion: 27,
-          newContractVersion: 31,
+          newContractVersion: 32,
           action: "unknown",
           expected: 4,
           attempted: 0,
@@ -13213,7 +13214,7 @@ else printf '%s\\n' '[]'; fi
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 35, schemaDigest, contractVersion: 31, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 35, schemaDigest, contractVersion: 32, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -17727,10 +17728,11 @@ printf '%s\\n' '${external}'
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 31, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 31, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 31, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 31))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 31, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 32, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 32, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 32, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 31))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 32, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 32))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 32, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 
@@ -18971,6 +18973,129 @@ exit 1
       });
       expect(result).toMatchObject({ outcome: expect.stringMatching(/AMBIGUOUS|UNKNOWN|FOREIGN|EXTERNAL/), verified: 0 });
       expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+    }
+  });
+
+  it("consumes exact owner completion, replays delegated completion after evidence loss, and refuses delegated completion", async () => {
+    type NativeEvent = { id: string; threadId: string; seq: number; type: string; scope: { kind: "thread" } | { kind: "turn"; turnId: string }; data: unknown; createdAt: number };
+    const cases = [
+      { name: "artinspire-no-change", directorSeat: true, candidateSha: BASE_SHA, expectedRole: "director" },
+      { name: "benchbait-clean-candidate", directorSeat: false, candidateSha: CANDIDATE_SHA, expectedRole: "project-orchestrator" },
+    ] as const;
+    for (const shape of cases) {
+      const fixture = await assignmentFixture({ directorSeat: shape.directorSeat });
+      const ownerThreadId = `${shape.name}-owner`;
+      const environmentId = `${shape.name}-environment`;
+      const turnId = `${shape.name}-turn`;
+      const providerThreadId = `${shape.name}-provider-thread`;
+      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
+        idempotencyKey: `${shape.name}-in-progress`,
+        workAttempt: { laneId: `${shape.name}-lane`, threadId: ownerThreadId, assignmentKind: "write", requestedProfile: ROLE_PROFILE },
+      })).outcome).toBe("OK");
+      const attempt = fixture.db.prepare(
+        "SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state = 'running'",
+      ).get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string };
+      const branchName = `bb/${shape.name}`;
+      fixture.db.prepare("UPDATE execution_attempts SET branch_name = ?, base_sha = ?, candidate_sha = ? WHERE execution_attempt_id = ?")
+        .run(branchName, BASE_SHA, shape.candidateSha, attempt.execution_attempt_id);
+      const events: NativeEvent[] = [
+        { id: `${shape.name}-request`, threadId: ownerThreadId, seq: 10, type: "client/turn/requested", scope: { kind: "thread" }, data: { requestId: `${shape.name}-request-id`, execution: { model: ROLE_PROFILE.model, reasoningLevel: ROLE_PROFILE.reasoningLevel, permissionMode: ROLE_PROFILE.permissionMode, serviceTier: ROLE_PROFILE.serviceTier, source: "client/turn/requested" } }, createdAt: 10 },
+        { id: `${shape.name}-started`, threadId: ownerThreadId, seq: 20, type: "turn/started", scope: { kind: "turn", turnId }, data: { providerThreadId }, createdAt: 20 },
+        { id: `${shape.name}-accepted`, threadId: ownerThreadId, seq: 30, type: "turn/input/accepted", scope: { kind: "turn", turnId }, data: { clientRequestId: `${shape.name}-request-id`, providerThreadId }, createdAt: 30 },
+        { id: `${shape.name}-completed`, threadId: ownerThreadId, seq: 40, type: "turn/completed", scope: { kind: "turn", turnId }, data: { providerThreadId, status: "completed" }, createdAt: 40 },
+      ];
+      const checkout = { kind: "branch" as const, branchName, headSha: shape.candidateSha };
+      const workingTree = { files: [], insertions: 0, deletions: 0 };
+      let eventReads = 0;
+      let retireBeforeWrite = false;
+      fixture.host.harness.sdk.stub("threads.get", (async () => makeThreadResponse({ id: ownerThreadId, projectId: PROJECT_ID, environmentId, providerId: ROLE_PROFILE.providerId, status: "idle", visibility: "visible" })) as never);
+      fixture.host.harness.sdk.stub("threads.events.list", (async ({ afterSeq }: { afterSeq?: string }) => {
+        eventReads += 1;
+        if (retireBeforeWrite && eventReads === 2) {
+          fixture.db.prepare("UPDATE role_generations SET status = 'retired' WHERE project_id = ? AND role_id = ? AND generation = 1 AND domain_id = 'default'").run(PROJECT_ID, shape.expectedRole);
+        }
+        return events.filter((event) => afterSeq === undefined || event.seq > Number(afterSeq));
+      }) as never);
+      fixture.host.harness.sdk.stub("environments.get", (async () => ({ id: environmentId, projectId: PROJECT_ID })) as never);
+      fixture.host.harness.sdk.stub("environments.status", (async () => ({ outcome: "available", workspace: { checkout, workingTree } })) as never);
+      const identity = { nativeEventId: `${shape.name}-completed`, nativeEventSeq: 40, nativeTurnId: turnId };
+      const semantic = { outcome: "DONE" as const, reasonCode: `${shape.name}-complete`, ...identity };
+      const ownerReport = JSON.parse(await fixture.host.harness.callAgentTool("build_terminal_report", {
+        projectId: PROJECT_ID,
+        workItemId: WORK_ITEM_ID,
+        executionAttemptId: attempt.execution_attempt_id,
+        ...semantic,
+      }, { projectId: PROJECT_ID, threadId: ownerThreadId }) as string);
+      const request = {
+        projectId: PROJECT_ID,
+        operationClass: "execution_attempt_terminal_report" as const,
+        idempotencyKey: `${shape.name}-consume`,
+        actorReceiptId: RECEIPT_ID,
+        expectedConfigRevision: 1,
+        expectedGovernanceEpoch: 1,
+        expectedFenceToken: fixture.fenceToken,
+        expectedResourceRevision: 3,
+        workItemId: WORK_ITEM_ID,
+        executionAttemptId: attempt.execution_attempt_id,
+      };
+      const input = { request, ...semantic };
+      const beforeForeign = exportFoundation(fixture.db, PROJECT_ID);
+      const foreign = JSON.parse(await fixture.host.harness.callAgentTool("consume_execution_attempt_completion", input, { projectId: PROJECT_ID, threadId: "ordinary-foreign-thread" }) as string);
+      expect(foreign, `${shape.name}: foreign caller`).toMatchObject({ outcome: "ROLE_HOLDER_MISMATCH", verified: 0 });
+      expect(exportFoundation(fixture.db, PROJECT_ID), `${shape.name}: foreign caller no mutation`).toEqual(beforeForeign);
+      const foreignProject = JSON.parse(await fixture.host.harness.callAgentTool("consume_execution_attempt_completion", input, { projectId: FOREIGN_PROJECT_ID, threadId: ROLE_THREAD_ID }) as string);
+      expect(foreignProject, `${shape.name}: foreign project`).toMatchObject({ outcome: "ROLE_CONTEXT_FOREIGN", verified: 0 });
+      expect(exportFoundation(fixture.db, PROJECT_ID), `${shape.name}: foreign project no mutation`).toEqual(beforeForeign);
+      for (const [name, mutated, expectedOutcome] of [
+        ["wrong WorkItem", { ...input, request: { ...request, workItemId: `${shape.name}-wrong-work-item` } }, "WORK_ITEM_UNKNOWN"],
+        ["wrong attempt", { ...input, request: { ...request, executionAttemptId: `${shape.name}-wrong-attempt` } }, "TERMINAL_REPORT_AMBIGUOUS"],
+        ["wrong native event", { ...input, nativeEventId: `${shape.name}-wrong-event` }, "EXTERNAL_UNAVAILABLE"],
+        ["wrong native turn", { ...input, nativeTurnId: `${shape.name}-wrong-turn` }, "EXTERNAL_UNAVAILABLE"],
+      ] as const) {
+        const result = JSON.parse(await fixture.host.harness.callAgentTool("consume_execution_attempt_completion", mutated, { projectId: PROJECT_ID, threadId: ROLE_THREAD_ID }) as string);
+        expect(result.outcome, `${shape.name}/${name}: expected=${expectedOutcome}; actual=${JSON.stringify(result)}`).toBe(expectedOutcome);
+        expect(exportFoundation(fixture.db, PROJECT_ID), `${shape.name}/${name}: byte-identical no mutation`).toEqual(beforeForeign);
+      }
+      await expect(fixture.host.harness.callAgentTool("consume_execution_attempt_completion", { ...input, evidence: [] }, { projectId: PROJECT_ID, threadId: ROLE_THREAD_ID }))
+        .rejects.toThrow(/Unrecognized key.*evidence|Unrecognized keys.*evidence/);
+      expect(exportFoundation(fixture.db, PROJECT_ID), `${shape.name}: caller evidence no mutation`).toEqual(beforeForeign);
+      retireBeforeWrite = true;
+      eventReads = 0;
+      const retired = JSON.parse(await fixture.host.harness.callAgentTool("consume_execution_attempt_completion", input, { projectId: PROJECT_ID, threadId: ROLE_THREAD_ID }) as string);
+      fixture.db.prepare("UPDATE role_generations SET status = 'active' WHERE project_id = ? AND role_id = ? AND generation = 1 AND domain_id = 'default'").run(PROJECT_ID, shape.expectedRole);
+      retireBeforeWrite = false;
+      eventReads = 0;
+      expect(retired.outcome, `${shape.name}/role succession before write: expected=ROLE_HOLDER_MISMATCH; actual=${JSON.stringify(retired)}`).toBe("ROLE_HOLDER_MISMATCH");
+      expect(exportFoundation(fixture.db, PROJECT_ID), `${shape.name}: role succession no mutation`).toEqual(beforeForeign);
+      fixture.db.prepare("DELETE FROM actor_receipts WHERE actor_kind = 'role'").run();
+      const result = JSON.parse(await fixture.host.harness.callAgentTool("consume_execution_attempt_completion", input, { projectId: PROJECT_ID, threadId: ROLE_THREAD_ID }) as string);
+      expect(result, shape.name).toMatchObject({
+        outcome: "OK",
+        attempted: 1,
+        verified: 1,
+        evidence: {
+          originalExecution: { ownerThreadId, ...identity },
+          consumption: { kind: "delegated-current-holder", roleId: shape.expectedRole, threadId: ROLE_THREAD_ID },
+        },
+      });
+      expect(fixture.db.prepare("SELECT state, terminalization_class, terminal_report_json FROM execution_attempts WHERE execution_attempt_id = ?").get(attempt.execution_attempt_id)).toMatchObject({ state: "done", terminalization_class: "accepted-terminal-report", terminal_report_json: canonicalJson(ownerReport) });
+      expect(fixture.db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "in_progress", resource_revision: 3 });
+      const accepted = fixture.db.prepare("SELECT event_json FROM state_events WHERE project_id = ? AND aggregate_id = ? AND event_type = 'execution_attempt_terminal_report_accepted'").get(PROJECT_ID, attempt.execution_attempt_id) as { event_json: string };
+      expect(JSON.parse(accepted.event_json)).toMatchObject({
+        originalExecution: { ownerThreadId, ...identity },
+        consumption: { kind: "delegated-current-holder", path: "agent-tool:consume_execution_attempt_completion", roleId: shape.expectedRole, threadId: ROLE_THREAD_ID },
+      });
+      const committed = exportFoundation(fixture.db, PROJECT_ID);
+      fixture.host.harness.sdk.stub("threads.get", (async () => { throw new Error("owner evidence unavailable after acceptance"); }) as never);
+      const replay = JSON.parse(await fixture.host.harness.callAgentTool("consume_execution_attempt_completion", input, { projectId: PROJECT_ID, threadId: ROLE_THREAD_ID }) as string);
+      expect(replay, `${shape.name}: stored replay`).toMatchObject({ outcome: "OK", evidence: { consumption: { roleId: shape.expectedRole } } });
+      expect(exportFoundation(fixture.db, PROJECT_ID), `${shape.name}: replay no mutation`).toEqual(committed);
+      const sameKeyConflict = JSON.parse(await fixture.host.harness.callAgentTool("consume_execution_attempt_completion", { ...input, outcome: "BLOCKED" }, { projectId: PROJECT_ID, threadId: ROLE_THREAD_ID }) as string);
+      expect(sameKeyConflict, `${shape.name}: same-key conflict`).toMatchObject({ outcome: "IDEMPOTENCY_KEY_CONFLICT" });
+      expect(exportFoundation(fixture.db, PROJECT_ID), `${shape.name}: same-key conflict no mutation`).toEqual(committed);
+      const differentKey = JSON.parse(await fixture.host.harness.callAgentTool("consume_execution_attempt_completion", { ...input, request: { ...request, idempotencyKey: `${shape.name}-consume-again` } }, { projectId: PROJECT_ID, threadId: ROLE_THREAD_ID }) as string);
+      expect(differentKey, `${shape.name}: different-key conflict`).toMatchObject({ outcome: "TERMINAL_REPORT_AMBIGUOUS", message: expect.stringContaining("same terminal report") });
+      expect(exportFoundation(fixture.db, PROJECT_ID), `${shape.name}: different-key conflict no mutation`).toEqual(committed);
     }
   });
 
