@@ -6196,6 +6196,68 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     }
   });
 
+  it("keeps a replacement writer on the same still-error native thread in one episode", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
+    fixture.addNativeLane("thread-work-item-1", "error");
+
+    const failed = (error: string) => fixture.host.harness.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, status: "error", updatedAt: 1 }),
+      error,
+    });
+    await failed("provider failure after accepted recovery");
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, undefined, 3, {
+      idempotencyKey: "same-thread-replacement-writer",
+      workAttempt: { laneId: "lane-replacement-writer", threadId: "thread-work-item-1", assignmentKind: "write" },
+    })).outcome).toBe("OK");
+    await failed("provider failure after replacement recovery");
+
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+  });
+
+  it("re-observes idle after a blocked environment read before recovery and preserves later eligibility", async () => {
+    const fixture = await fleetWatchdogFixture(0);
+    let status: "error" | "idle" = "error";
+    let environmentReadStarted!: () => void;
+    let releaseEnvironmentRead!: () => void;
+    const environmentReadStartedPromise = new Promise<void>((resolve) => { environmentReadStarted = resolve; });
+    const blockedEnvironmentRead = new Promise<void>((resolve) => { releaseEnvironmentRead = resolve; });
+    let environmentReads = 0;
+    fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+      id: threadId,
+      projectId: PROJECT_ID,
+      environmentId: `environment-${threadId}`,
+      status,
+      updatedAt: 1,
+    })) as never);
+    fixture.host.harness.sdk.stub("environments.status", (async () => {
+      if (environmentReads++ === 0) {
+        environmentReadStarted();
+        await blockedEnvironmentRead;
+      }
+      return { outcome: "available", workspace: { checkout: { kind: "detached", headSha: "recovery-head" } } };
+    }) as never);
+
+    const failed = () => fixture.host.harness.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: fixture.orchestratorThreadId, projectId: PROJECT_ID, status: "error", updatedAt: 1 }),
+      error: "blocked environment recovery",
+    });
+    const firstRecovery = failed();
+    await environmentReadStartedPromise;
+    status = "idle";
+    await fixture.host.harness.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: fixture.orchestratorThreadId, projectId: PROJECT_ID, status: "idle", updatedAt: 2 }),
+      lastAssistantText: null,
+    });
+    releaseEnvironmentRead();
+    await firstRecovery;
+
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    status = "error";
+    await failed();
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+  });
+
   it("restarts a genuinely errored canonical lane through auto mode", async () => {
     const fixture = await fleetWatchdogFixture(0);
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
