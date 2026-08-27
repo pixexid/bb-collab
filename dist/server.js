@@ -17388,6 +17388,20 @@ var terminalReportSchema = external_exports.object({
   receiptEventSeq: external_exports.number().int().positive().optional(),
   receivedAtMs: external_exports.number().int().nonnegative().optional()
 }).strict();
+var reviewHandoffSchema = external_exports.discriminatedUnion("kind", [
+  external_exports.object({
+    kind: external_exports.literal("accepted-write-terminal-report"),
+    executionAttemptId: id,
+    terminalReportDigest: digestSchema,
+    terminalEventId: id,
+    terminalEventSeq: external_exports.number().int().positive()
+  }).strict(),
+  external_exports.object({
+    kind: external_exports.literal("active-write-legacy-handoff"),
+    executionAttemptId: id
+  }).strict()
+]);
+var LEGACY_REVIEW_HANDOFF_REASON = "legacy-work-item-review-handoff";
 var interruptionEvidenceSchema = external_exports.object({
   projectId: id,
   workItemId: id,
@@ -17492,6 +17506,7 @@ var applyRequestSchema = external_exports.object({
   satisfactionEvidence: workItemSatisfactionEvidenceSchema.optional(),
   projectionRecoveryEvidence: projectionRecoveryEvidenceSchema.optional(),
   workAttempt: workAttemptSchema.optional(),
+  reviewHandoff: reviewHandoffSchema.optional(),
   projectionKind: external_exports.literal("github_issue").optional(),
   queueLabel: external_exports.literal("queue:dispatched").optional(),
   roleId: roleIdSchema.optional(),
@@ -18307,6 +18322,7 @@ function normalizeRequest(request) {
     satisfactionEvidence: request.satisfactionEvidence ?? void 0,
     projectionRecoveryEvidence: request.projectionRecoveryEvidence ?? void 0,
     workAttempt: request.workAttempt ?? void 0,
+    reviewHandoff: request.reviewHandoff ?? void 0,
     projectionKind: request.projectionKind ?? void 0,
     roleId: request.roleId ?? void 0,
     roleRequirementId: request.roleRequirementId ?? void 0,
@@ -21095,6 +21111,63 @@ function requireAttemptForMutation(db, request, attemptId) {
   const foreign = db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ? LIMIT 1").get(attemptId);
   throw refusal(foreign ? "EXECUTION_CONTEXT_FOREIGN" : "TERMINAL_REPORT_AMBIGUOUS", foreign ? "execution attempt belongs to another project" : "execution attempt is not known");
 }
+function requireReviewHandoff(db, request, workItem) {
+  const handoff = request.reviewHandoff;
+  if (!handoff || !request.executionAttemptId || handoff.executionAttemptId !== request.executionAttemptId) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "review-pending requires an explicit exact review handoff attempt");
+  }
+  if (handoff.kind === "active-write-legacy-handoff") {
+    if (request.reasonCode !== LEGACY_REVIEW_HANDOFF_REASON) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "active-write legacy handoff requires its explicit recovery reason");
+    }
+    const active = requireAttemptForMutation(db, request, handoff.executionAttemptId);
+    const latest2 = latestWorkItemAttempt(db, request.projectId, workItem.work_item_id);
+    if (active.work_item_id !== workItem.work_item_id || active.origin !== "work_item" || active.assignment_kind !== "write" || !WORK_ITEM_CAPACITY_ATTEMPT_STATES.includes(active.state) || latest2?.execution_attempt_id !== handoff.executionAttemptId) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "legacy review handoff does not identify the latest active writer");
+    }
+    return handoff;
+  }
+  const attempt = requireAttemptForMutation(db, request, handoff.executionAttemptId);
+  const latest = latestWorkItemAttempt(db, request.projectId, workItem.work_item_id);
+  const successor = db.prepare(
+    `SELECT execution_attempt_id FROM execution_attempts
+     WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
+       AND attempt_ordinal > ? LIMIT 1`
+  ).get(request.projectId, workItem.work_item_id, attempt.attempt_ordinal);
+  if (attempt.work_item_id !== workItem.work_item_id || attempt.origin !== "work_item" || attempt.assignment_kind !== "write" || latest?.execution_attempt_id !== handoff.executionAttemptId || successor || activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write") || attempt.state !== "done" || attempt.terminalization_class !== "accepted-terminal-report" || attempt.terminal_result !== "DONE" || attempt.reported_outcome !== "DONE" || !attempt.terminal_report_digest || !attempt.terminal_report_json || !attempt.terminal_event_id || attempt.terminal_event_seq === null) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "review handoff requires the exact latest accepted DONE writing attempt");
+  }
+  let report;
+  try {
+    const parsed = JSON.parse(attempt.terminal_report_json);
+    const result2 = terminalReportSchema.safeParse(parsed);
+    if (!result2.success || canonicalJson(result2.data) !== attempt.terminal_report_json) throw new Error("invalid terminal report");
+    report = result2.data;
+  } catch {
+    throw refusal("WORK_ITEM_STATE_INVALID", "accepted terminal report JSON is missing or inconsistent");
+  }
+  const reportDigest = sha256(attempt.terminal_report_json);
+  if (handoff.terminalReportDigest !== reportDigest || attempt.terminal_report_digest !== reportDigest || handoff.terminalEventId !== attempt.terminal_event_id || handoff.terminalEventSeq !== attempt.terminal_event_seq || report.outcome !== "DONE" || report.projectId !== request.projectId || report.workItemId !== workItem.work_item_id || report.executionAttemptId !== attempt.execution_attempt_id || report.nativeEventId !== attempt.terminal_event_id || report.nativeEventSeq !== attempt.terminal_event_seq) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "accepted terminal report identity or digest is inconsistent");
+  }
+  const acceptedEvent = asRow(db.prepare(
+    `SELECT event_json FROM state_events
+     WHERE project_id = ? AND aggregate_type = 'execution_attempt' AND aggregate_id = ?
+       AND event_type = 'execution_attempt_terminal_report_accepted'
+     ORDER BY event_sequence DESC LIMIT 1`
+  ).get(request.projectId, attempt.execution_attempt_id));
+  let event;
+  try {
+    const parsed = JSON.parse(acceptedEvent?.event_json ?? "null");
+    event = parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    event = {};
+  }
+  if (!acceptedEvent || event.executionAttemptId !== attempt.execution_attempt_id || event.outcome !== "DONE" || event.nativeEventId !== attempt.terminal_event_id || event.nativeEventSeq !== attempt.terminal_event_seq || event.terminalReportDigest !== reportDigest) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "accepted terminal report event evidence is missing or inconsistent");
+  }
+  return handoff;
+}
 function applyExecutionAttemptTerminalReport(db, request, digest2, evidenceReader) {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
@@ -22276,6 +22349,9 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
     throw refusal("WORK_ITEM_STATE_INVALID", "review-pending may only register a review attempt");
   }
   const redispatchingReview = workItem.lifecycle_state === "review_pending" && nextState === "review_pending";
+  if (request.reviewHandoff !== void 0 && (nextState !== "review_pending" || redispatchingReview)) {
+    throw refusal("WORK_ITEM_STATE_INVALID", "review handoff is valid only when entering review-pending");
+  }
   const priorReview = redispatchingReview ? activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "review") : void 0;
   if (redispatchingReview && (!workAttempt || !workAttempt.threadId || !workAttempt.requestedProfile || !priorReview || !reviewCandidateMatches(priorReview, workAttempt) || !reviewAuthorityMatches(priorReview, workAttempt))) {
     throw refusal("WORK_ITEM_STATE_INVALID", "review re-dispatch requires one active review and the same exact immutable candidate and profile");
@@ -22532,9 +22608,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
   if (nextState === "in_progress" && workAttempt === void 0) {
     throw refusal("WORK_ITEM_STATE_INVALID", "entering in-progress requires a work attempt");
   }
-  if (nextState === "review_pending" && !redispatchingReview && !activeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "write")) {
-    throw refusal("WORK_ITEM_STATE_INVALID", "review-pending requires an active writing attempt to close");
-  }
+  const reviewHandoff = nextState === "review_pending" && !redispatchingReview ? requireReviewHandoff(db, request, workItem) : void 0;
   const latestAttempt = latestWorkItemAttempt(db, request.projectId, workItem.work_item_id);
   if (nextState === "succeeded" && latestAttempt?.state === "interrupted") {
     throw refusal("WORK_ITEM_STATE_INVALID", "interrupted attempt requires explicit resume or disposition before success");
@@ -22670,7 +22744,7 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
       reviewCandidateJson: null
     });
   } else if (nextState === "review_pending") {
-    executionAttemptId = redispatchingReview ? terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "superseded", "review") : terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "done", "write", "work-item-review-handoff");
+    executionAttemptId = redispatchingReview ? terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "superseded", "review") : reviewHandoff?.kind === "accepted-write-terminal-report" ? reviewHandoff.executionAttemptId : terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "done", "write", "work-item-review-handoff");
     if (workAttempt) {
       reviewExecutionAttemptId = insertWorkItemAttempt(db, {
         projectId: request.projectId,
@@ -22730,6 +22804,14 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
         to: nextState,
         ...executionAttemptId === null ? {} : { executionAttemptId },
         ...reviewExecutionAttemptId === null ? {} : { reviewExecutionAttemptId },
+        ...reviewHandoff === void 0 ? {} : {
+          handoffKind: reviewHandoff.kind,
+          ...reviewHandoff.kind === "accepted-write-terminal-report" ? {
+            terminalReportDigest: reviewHandoff.terminalReportDigest,
+            terminalEventId: reviewHandoff.terminalEventId,
+            terminalEventSeq: reviewHandoff.terminalEventSeq
+          } : {}
+        },
         ...workAttempt === void 0 ? {} : { workAttempt },
         ...machineWait === null ? {} : { blocker: machineWait },
         ...isGithubPrWait(machineWait ?? { kind: "none" }) ? { initialObservation: githubPrObservation, initialSemanticDigest: githubPrSemanticDigest(githubPrObservation) } : {},
@@ -22760,6 +22842,14 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
         lifecycleState: nextState,
         ...executionAttemptId === null ? {} : { executionAttemptId },
         ...reviewExecutionAttemptId === null ? {} : { reviewExecutionAttemptId },
+        ...reviewHandoff === void 0 ? {} : {
+          handoffKind: reviewHandoff.kind,
+          ...reviewHandoff.kind === "accepted-write-terminal-report" ? {
+            terminalReportDigest: reviewHandoff.terminalReportDigest,
+            terminalEventId: reviewHandoff.terminalEventId,
+            terminalEventSeq: reviewHandoff.terminalEventSeq
+          } : {}
+        },
         ...machineWait === null ? {} : { blocker: machineWait },
         ...isGithubPrWait(machineWait ?? { kind: "none" }) ? { initialSemanticDigest: githubPrSemanticDigest(githubPrObservation) } : {},
         ...unblock === void 0 ? {} : { unblock },

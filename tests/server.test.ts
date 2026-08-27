@@ -701,6 +701,155 @@ function transitionRequest(
   return request;
 }
 
+function legacyReviewPendingRequest(
+  db: Database.Database,
+  fenceToken: string,
+  expectedResourceRevision: number,
+  overrides: Partial<ApplyRequest> = {},
+): ApplyRequest {
+  const projectId = overrides.projectId ?? PROJECT_ID;
+  const workItemId = overrides.workItemId ?? WORK_ITEM_ID;
+  const attempt = db.prepare(
+    `SELECT execution_attempt_id FROM execution_attempts
+     WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item'
+       AND assignment_kind = 'write' AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')
+     ORDER BY attempt_ordinal DESC LIMIT 1`,
+  ).get(projectId, workItemId) as { execution_attempt_id: string } | undefined;
+  if (!attempt) throw new Error(`no active writer for ${projectId}/${workItemId}`);
+  return transitionRequest(fenceToken, "review_pending", expectedResourceRevision, {
+    reasonCode: "legacy-work-item-review-handoff",
+    executionAttemptId: attempt.execution_attempt_id,
+    reviewHandoff: { kind: "active-write-legacy-handoff", executionAttemptId: attempt.execution_attempt_id },
+    ...overrides,
+  });
+}
+
+async function acceptedDoneWorkItemFixture(
+  workItemId = WORK_ITEM_ID,
+  outcome: "DONE" | "BLOCKED" = "DONE",
+  accept = true,
+) {
+  const fixture = await assignmentFixture({ withoutGithubIssues: true });
+  if (workItemId !== WORK_ITEM_ID) {
+    expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+      idempotencyKey: `${workItemId}-create`,
+      workItemId,
+      workItem: { workItemId, title: workItemId, body: workItemId },
+    })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, {
+      workItemId,
+      idempotencyKey: `${workItemId}-ready`,
+    })).outcome).toBe("OK");
+  }
+  expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2, {
+    workItemId,
+    idempotencyKey: `${workItemId}-in-progress`,
+  })).outcome).toBe("OK");
+  const attempt = fixture.db.prepare(
+    `SELECT execution_attempt_id, thread_id FROM execution_attempts
+     WHERE project_id = ? AND work_item_id = ? AND origin = 'work_item' AND assignment_kind = 'write' AND state = 'running'`,
+  ).get(PROJECT_ID, workItemId) as { execution_attempt_id: string; thread_id: string };
+  const report = {
+    receiptVersion: 1 as const,
+    outcome,
+    projectId: PROJECT_ID,
+    assignmentId: null,
+    executionAttemptId: attempt.execution_attempt_id,
+    workItemId,
+    roleId: null,
+    roleGeneration: null,
+    repoTargetId: TARGET_ID,
+    environmentId: "environment-work-item-terminal",
+    threadId: attempt.thread_id,
+    branchName: null,
+    baseSha: null,
+    candidateSha: null,
+    nativeReceiptDigest: "a".repeat(64),
+    actualProfileDigest: "b".repeat(64),
+    candidateObservationDigest: "c".repeat(64),
+    reasonCode: "accepted-done-fixture",
+    nativeEventId: `native-terminal-${workItemId}`,
+    nativeEventSeq: 100,
+    nativeTurnId: `native-turn-${workItemId}`,
+    evidence: [{ kind: "test-evidence", digest: "d".repeat(64), ref: `evidence-${workItemId}` }],
+  } satisfies NonNullable<ApplyRequest["terminalReport"]>;
+  const evidenceReader = new DeterministicExecutionAttemptEvidenceReader();
+  evidenceReader.terminalEvidence = {
+    projectId: PROJECT_ID,
+    workItemId,
+    executionAttemptId: attempt.execution_attempt_id,
+    repoTargetId: TARGET_ID,
+    resourceRevision: 3,
+    assignmentId: null,
+    roleId: null,
+    roleGeneration: null,
+    environmentId: report.environmentId,
+    threadId: report.threadId,
+    branchName: null,
+    baseSha: null,
+    candidateSha: null,
+    nativeReceiptDigest: report.nativeReceiptDigest,
+    actualProfileDigest: report.actualProfileDigest,
+    candidateObservationDigest: report.candidateObservationDigest,
+    nativeEventId: report.nativeEventId,
+    nativeEventSeq: report.nativeEventSeq,
+    nativeTurnId: report.nativeTurnId,
+    evidence: report.evidence,
+  };
+  if (accept) {
+    const accepted = applyWithFixtureReceipt(fixture.db, {
+      projectId: PROJECT_ID,
+      operationClass: "execution_attempt_terminal_report",
+      idempotencyKey: `${workItemId}-terminal-report`,
+      actorReceiptId: RECEIPT_ID,
+      expectedConfigRevision: 1,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fixture.fenceToken,
+      repoTargetId: TARGET_ID,
+      expectedResourceRevision: 3,
+      workItemId,
+      executionAttemptId: attempt.execution_attempt_id,
+      terminalReport: report,
+    }, null, null, null, null, evidenceReader);
+    expect(accepted).toMatchObject({ outcome: "OK", attempted: 1, verified: 1 });
+  }
+  return { fixture, attempt, report, reportDigest: sha256(canonicalJson(report)), evidenceReader };
+}
+
+function acceptedReviewPendingRequest(
+  accepted: Awaited<ReturnType<typeof acceptedDoneWorkItemFixture>>,
+  expectedResourceRevision = 3,
+  overrides: Partial<ApplyRequest> = {},
+): ApplyRequest {
+  return transitionRequest(accepted.fixture.fenceToken, "review_pending", expectedResourceRevision, {
+    workItemId: accepted.report.workItemId,
+    executionAttemptId: accepted.attempt.execution_attempt_id,
+    reviewHandoff: {
+      kind: "accepted-write-terminal-report",
+      executionAttemptId: accepted.attempt.execution_attempt_id,
+      terminalReportDigest: accepted.reportDigest,
+      terminalEventId: accepted.report.nativeEventId,
+      terminalEventSeq: accepted.report.nativeEventSeq,
+    },
+    ...overrides,
+  });
+}
+
+function interleaveWorkItemRevisionMutation(db: Database.Database, workItemId: string): () => void {
+  const originalPrepare = db.prepare;
+  const boundPrepare = originalPrepare.bind(db);
+  let armed = true;
+  db.prepare = ((sql: string) => {
+    const statement = boundPrepare(sql);
+    if (!armed || !sql.includes("UPDATE work_items SET lifecycle_state = ?")) return statement;
+    armed = false;
+    boundPrepare("UPDATE work_items SET resource_revision = resource_revision + 1 WHERE project_id = ? AND work_item_id = ?")
+      .run(PROJECT_ID, workItemId);
+    return statement;
+  }) as typeof db.prepare;
+  return () => { db.prepare = originalPrepare; };
+}
+
 function workItemWaitRequest(
   fenceToken: string,
   expectedResourceRevision: number,
@@ -3999,7 +4148,7 @@ else printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue:startable"}]}]]'; 
     })).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, legacyReviewPendingRequest(db, fenceToken, 3)).outcome).toBe("OK");
     expect(applyFixtureMutation(db, transitionRequest(fenceToken, "succeeded", 4, {
       workItemExternalEvent: { kind: "github_issue_closed", owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351 },
     }), null, null, null, null, githubRead)).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
@@ -6218,7 +6367,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
   it("refuses pull-request review dispatch through the local candidate lane before intent or spawn", async () => {
     const fixture = await assignmentFixture({ withoutGithubIssues: true });
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, {
+    expect(applyWithFixtureReceipt(fixture.db, legacyReviewPendingRequest(fixture.db, fixture.fenceToken, 3, {
       idempotencyKey: "pull-request-review-pending",
       workAttempt: undefined,
     })).outcome).toBe("OK");
@@ -6319,7 +6468,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       reviewReturnPath: { threadId: ROLE_THREAD_ID, statuses: ["DONE", "BLOCKED", "WAITING"] as ["DONE", "BLOCKED", "WAITING"] },
     };
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, {
+    expect(applyWithFixtureReceipt(fixture.db, legacyReviewPendingRequest(fixture.db, fixture.fenceToken, 3, {
       idempotencyKey: "local-review-pending",
       workAttempt: undefined,
     })).outcome).toBe("OK");
@@ -6423,7 +6572,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     delete reviewAttempt._status;
     const mutatedStatus = (mutated._status as Record<string, unknown> | undefined) ?? status;
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, { idempotencyKey: `local-review-pending-${_name}`, workAttempt: undefined })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(fixture.db, legacyReviewPendingRequest(fixture.db, fixture.fenceToken, 3, { idempotencyKey: `local-review-pending-${_name}`, workAttempt: undefined })).outcome).toBe("OK");
     if (mutated._status) fixture.host.harness.sdk.stub("environments.status", (async () => mutatedStatus) as never);
     const before = exportFoundation(fixture.db, PROJECT_ID);
     let result: { outcome: string };
@@ -6469,7 +6618,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     }) as never);
     fixture.host.harness.sdk.stub("threads.spawn", (async () => { throw new Error("spawn must not be reached"); }) as never);
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, { idempotencyKey: "late-move-review-pending", workAttempt: undefined })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(fixture.db, legacyReviewPendingRequest(fixture.db, fixture.fenceToken, 3, { idempotencyKey: "late-move-review-pending", workAttempt: undefined })).outcome).toBe("OK");
     const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
       request: transitionRequest(fixture.fenceToken, undefined, 4, { idempotencyKey: "late-move-review-dispatch", workAttempt: reviewAttempt }),
       spawn: dispatchSpawn(ROLE_THREAD_ID, { environment: { type: "reuse", environmentId: ROLE_ENVIRONMENT_ID } }),
@@ -8002,7 +8151,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     const fixture = await fleetWatchdogFixture(0);
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
     fixture.addNativeLane("thread-work-item-1", "active");
-    const request = { ...transitionRequest(fixture.fenceToken, "review_pending", 3), workAttempt: undefined };
+    const request = { ...legacyReviewPendingRequest(fixture.db, fixture.fenceToken, 3), workAttempt: undefined };
     expect(await fixture.host.harness.callRpc("apply", request)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 1, verified: 0 });
     expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item'").get()).toEqual({ state: "running" });
     fixture.addNativeLane("thread-work-item-1", "idle");
@@ -8011,7 +8160,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
 
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 4))).toMatchObject({ outcome: "OK" });
     fixture.addNativeLane("thread-work-item-1", "active");
-    const reviewAttemptRequest = transitionRequest(fixture.fenceToken, "review_pending", 5);
+    const reviewAttemptRequest = legacyReviewPendingRequest(fixture.db, fixture.fenceToken, 5);
     expect(await fixture.host.harness.callRpc("apply", reviewAttemptRequest)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 1, verified: 0 });
     expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item' AND assignment_kind = 'write' ORDER BY attempt_ordinal DESC LIMIT 1").get()).toEqual({ state: "running" });
     fixture.addNativeLane("thread-work-item-1", "idle");
@@ -8104,7 +8253,7 @@ fi
       await fixture.host.harness.runSchedule("fleet-watchdog");
       fixture.addNativeLane("thread-successor", "idle");
       await fixture.host.harness.runSchedule("fleet-watchdog");
-      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 4, {
+      expect(applyWithFixtureReceipt(fixture.db, legacyReviewPendingRequest(fixture.db, fixture.fenceToken, 4, {
         idempotencyKey: "dispatched-live-review",
         workAttempt: { laneId: "lane-review-successor", threadId: "thread-review-successor", assignmentKind: "review", candidateKind: "pull-request", reviewPrNumber: 507, reviewPrHeadSha: CANDIDATE_SHA },
       }))).toMatchObject({ outcome: "OK" });
@@ -8241,7 +8390,7 @@ fi
       expect(workItemReconciliationIssues(fixture.db, PROJECT_ID)).toEqual([]);
       await fixture.host.harness.runSchedule("fleet-watchdog");
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
-      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3))).toMatchObject({ outcome: "OK" });
+      expect(applyWithFixtureReceipt(fixture.db, legacyReviewPendingRequest(fixture.db, fixture.fenceToken, 3))).toMatchObject({ outcome: "OK" });
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 4))).toMatchObject({ outcome: "OK" });
       expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM work_items WHERE lifecycle_state = 'in_progress'").get()).toEqual({ count: 0 });
       await fixture.host.harness.runSchedule("fleet-watchdog");
@@ -9145,7 +9294,7 @@ exit 1
       const fixture = await fleetWatchdogFixture(1, true);
       fixture.host.harness.sdk.stub("threads.wait", (async () => undefined) as never);
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
-      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3)).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, legacyReviewPendingRequest(fixture.db, fixture.fenceToken, 3)).outcome).toBe("OK");
       vi.useFakeTimers();
       try {
         await fixture.host.harness.emitThreadEvent("thread.idle", {
@@ -9226,7 +9375,7 @@ exit 1
       ).get()).toEqual({ count: 1, last_confirmed_at_ms: 160 }));
 
       clock.mockReturnValue(200);
-      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3))).toMatchObject({ outcome: "OK" });
+      expect(applyWithFixtureReceipt(fixture.db, legacyReviewPendingRequest(fixture.db, fixture.fenceToken, 3))).toMatchObject({ outcome: "OK" });
       fixture.addNativeLane("thread-work-item-1", "error");
       await fixture.host.harness.emitThreadEvent("thread.active", {
         thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "active", updatedAt: 200 }),
@@ -9720,7 +9869,7 @@ exit 1
     try {
       const fixture = await fleetWatchdogFixture(0, true);
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
-      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3))).toMatchObject({ outcome: "OK" });
+      expect(applyWithFixtureReceipt(fixture.db, legacyReviewPendingRequest(fixture.db, fixture.fenceToken, 3))).toMatchObject({ outcome: "OK" });
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 4))).toMatchObject({ outcome: "OK" });
       let directorReads = 0;
       fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
@@ -9988,7 +10137,7 @@ exit 1
       workItemId: dependencyId,
       workAttempt: { laneId: "lane-watchdog-dependency", threadId: "thread-watchdog-dependency", assignmentKind: "write" },
     })).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, {
+    expect(applyWithFixtureReceipt(fixture.db, legacyReviewPendingRequest(fixture.db, fixture.fenceToken, 3, {
       idempotencyKey: "watchdog-dependency-review",
       workItemId: dependencyId,
       workAttempt: { laneId: "lane-watchdog-dependency-review", threadId: "thread-watchdog-dependency-review", assignmentKind: "review", candidateKind: "pull-request", reviewPrNumber: 200, reviewPrHeadSha: CANDIDATE_SHA },
@@ -10034,7 +10183,7 @@ exit 1
         idempotencyKey: "refused-reopen-disagreement-start", workItemId,
         workAttempt: { laneId: "lane-refused-reopen-disagreement", threadId: "thread-refused-reopen-disagreement", assignmentKind: "write" },
       })).outcome).toBe("OK");
-      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, {
+      expect(applyWithFixtureReceipt(fixture.db, legacyReviewPendingRequest(fixture.db, fixture.fenceToken, 3, {
         idempotencyKey: "refused-reopen-disagreement-review", workItemId,
         workAttempt: { laneId: "lane-refused-reopen-disagreement-review", threadId: "thread-refused-reopen-disagreement-review", assignmentKind: "review", candidateKind: "pull-request", reviewPrNumber: 200, reviewPrHeadSha: CANDIDATE_SHA },
       })).outcome).toBe("OK");
@@ -10095,7 +10244,7 @@ exit 1
         idempotencyKey: "permanently-refused-reopen-start", workItemId,
         workAttempt: { laneId: "lane-permanently-refused-reopen", threadId: "thread-permanently-refused-reopen", assignmentKind: "write" },
       })).outcome).toBe("OK");
-      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, {
+      expect(applyWithFixtureReceipt(fixture.db, legacyReviewPendingRequest(fixture.db, fixture.fenceToken, 3, {
         idempotencyKey: "permanently-refused-reopen-review", workItemId,
         workAttempt: { laneId: "lane-permanently-refused-reopen-review", threadId: "thread-permanently-refused-reopen-review", assignmentKind: "review", candidateKind: "pull-request", reviewPrNumber: 200, reviewPrHeadSha: CANDIDATE_SHA },
       })).outcome).toBe("OK");
@@ -10159,7 +10308,7 @@ exit 1
         idempotencyKey: "reopened-work-item-start", workItemId,
         workAttempt: { laneId: "lane-reopened", threadId: "thread-reopened", assignmentKind: "write" },
       })).outcome).toBe("OK");
-      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, {
+      expect(applyWithFixtureReceipt(fixture.db, legacyReviewPendingRequest(fixture.db, fixture.fenceToken, 3, {
         idempotencyKey: "reopened-work-item-review", workItemId,
         workAttempt: { laneId: "lane-reopened-review", threadId: "thread-reopened-review", assignmentKind: "review", candidateKind: "pull-request", reviewPrNumber: 200, reviewPrHeadSha: CANDIDATE_SHA },
       })).outcome).toBe("OK");
@@ -11451,7 +11600,7 @@ else printf '%s\\n' '[]'; fi
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
 
-    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3, {
+    expect(applyWithFixtureReceipt(db, legacyReviewPendingRequest(db, fenceToken, 3, {
       workAttempt: { laneId: "lane-review", assignmentKind: "review", candidateKind: "pull-request", reviewPrNumber: 338 },
     }))).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0 });
     expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({
@@ -13198,7 +13347,7 @@ else printf '%s\\n' '[]'; fi
 
     db.prepare("UPDATE role_generations SET status = 'retired' WHERE project_id = ? AND role_id = 'project-orchestrator' AND generation = 1").run(PROJECT_ID);
     const before = db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID);
-    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3, {
+    expect(applyWithFixtureReceipt(db, legacyReviewPendingRequest(db, fenceToken, 3, {
       idempotencyKey: "retired-role-work-item-review",
       actorReceiptId: "role-actor-assignment",
     })).outcome).toBe("ROLE_NOT_ACTIVE");
@@ -13896,7 +14045,7 @@ else printf '%s\\n' '[]'; fi
       idempotencyKey: "stale-work-item-start",
       expectedConfigRevision: 2,
     }))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
-    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3, {
+    expect(applyWithFixtureReceipt(db, legacyReviewPendingRequest(db, fenceToken, 3, {
       idempotencyKey: "stale-work-item-review",
       expectedConfigRevision: 2,
       workAttempt: { laneId: "lane-review-item-1", threadId: "thread-review-item-1", assignmentKind: "review", candidateKind: "pull-request", reviewPrNumber: 338, reviewPrHeadSha: CANDIDATE_SHA },
@@ -13960,7 +14109,7 @@ else printf '%s\\n' '[]'; fi
       requested_reasoning_level: ROLE_PROFILE.reasoningLevel,
       requested_profile_digest: ROLE_PROFILE_DIGEST,
     });
-    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3, { idempotencyKey: "profile-review" })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, legacyReviewPendingRequest(db, fenceToken, 3, { idempotencyKey: "profile-review" })).outcome).toBe("OK");
     expect(measure()).toEqual({ total: 2, with_model: 2, with_thread: 2, with_digest: 2 });
     expect(db.prepare(
       `SELECT requested_provider_id, requested_model, requested_reasoning_level, requested_profile_digest
@@ -14023,7 +14172,7 @@ else printf '%s\\n' '[]'; fi
     }))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 3))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
     if (terminalState === "succeeded") {
-      expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 4))).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
+      expect(applyWithFixtureReceipt(db, legacyReviewPendingRequest(db, fenceToken, 4))).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
     }
     const terminalRevision = terminalState === "succeeded" ? 5 : 4;
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, terminalState, terminalRevision))).toMatchObject({
@@ -14209,7 +14358,11 @@ else printf '%s\\n' '[]'; fi
       },
     }));
     const transition = (workItemId: string, state: ApplyRequest["lifecycleState"], revision: number, overrides: Partial<ApplyRequest> = {}) =>
-      applyWithFixtureReceipt(db, transitionRequest(fenceToken, state, revision, {
+      applyWithFixtureReceipt(db, state === "review_pending" ? legacyReviewPendingRequest(db, fenceToken, revision, {
+        idempotencyKey: `${workItemId}-${state}-${revision}`,
+        workItemId,
+        ...overrides,
+      }) : transitionRequest(fenceToken, state, revision, {
         idempotencyKey: `${workItemId}-${state}-${revision}`,
         workItemId,
         ...overrides,
@@ -14266,7 +14419,11 @@ else printf '%s\\n' '[]'; fi
       workItem: { workItemId, title: workItemId, body: workItemId },
     }));
     const transition = (workItemId: string, state: ApplyRequest["lifecycleState"], revision: number, overrides: Partial<ApplyRequest> = {}) =>
-      applyWithFixtureReceipt(db, transitionRequest(fenceToken, state, revision, {
+      applyWithFixtureReceipt(db, state === "review_pending" ? legacyReviewPendingRequest(db, fenceToken, revision, {
+        idempotencyKey: `${workItemId}-${state}-${revision}`,
+        workItemId,
+        ...overrides,
+      }) : transitionRequest(fenceToken, state, revision, {
         idempotencyKey: `${workItemId}-${state}-${revision}`,
         workItemId,
         ...overrides,
@@ -14313,7 +14470,11 @@ else printf '%s\\n' '[]'; fi
       workItem: { workItemId, title: workItemId, body: workItemId },
     }));
     const transition = (workItemId: string, state: ApplyRequest["lifecycleState"], revision: number, overrides: Partial<ApplyRequest> = {}) =>
-      applyWithFixtureReceipt(db, transitionRequest(fenceToken, state, revision, {
+      applyWithFixtureReceipt(db, state === "review_pending" ? legacyReviewPendingRequest(db, fenceToken, revision, {
+        idempotencyKey: `${workItemId}-${state}-${revision}`,
+        workItemId,
+        ...overrides,
+      }) : transitionRequest(fenceToken, state, revision, {
         idempotencyKey: `${workItemId}-${state}-${revision}`,
         workItemId,
         ...overrides,
@@ -14353,7 +14514,9 @@ else printf '%s\\n' '[]'; fi
       workItem: { workItemId, title: workItemId, body: workItemId },
     }));
     const transition = (workItemId: string, state: ApplyRequest["lifecycleState"], revision: number, overrides: Partial<ApplyRequest> = {}) =>
-      applyWithFixtureReceipt(db, transitionRequest(fenceToken, state, revision, { idempotencyKey: `${workItemId}-${state}-${revision}`, workItemId, ...overrides }));
+      applyWithFixtureReceipt(db, state === "review_pending"
+        ? legacyReviewPendingRequest(db, fenceToken, revision, { idempotencyKey: `${workItemId}-${state}-${revision}`, workItemId, ...overrides })
+        : transitionRequest(fenceToken, state, revision, { idempotencyKey: `${workItemId}-${state}-${revision}`, workItemId, ...overrides }));
     expect(create(WORK_ITEM_ID).outcome).toBe("OK");
     expect(create(dependencyId).outcome).toBe("OK");
     expect(create(laterDependencyId).outcome).toBe("OK");
@@ -14440,7 +14603,7 @@ else printf '%s\\n' '[]'; fi
     })).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, legacyReviewPendingRequest(db, fenceToken, 3)).outcome).toBe("OK");
     github.put({ ...closed, state: "closed", stateReason: "REOPENED", externalRevision: "closed-impossible" });
     const impossibleCloseRefusal = applyFixtureMutation(db, transitionRequest(fenceToken, "succeeded", 4, {
       idempotencyKey: "impossible-close",
@@ -14494,7 +14657,11 @@ else printf '%s\\n' '[]'; fi
       "SELECT config_digest FROM project_config_revisions WHERE project_id = ? AND config_revision = 1",
     ).get(PROJECT_ID) as { config_digest: string }).config_digest;
     const transition = (workItemId: string, state: ApplyRequest["lifecycleState"], revision: number, overrides: Partial<ApplyRequest> = {}) =>
-      applyWithFixtureReceipt(db, transitionRequest(fenceToken, state, revision, {
+      applyWithFixtureReceipt(db, state === "review_pending" ? legacyReviewPendingRequest(db, fenceToken, revision, {
+        idempotencyKey: `${workItemId}-${state}-${revision}`,
+        workItemId,
+        ...overrides,
+      }) : transitionRequest(fenceToken, state, revision, {
         idempotencyKey: `${workItemId}-${state}-${revision}`,
         workItemId,
         ...overrides,
@@ -14587,7 +14754,11 @@ else printf '%s\\n' '[]'; fi
     const issue = { kind: "github_issue_closed" as const, owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 901 };
     const targetId = "github-satisfaction-target";
     const transition = (workItemId: string, state: ApplyRequest["lifecycleState"], revision: number, overrides: Partial<ApplyRequest> = {}) =>
-      applyWithFixtureReceipt(db, transitionRequest(fenceToken, state, revision, {
+      applyWithFixtureReceipt(db, state === "review_pending" ? legacyReviewPendingRequest(db, fenceToken, revision, {
+        idempotencyKey: `${workItemId}-${state}-${revision}`,
+        workItemId,
+        ...overrides,
+      }) : transitionRequest(fenceToken, state, revision, {
         idempotencyKey: `${workItemId}-${state}-${revision}`,
         workItemId,
         ...overrides,
@@ -14642,7 +14813,11 @@ else printf '%s\\n' '[]'; fi
       workItem: { workItemId, title: workItemId, body: workItemId, ...(githubIssue === undefined ? {} : { githubIssue: { issueNumber: githubIssue } }) },
     }));
     const transition = (workItemId: string, state: ApplyRequest["lifecycleState"], revision: number, overrides: Partial<ApplyRequest> = {}) =>
-      applyWithFixtureReceipt(db, transitionRequest(fenceToken, state, revision, {
+      applyWithFixtureReceipt(db, state === "review_pending" ? legacyReviewPendingRequest(db, fenceToken, revision, {
+        idempotencyKey: `${workItemId}-${state}-${revision}`,
+        workItemId,
+        ...overrides,
+      }) : transitionRequest(fenceToken, state, revision, {
         idempotencyKey: `${workItemId}-${state}-${revision}`,
         workItemId,
         ...overrides,
@@ -14672,7 +14847,7 @@ else printf '%s\\n' '[]'; fi
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "succeeded", 3))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
     expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items").get()).toEqual({ lifecycle_state: "in_progress", resource_revision: 3 });
 
-    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    expect(applyWithFixtureReceipt(db, legacyReviewPendingRequest(db, fenceToken, 3))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
     expect(db.prepare("SELECT assignment_kind, state FROM execution_attempts WHERE project_id = ? AND work_item_id = ? ORDER BY attempt_ordinal").all(PROJECT_ID, WORK_ITEM_ID)).toEqual([
       { assignment_kind: "write", state: "done" },
       { assignment_kind: "review", state: "running" },
@@ -14688,10 +14863,173 @@ else printf '%s\\n' '[]'; fi
       { assignment_kind: "write", state: "running" },
     ]);
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "succeeded", 5))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0 });
-    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 5))).toMatchObject({ outcome: "OK", currentResourceRevision: 6 });
+    expect(applyWithFixtureReceipt(db, legacyReviewPendingRequest(db, fenceToken, 5))).toMatchObject({ outcome: "OK", currentResourceRevision: 6 });
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "succeeded", 6))).toMatchObject({ outcome: "OK", currentResourceRevision: 7 });
     expect(db.prepare("SELECT lifecycle_state FROM work_items").get()).toEqual({ lifecycle_state: "succeeded" });
     expect(db.prepare("SELECT COUNT(*) AS count FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state IN ('prepared', 'armed', 'content_delivered', 'running', 'dispatch_unknown')").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ count: 0 });
+  });
+
+  it("#723 B1-B4 accepts a DONE report and causally hands off the completed writer", async () => {
+    const accepted = await acceptedDoneWorkItemFixture();
+    const { db } = accepted.fixture;
+    expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ lifecycle_state: "in_progress", resource_revision: 3 });
+    const terminalFields = db.prepare(
+      `SELECT state, completed_at_ms, terminalization_class, terminal_result, reported_outcome,
+              terminal_report_digest, terminal_report_json, terminal_event_id, terminal_event_seq,
+              terminal_actual_profile_digest, native_receipt_digest, observed_at_ms,
+              lease_owner_thread_id, progress_json
+       FROM execution_attempts WHERE execution_attempt_id = ?`,
+    ).get(accepted.attempt.execution_attempt_id);
+    const handoff = acceptedReviewPendingRequest(accepted);
+    const result = applyWithFixtureReceipt(db, handoff);
+    expect(result).toMatchObject({
+      outcome: "OK",
+      currentResourceRevision: 4,
+      evidence: {
+        executionAttemptId: accepted.attempt.execution_attempt_id,
+        handoffKind: "accepted-write-terminal-report",
+        terminalReportDigest: accepted.reportDigest,
+        terminalEventId: accepted.report.nativeEventId,
+        terminalEventSeq: accepted.report.nativeEventSeq,
+      },
+    });
+    expect(db.prepare("SELECT * FROM execution_attempts WHERE execution_attempt_id = ?").get(accepted.attempt.execution_attempt_id)).toMatchObject(terminalFields as object);
+    expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ lifecycle_state: "review_pending", resource_revision: 4 });
+    const event = db.prepare(
+      `SELECT event_json FROM state_events
+       WHERE project_id = ? AND aggregate_type = 'work_item' AND aggregate_id = ? AND event_type = 'work_item_transitioned'
+       ORDER BY event_sequence DESC LIMIT 1`,
+    ).get(PROJECT_ID, WORK_ITEM_ID) as { event_json: string };
+    expect(JSON.parse(event.event_json)).toMatchObject({
+      executionAttemptId: accepted.attempt.execution_attempt_id,
+      handoffKind: "accepted-write-terminal-report",
+      terminalReportDigest: accepted.reportDigest,
+      terminalEventId: accepted.report.nativeEventId,
+      terminalEventSeq: accepted.report.nativeEventSeq,
+    });
+    expect(db.prepare(
+      "SELECT assignment_kind, continuation_of_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? ORDER BY attempt_ordinal DESC LIMIT 1",
+    ).get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ assignment_kind: "review", continuation_of_attempt_id: accepted.attempt.execution_attempt_id });
+  });
+
+  it("#723 B5 refuses missing or inconsistent accepted-DONE controls", async () => {
+    const cases: Array<[string, (accepted: Awaited<ReturnType<typeof acceptedDoneWorkItemFixture>>) => void]> = [
+      ["missing event", ({ fixture, attempt }) => fixture.db.prepare("UPDATE state_events SET event_json = '{}' WHERE project_id = ? AND aggregate_id = ? AND event_type = 'execution_attempt_terminal_report_accepted'").run(PROJECT_ID, attempt.execution_attempt_id)],
+      ["null digest", ({ fixture, attempt }) => fixture.db.prepare("UPDATE execution_attempts SET terminal_report_digest = NULL WHERE execution_attempt_id = ?").run(attempt.execution_attempt_id)],
+      ["mismatched digest", ({ fixture, attempt }) => fixture.db.prepare("UPDATE execution_attempts SET terminal_report_digest = ? WHERE execution_attempt_id = ?").run("f".repeat(64), attempt.execution_attempt_id)],
+      ["non-accepted class", ({ fixture, attempt }) => fixture.db.prepare("UPDATE execution_attempts SET terminalization_class = 'work-item-review-handoff' WHERE execution_attempt_id = ?").run(attempt.execution_attempt_id)],
+      ["non-write kind", ({ fixture, attempt }) => fixture.db.prepare("UPDATE execution_attempts SET assignment_kind = 'review' WHERE execution_attempt_id = ?").run(attempt.execution_attempt_id)],
+    ];
+    for (const [name, mutate] of cases) {
+      const accepted = await acceptedDoneWorkItemFixture();
+      mutate(accepted);
+      const before = exportFoundation(accepted.fixture.db, PROJECT_ID);
+      expect(applyWithFixtureReceipt(accepted.fixture.db, acceptedReviewPendingRequest(accepted)), name).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
+      expect(exportFoundation(accepted.fixture.db, PROJECT_ID), name).toEqual(before);
+    }
+    const blocked = await acceptedDoneWorkItemFixture(WORK_ITEM_ID, "BLOCKED");
+    expect(applyWithFixtureReceipt(blocked.fixture.db, acceptedReviewPendingRequest(blocked))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
+
+    const foreign = await acceptedDoneWorkItemFixture();
+    const foreignWorkItemId = "b5-foreign-work-item";
+    expect(applyWithFixtureReceipt(foreign.fixture.db, workItemCreateRequest(foreign.fixture.fenceToken, {
+      idempotencyKey: "b5-foreign-create",
+      workItemId: foreignWorkItemId,
+      workItem: { workItemId: foreignWorkItemId, title: foreignWorkItemId, body: foreignWorkItemId },
+    })).outcome).toBe("OK");
+    foreign.fixture.db.prepare("UPDATE execution_attempts SET work_item_id = ? WHERE execution_attempt_id = ?")
+      .run(foreignWorkItemId, foreign.attempt.execution_attempt_id);
+    const originalPrepare = foreign.fixture.db.prepare;
+    const boundPrepare = originalPrepare.bind(foreign.fixture.db);
+    foreign.fixture.db.prepare = ((sql: string) => {
+      const statement = boundPrepare(sql);
+      if (!sql.includes("SELECT execution_attempt_id, state, assignment_kind, thread_id") || !sql.includes("ORDER BY attempt_ordinal DESC LIMIT 1")) return statement;
+      return { get: (projectId: string) => statement.get(projectId, foreignWorkItemId) } as Database.Statement;
+    }) as typeof foreign.fixture.db.prepare;
+    try {
+      const foreignWorkItemRequest = acceptedReviewPendingRequest(foreign);
+      expect(applyWithFixtureReceipt(foreign.fixture.db, foreignWorkItemRequest)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
+    } finally {
+      foreign.fixture.db.prepare = originalPrepare;
+    }
+  });
+
+  it("#723 B6-B8 rejects successors, omitted/foreign attempts, and stale revisions", async () => {
+    const accepted = await acceptedDoneWorkItemFixture();
+    const { db, fenceToken } = accepted.fixture;
+    const replacement = transitionRequest(fenceToken, undefined, 3, {
+      idempotencyKey: "b6-replacement-writer",
+      workAttempt: { laneId: "b6-successor", threadId: "thread-b6-successor", assignmentKind: "write" },
+    });
+    expect(applyWithFixtureReceipt(db, replacement)).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    const beforeOld = db.prepare("SELECT state, terminal_report_digest FROM execution_attempts WHERE execution_attempt_id = ?").get(accepted.attempt.execution_attempt_id);
+    expect(applyWithFixtureReceipt(db, acceptedReviewPendingRequest(accepted, 4))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
+    expect(db.prepare("SELECT state, terminal_report_digest FROM execution_attempts WHERE execution_attempt_id = ?").get(accepted.attempt.execution_attempt_id)).toEqual(beforeOld);
+    expect(db.prepare("SELECT state, lane_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? ORDER BY attempt_ordinal DESC LIMIT 1").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ state: "running", lane_id: "b6-successor" });
+
+    const omitted = await acceptedDoneWorkItemFixture();
+    const omittedRequest = acceptedReviewPendingRequest(omitted);
+    delete omittedRequest.executionAttemptId;
+    expect(applyWithFixtureReceipt(omitted.fixture.db, omittedRequest)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
+
+    const cas = await acceptedDoneWorkItemFixture();
+    const restoreInterleaving = interleaveWorkItemRevisionMutation(cas.fixture.db, WORK_ITEM_ID);
+    try {
+      expect(applyWithFixtureReceipt(cas.fixture.db, acceptedReviewPendingRequest(cas, 3, { idempotencyKey: "b8-interleaved" }))).toMatchObject({ outcome: "WORK_ITEM_REVISION_STALE", attempted: 0, verified: 0 });
+    } finally {
+      restoreInterleaving();
+    }
+    expect(cas.fixture.db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ lifecycle_state: "in_progress", resource_revision: 3 });
+  });
+
+  it("#723 B9-B11 orders report before handoff, gates legacy policy, and replays exactly", async () => {
+    const running = await acceptedDoneWorkItemFixture(WORK_ITEM_ID, "DONE", false);
+    const before = exportFoundation(running.fixture.db, PROJECT_ID);
+    const premature = acceptedReviewPendingRequest(running);
+    expect(applyWithFixtureReceipt(running.fixture.db, premature)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
+    expect(exportFoundation(running.fixture.db, PROJECT_ID)).toEqual(before);
+    const reportResult = applyWithFixtureReceipt(running.fixture.db, {
+      projectId: PROJECT_ID,
+      operationClass: "execution_attempt_terminal_report",
+      idempotencyKey: "b9-terminal-report",
+      actorReceiptId: RECEIPT_ID,
+      expectedConfigRevision: 1,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: running.fixture.fenceToken,
+      repoTargetId: TARGET_ID,
+      expectedResourceRevision: 3,
+      workItemId: WORK_ITEM_ID,
+      executionAttemptId: running.attempt.execution_attempt_id,
+      terminalReport: running.report,
+    }, null, null, null, null, running.evidenceReader);
+    expect(reportResult).toMatchObject({ outcome: "OK" });
+    const exact = acceptedReviewPendingRequest(running, 3, { idempotencyKey: "b9-handoff" });
+    expect(applyWithFixtureReceipt(running.fixture.db, exact)).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+
+    const legacy = await acceptedDoneWorkItemFixture("b10-legacy", "DONE", false);
+    const normal = transitionRequest(legacy.fixture.fenceToken, "review_pending", 3, { workItemId: "b10-legacy" });
+    expect(applyWithFixtureReceipt(legacy.fixture.db, normal)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
+    expect(applyWithFixtureReceipt(legacy.fixture.db, legacyReviewPendingRequest(legacy.fixture.db, legacy.fixture.fenceToken, 3, { workItemId: "b10-legacy", reasonCode: "arbitrary-recovery-reason" }))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
+    expect(applyWithFixtureReceipt(legacy.fixture.db, legacyReviewPendingRequest(legacy.fixture.db, legacy.fixture.fenceToken, 3, { workItemId: "b10-legacy" }))).toMatchObject({ outcome: "OK" });
+
+    const replay = await acceptedDoneWorkItemFixture();
+    const replayRequest = acceptedReviewPendingRequest(replay, 3, { idempotencyKey: "b11-exact" });
+    const first = applyWithFixtureReceipt(replay.fixture.db, replayRequest);
+    expect(applyWithFixtureReceipt(replay.fixture.db, replayRequest)).toEqual(first);
+    if (replayRequest.reviewHandoff?.kind !== "accepted-write-terminal-report") throw new Error("test fixture must use accepted handoff");
+    expect(applyWithFixtureReceipt(replay.fixture.db, { ...replayRequest, reviewHandoff: { ...replayRequest.reviewHandoff, terminalReportDigest: "f".repeat(64) } })).toMatchObject({ outcome: "IDEMPOTENCY_KEY_CONFLICT", attempted: 0, verified: 0 });
+  });
+
+  it("#723 B12-B13 preserves the review boundary and rejects interrupted or BLOCKED writers", async () => {
+    const direct = await acceptedDoneWorkItemFixture(WORK_ITEM_ID, "DONE", false);
+    expect(applyWithFixtureReceipt(direct.fixture.db, transitionRequest(direct.fixture.fenceToken, "succeeded", 3))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
+
+    const interrupted = await acceptedDoneWorkItemFixture("b13-interrupted", "DONE", true);
+    interrupted.fixture.db.prepare("UPDATE execution_attempts SET state = 'interrupted' WHERE execution_attempt_id = ?").run(interrupted.attempt.execution_attempt_id);
+    expect(applyWithFixtureReceipt(interrupted.fixture.db, acceptedReviewPendingRequest(interrupted))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
+
+    const blocked = await acceptedDoneWorkItemFixture("b13-blocked", "BLOCKED");
+    expect(applyWithFixtureReceipt(blocked.fixture.db, acceptedReviewPendingRequest(blocked))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
   });
 
   it("re-dispatches a same-head review without changing lifecycle state or writing capacity", async () => {
@@ -14700,7 +15038,7 @@ else printf '%s\\n' '[]'; fi
     expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    expect(applyWithFixtureReceipt(db, legacyReviewPendingRequest(db, fenceToken, 3))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
     const prior = db.prepare(
       "SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND assignment_kind = 'review'",
     ).get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string };
@@ -14756,7 +15094,7 @@ else printf '%s\\n' '[]'; fi
     expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, legacyReviewPendingRequest(db, fenceToken, 3)).outcome).toBe("OK");
     db.prepare("UPDATE execution_attempts SET assignment_kind = 'review', state = 'running' WHERE project_id = ? AND work_item_id = ? AND assignment_kind = 'write'").run(PROJECT_ID, WORK_ITEM_ID);
 
     expect(workItemReconciliationIssues(db, PROJECT_ID)).toEqual([
@@ -14787,7 +15125,7 @@ else printf '%s\\n' '[]'; fi
       resource_revision: 2,
     });
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK", currentResourceRevision: 3 });
-    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
+    expect(applyWithFixtureReceipt(db, legacyReviewPendingRequest(db, fenceToken, 3))).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 4, {
       idempotencyKey: "changed-head-review-redispatch",
       workAttempt: {
@@ -14834,7 +15172,7 @@ else printf '%s\\n' '[]'; fi
     expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1)).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2)).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "review_pending", 3)).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(db, legacyReviewPendingRequest(db, fenceToken, 3)).outcome).toBe("OK");
     db.prepare("UPDATE execution_attempts SET assignment_kind = 'write' WHERE project_id = ? AND work_item_id = ? AND assignment_kind = 'review'").run(PROJECT_ID, WORK_ITEM_ID);
 
     const blindWorkItemId = "blind-work-item";
@@ -14977,7 +15315,7 @@ else printf '%s\\n' '[]'; fi
       { execution_attempt_id: expect.any(String), state: "running", attempt_ordinal: 2, lane_id: "lane-second", thread_id: "thread-second", continuation_of_attempt_id: first.execution_attempt_id },
     ]);
 
-    const reviewPendingWithoutReviewAttempt = transitionRequest(fenceToken, "review_pending", 4, {
+    const reviewPendingWithoutReviewAttempt = legacyReviewPendingRequest(db, fenceToken, 4, {
       projectId: "proj_gh300_registration",
       workItemId,
       idempotencyKey: "gh300-registration-review-pending",
@@ -17400,7 +17738,7 @@ exit 1
     const original = fixture.db.prepare(
       "SELECT execution_attempt_id, thread_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state = 'running'",
     ).get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string; thread_id: string };
-    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, { idempotencyKey: "gh613-review-pending" })).outcome).toBe("OK");
+    expect(applyWithFixtureReceipt(fixture.db, legacyReviewPendingRequest(fixture.db, fixture.fenceToken, 3, { idempotencyKey: "gh613-review-pending" })).outcome).toBe("OK");
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 4, { idempotencyKey: "gh613-product-success" })).outcome).toBe("OK");
     const correction = {
       projectId: PROJECT_ID,
@@ -17534,7 +17872,7 @@ exit 1
       const original = fixture.db.prepare(
         "SELECT execution_attempt_id, thread_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state = 'running'",
       ).get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string; thread_id: string };
-      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, { idempotencyKey: `gh613-live-review-${variant}` })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, legacyReviewPendingRequest(fixture.db, fixture.fenceToken, 3, { idempotencyKey: `gh613-live-review-${variant}` })).outcome).toBe("OK");
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 4, { idempotencyKey: `gh613-live-success-${variant}` })).outcome).toBe("OK");
       const primaryEventId = `live-native-event-11444-${variant}`;
       const completionEventId = `live-native-event-11448-${variant}`;
@@ -17620,7 +17958,7 @@ exit 1
       const original = fixture.db.prepare(
         "SELECT execution_attempt_id, thread_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND state = 'running'",
       ).get(PROJECT_ID, WORK_ITEM_ID) as { execution_attempt_id: string; thread_id: string };
-      expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "review_pending", 3, { idempotencyKey: "gh613-live-valid-review" })).outcome).toBe("OK");
+      expect(applyWithFixtureReceipt(fixture.db, legacyReviewPendingRequest(fixture.db, fixture.fenceToken, 3, { idempotencyKey: "gh613-live-valid-review" })).outcome).toBe("OK");
       expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "succeeded", 4, { idempotencyKey: "gh613-live-valid-success" })).outcome).toBe("OK");
       fixture.recordNativeEvent(original.thread_id, { id: "evt_live_start", seq: 11440, type: "turn/started", data: { providerThreadId: "provider-thread-613" }, scope: { kind: "turn", turnId: "turn-live-613" } });
       fixture.recordNativeEvent(original.thread_id, { id: "evt_gr5za29vps", seq: 11444, type: "system/thread/interrupted", data: { reason: "manual-stop" }, scope: { kind: "thread" } });
