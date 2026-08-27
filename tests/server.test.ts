@@ -728,9 +728,8 @@ async function acceptedDoneWorkItemFixture(
   workItemId = WORK_ITEM_ID,
   outcome: "DONE" | "BLOCKED" = "DONE",
   accept = true,
-  existingFixture: Awaited<ReturnType<typeof assignmentFixture>> | undefined = undefined,
 ) {
-  const fixture = existingFixture ?? await assignmentFixture({ withoutGithubIssues: true });
+  const fixture = await assignmentFixture({ withoutGithubIssues: true });
   if (workItemId !== WORK_ITEM_ID) {
     expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
       idempotencyKey: `${workItemId}-create`,
