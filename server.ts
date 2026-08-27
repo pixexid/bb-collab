@@ -1078,6 +1078,8 @@ export const foundationResultSchema = z
     currentGovernanceEpoch: z.number().int().positive().optional(),
     expectedGovernanceEpoch: z.number().int().nonnegative().optional(),
     fenceMatched: z.boolean().optional(),
+    epochPresent: z.boolean().optional(),
+    fencePresent: z.boolean().optional(),
     currentResourceRevision: z.number().int().positive().optional(),
     expectedResourceRevision: z.number().int().positive().optional(),
     structurallyImpossibleAtRevision: z.boolean().optional(),

@@ -6687,6 +6687,11 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     };
     expect(prove(99, fixture.fenceToken)).toMatchObject({ data: { code: "GOVERNOR_EPOCH_STALE", fenceMatched: true } });
     expect(prove(1, "wrong-fence")).toMatchObject({ data: { code: "GOVERNOR_EPOCH_STALE", fenceMatched: false } });
+
+    fixture.db.prepare("UPDATE project_governorship_heads SET state = 'source_active' WHERE project_id = ?").run(PROJECT_ID);
+    const noGovernor = prove(1, fixture.fenceToken) as { data?: Record<string, unknown> };
+    expect(noGovernor).toMatchObject({ data: { code: "GOVERNOR_EPOCH_STALE" } });
+    expect(noGovernor).not.toHaveProperty("data.fenceMatched");
   });
 
   it.each([
@@ -13057,7 +13062,7 @@ else printf '%s\\n' '[]'; fi
     }
   });
 
-  it("reports a missing governor-claim fence as unmatched", async () => {
+  it("reports a missing governor-claim epoch without inventing a fence comparison", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host);
     const missingEpoch = applyWithFixtureReceipt(db, {
@@ -13069,7 +13074,13 @@ else printf '%s\\n' '[]'; fi
       expectedFenceToken: fenceToken,
       repoTargetId: null,
     });
-    expect(missingEpoch).toMatchObject({ outcome: "GOVERNOR_EPOCH_STALE", fenceMatched: true });
+    expect(missingEpoch).toMatchObject({ outcome: "GOVERNOR_EPOCH_STALE", epochPresent: false, fencePresent: true });
+    expect(missingEpoch).not.toHaveProperty("fenceMatched");
+  });
+
+  it("reports a missing governor-claim fence as absent rather than mismatched", async () => {
+    const host = await loadedHost();
+    const { db } = seedAndBootstrap(host);
     const missingFence = applyWithFixtureReceipt(db, {
       ...bootstrapRequest(),
       operationClass: "governor_claim",
@@ -13079,7 +13090,8 @@ else printf '%s\\n' '[]'; fi
       expectedFenceToken: null,
       repoTargetId: null,
     });
-    expect(missingFence).toMatchObject({ outcome: "GOVERNOR_EPOCH_STALE", fenceMatched: false });
+    expect(missingFence).toMatchObject({ outcome: "GOVERNOR_EPOCH_STALE", epochPresent: true, fencePresent: false });
+    expect(missingFence).not.toHaveProperty("fenceMatched");
   });
 
   it("returns the original receipt on duplicate idempotency and refuses conflicting reuse", async () => {
