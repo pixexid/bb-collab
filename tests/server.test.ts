@@ -6063,7 +6063,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     await service.done;
   });
 
-  it("re-arms role recovery on service restart and reports measured lane coverage", async () => {
+  it("reconciles a pre-existing errored holder on restart without re-waking its episode", async () => {
     const fixture = await fleetWatchdogFixture(0);
     const statuses = new Map([[fixture.orchestratorThreadId, "error" as "error" | "active"]]);
     fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
@@ -6089,13 +6089,12 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     for (let start = 1; start <= 2; start += 1) {
       statuses.set(fixture.orchestratorThreadId, "error");
       const service = fixture.host.harness.runService("lane-watcher");
-      await vi.waitFor(() => expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(start));
+      await vi.waitFor(() => expect(fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.startsWith("error-recovery coverage=")).length).toBe(start));
       service.controller.abort();
       await service.done;
     }
 
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toEqual([
-      [expect.objectContaining({ threadId: fixture.orchestratorThreadId, mode: "auto" })],
       [expect.objectContaining({ threadId: fixture.orchestratorThreadId, mode: "auto" })],
     ]);
     expect(fixture.host.harness.inspection.logEntries.filter((entry) => entry.message.startsWith("error-recovery coverage="))).toEqual([
@@ -6128,7 +6127,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     }
   });
 
-  it("bounds the recovery guard around a send that never settles", async () => {
+  it("bounds a recovery send that never settles without re-waking its episode", async () => {
     vi.useFakeTimers();
     try {
       const fixture = await fleetWatchdogFixture(0);
@@ -6153,6 +6152,44 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       const second = emit();
       await vi.advanceTimersByTimeAsync(10_000);
       await second;
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("accepts one recovery wake per native error episode and rearms only after an idle park", async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = await fleetWatchdogFixture(0);
+      let status: "error" | "idle" = "error";
+      fixture.host.harness.sdk.stub("threads.get", (async ({ threadId }: { threadId: string }) => makeThreadResponse({
+        id: threadId,
+        projectId: PROJECT_ID,
+        environmentId: `environment-${threadId}`,
+        status,
+        updatedAt: 1,
+      })) as never);
+      fixture.host.harness.sdk.stub("environments.status", (async () => ({
+        outcome: "available",
+        workspace: { checkout: { kind: "detached", headSha: "episode-head" } },
+      })) as never);
+
+      const failed = () => fixture.host.harness.emitThreadEvent("thread.failed", {
+        thread: makeThreadResponse({ id: fixture.orchestratorThreadId, projectId: PROJECT_ID, status: "error", updatedAt: 1 }),
+        error: "provider failure after accepted recovery",
+      });
+      await failed();
+      await failed();
+      expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(1);
+
+      status = "idle";
+      await fixture.host.harness.emitThreadEvent("thread.idle", {
+        thread: makeThreadResponse({ id: fixture.orchestratorThreadId, projectId: PROJECT_ID, status: "idle", updatedAt: 2 }),
+        lastAssistantText: null,
+      });
+      status = "error";
+      await failed();
       expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(2);
     } finally {
       vi.useRealTimers();
