@@ -27812,8 +27812,8 @@ async function readStrandedOwnerIncapacity(bb, projectId, attempt, input) {
   let thread;
   try {
     thread = await bb.sdk.threads.get({ threadId: input.threadId });
-    if (thread.id !== input.threadId || thread.projectId !== projectId || thread.archivedAt !== null || thread.deletedAt !== null || thread.environmentId === null) {
-      return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "stranded execution closure owner thread is foreign, archived, deleted, or has no environment" };
+    if (thread.id !== input.threadId || thread.projectId !== projectId || thread.deletedAt !== null || thread.environmentId === null) {
+      return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "stranded execution closure owner thread is foreign, deleted, or has no environment" };
     }
     if (attempt.thread_id !== input.threadId || typeof attempt.environment_id === "string" && attempt.environment_id !== thread.environmentId) {
       return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "stranded execution closure environment does not match the canonical attempt" };
