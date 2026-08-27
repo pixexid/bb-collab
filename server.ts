@@ -2454,28 +2454,33 @@ function liveTerminalEvidenceReader(
       }
       const providerThreadId = typeof completionData.providerThreadId === "string" && completionData.providerThreadId.length > 0 ? completionData.providerThreadId : null;
       if (!providerThreadId) throw new Error("native completion provider thread is unavailable");
+      const starts = events.filter((event) => event.type === "turn/started" && nativeTurnId(event) === turnId);
+      if (starts.length !== 1) throw new Error("native completion start correlation is missing or ambiguous");
+      const started = starts[0]!;
+      const startedData = nativeEventData(started);
+      if (started.seq >= completion.seq || startedData.providerThreadId !== providerThreadId) throw new Error("native completion start correlation is foreign or unordered");
       const accepted = events.filter((event) => event.type === "turn/input/accepted" && nativeTurnId(event) === turnId);
-      if (accepted.length !== 1) throw new Error("native completion input correlation is missing or ambiguous");
-      const acceptedEvent = accepted[0]!;
-      const acceptedData = nativeEventData(acceptedEvent);
-      const requestId = typeof acceptedData.clientRequestId === "string" && acceptedData.clientRequestId.length > 0 ? acceptedData.clientRequestId : null;
-      if (!requestId) throw new Error("native accepted input request ID is unavailable");
-      const requestEvents = events.filter((event) => event.type === "client/turn/requested" && nativeEventData(event).requestId === requestId);
-      if (requestEvents.length !== 1) throw new Error("native execution request is missing or ambiguous");
-      const requestEvent = requestEvents[0]!;
-      if (requestEvent.scope?.kind !== "thread" && requestEvent.scope?.kind !== "turn") throw new Error("native execution request scope is malformed");
-      const requestScopeTurnId = nativeTurnId(requestEvent);
-      if (requestScopeTurnId !== null && requestScopeTurnId !== turnId || requestEvent.seq >= acceptedEvent.seq) throw new Error("native execution request is foreign to the exact turn");
-      if (acceptedData.providerThreadId !== providerThreadId) throw new Error("native accepted input provider thread is foreign");
+      const inputCorrelations = accepted.map((acceptedEvent) => {
+        const acceptedData = nativeEventData(acceptedEvent);
+        const requestId = typeof acceptedData.clientRequestId === "string" && acceptedData.clientRequestId.length > 0 ? acceptedData.clientRequestId : null;
+        if (!requestId) throw new Error("native accepted input request ID is unavailable");
+        const requestEvents = events.filter((event) => event.type === "client/turn/requested" && nativeEventData(event).requestId === requestId);
+        if (requestEvents.length !== 1) throw new Error("native execution request is missing or ambiguous");
+        const requestEvent = requestEvents[0]!;
+        if (requestEvent.scope?.kind !== "thread" && requestEvent.scope?.kind !== "turn") throw new Error("native execution request scope is malformed");
+        const requestScopeTurnId = nativeTurnId(requestEvent);
+        if (requestScopeTurnId !== null && requestScopeTurnId !== turnId || requestEvent.seq >= acceptedEvent.seq || acceptedEvent.seq >= completion.seq) throw new Error("native execution request is foreign to the exact turn");
+        if (acceptedData.providerThreadId !== providerThreadId) throw new Error("native accepted input provider thread is foreign");
+        return { acceptedEvent, requestEvent };
+      });
+      const origins = inputCorrelations.filter(({ requestEvent }) => requestEvent.seq < started.seq);
+      if (origins.length !== 1) throw new Error("native completion input correlation is missing or ambiguous");
+      const { acceptedEvent, requestEvent } = origins[0]!;
       const requestData = nativeEventData(requestEvent);
       if (typeof requestData.execution !== "object" || requestData.execution === null || Array.isArray(requestData.execution)) throw new Error("exact native execution request is missing");
       const execution = requestData.execution as Record<string, unknown>;
       const profileFields = ["model", "reasoningLevel", "permissionMode", "serviceTier"].map((field) => execution[field]);
       if (profileFields.some((field) => typeof field !== "string" || field.length === 0) || execution.source !== "client/turn/requested") throw new Error("native execution profile is incomplete");
-      const starts = events.filter((event) => event.type === "turn/started" && nativeTurnId(event) === turnId);
-      if (starts.length !== 1) throw new Error("native completion start correlation is missing or ambiguous");
-      const started = starts[0]!;
-      const startedData = nativeEventData(started);
       if (
         requestEvent.seq >= acceptedEvent.seq ||
         requestEvent.seq >= started.seq ||
