@@ -18122,10 +18122,13 @@ function proveWorkItemDispatchConfig(db, request, committedConfigRevision) {
   const governor = asRow(db.prepare(
     "SELECT governance_epoch, fence_token FROM project_governorship_heads WHERE project_id = ? AND state = 'target_active'"
   ).get(request.projectId));
-  if (!governor || request.expectedGovernanceEpoch !== governor.governance_epoch || request.expectedFenceToken !== governor.fence_token) {
+  const epochMatched = governor !== void 0 && request.expectedGovernanceEpoch === governor.governance_epoch;
+  const fenceMatched = governor !== void 0 && request.expectedFenceToken === governor.fence_token;
+  if (!governor || !epochMatched || !fenceMatched) {
     throw refusal("GOVERNOR_EPOCH_STALE", "dispatch expected governorship epoch or fence token is stale", {
       currentGovernanceEpoch: governor?.governance_epoch,
-      expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? void 0
+      expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? void 0,
+      ...governor === void 0 ? {} : { fenceMatched }
     });
   }
   const workItem = asRow(db.prepare(
@@ -18408,6 +18411,9 @@ function refusalResult(subject, data, expected = 1, attempted = 0, verified = 0)
     ...data.expectedConfigRevision === void 0 ? {} : { expectedConfigRevision: data.expectedConfigRevision },
     ...data.currentGovernanceEpoch === void 0 ? {} : { currentGovernanceEpoch: data.currentGovernanceEpoch },
     ...data.expectedGovernanceEpoch === void 0 ? {} : { expectedGovernanceEpoch: data.expectedGovernanceEpoch },
+    ...data.fenceMatched === void 0 ? {} : { fenceMatched: data.fenceMatched },
+    ...data.epochPresent === void 0 ? {} : { epochPresent: data.epochPresent },
+    ...data.fencePresent === void 0 ? {} : { fencePresent: data.fencePresent },
     ...data.currentResourceRevision === void 0 ? {} : { currentResourceRevision: data.currentResourceRevision },
     ...data.expectedResourceRevision === void 0 ? {} : { expectedResourceRevision: data.expectedResourceRevision }
   });
@@ -18502,10 +18508,13 @@ function requireGovernor(db, request) {
     db.prepare("SELECT governance_epoch, fence_token, state FROM project_governorship_heads WHERE project_id = ?").get(request.projectId)
   );
   if (!head) throw refusal("GOVERNOR_UNAVAILABLE", "project has no current governorship head");
-  if (request.expectedGovernanceEpoch !== head.governance_epoch || request.expectedFenceToken !== head.fence_token) {
+  const epochMatched = request.expectedGovernanceEpoch === head.governance_epoch;
+  const fenceMatched = request.expectedFenceToken === head.fence_token;
+  if (!epochMatched || !fenceMatched) {
     throw refusal("GOVERNOR_EPOCH_STALE", "expected governorship epoch or fence token is stale", {
       currentGovernanceEpoch: head.governance_epoch,
-      expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? void 0
+      expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? void 0,
+      fenceMatched
     });
   }
   if (head.state !== "target_active") throw refusal("PROJECT_FROZEN", "project governorship is not writable");
@@ -18656,10 +18665,13 @@ function deriveBootstrapActor(db, request, digest2) {
     db.prepare("SELECT governance_epoch, fence_token, state FROM project_governorship_heads WHERE project_id = ?").get(authority.sourceProjectId)
   );
   if (!sourceHead) throw refusal("GOVERNOR_UNAVAILABLE", "bootstrap source has no current governorship head");
-  if (sourceHead.governance_epoch !== authority.sourceGovernanceEpoch || sourceHead.fence_token !== authority.sourceFenceToken) {
+  const epochMatched = sourceHead.governance_epoch === authority.sourceGovernanceEpoch;
+  const fenceMatched = sourceHead.fence_token === authority.sourceFenceToken;
+  if (!epochMatched || !fenceMatched) {
     throw refusal("GOVERNOR_EPOCH_STALE", "bootstrap source governorship fence or epoch is stale", {
       currentGovernanceEpoch: sourceHead.governance_epoch,
-      expectedGovernanceEpoch: authority.sourceGovernanceEpoch
+      expectedGovernanceEpoch: authority.sourceGovernanceEpoch,
+      fenceMatched
     });
   }
   if (sourceHead.state !== "target_active") throw refusal("PROJECT_FROZEN", "bootstrap source governorship is not writable");
@@ -18995,10 +19007,14 @@ function applyGovernorClaim(db, request, digest2) {
   if (currentHead.state !== "target_active") throw refusal("PROJECT_FROZEN", "project governorship is not writable");
   const expectedEpoch = request.expectedGovernanceEpoch;
   const expectedToken = request.expectedFenceToken;
-  if (expectedEpoch === null || expectedEpoch === void 0 || expectedToken === null || expectedToken === void 0) {
+  const epochPresent = expectedEpoch !== null && expectedEpoch !== void 0;
+  const fencePresent = expectedToken !== null && expectedToken !== void 0;
+  if (!epochPresent || !fencePresent) {
     throw refusal("GOVERNOR_EPOCH_STALE", "governor claim requires an expected epoch and fence token", {
       currentGovernanceEpoch: currentHead.governance_epoch,
-      expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? void 0
+      expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? void 0,
+      epochPresent,
+      fencePresent
     });
   }
   const actorReceiptId = requireActor(db, request);
@@ -19055,10 +19071,13 @@ function exactGovernor(db, request) {
     ).get(request.projectId)
   );
   if (!head) throw refusal("GOVERNOR_UNAVAILABLE", "project has no current governorship head");
-  if (request.expectedGovernanceEpoch !== head.governance_epoch || request.expectedFenceToken !== head.fence_token) {
+  const epochMatched = request.expectedGovernanceEpoch === head.governance_epoch;
+  const fenceMatched = request.expectedFenceToken === head.fence_token;
+  if (!epochMatched || !fenceMatched) {
     throw refusal("GOVERNOR_EPOCH_STALE", "expected governorship epoch or fence token is stale", {
       currentGovernanceEpoch: head.governance_epoch,
-      expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? void 0
+      expectedGovernanceEpoch: request.expectedGovernanceEpoch ?? void 0,
+      fenceMatched
     });
   }
   return head;
@@ -26818,6 +26837,9 @@ var foundationResultSchema = external_exports.object({
   expectedConfigRevision: external_exports.number().int().nonnegative().optional(),
   currentGovernanceEpoch: external_exports.number().int().positive().optional(),
   expectedGovernanceEpoch: external_exports.number().int().nonnegative().optional(),
+  fenceMatched: external_exports.boolean().optional(),
+  epochPresent: external_exports.boolean().optional(),
+  fencePresent: external_exports.boolean().optional(),
   currentResourceRevision: external_exports.number().int().positive().optional(),
   expectedResourceRevision: external_exports.number().int().positive().optional(),
   structurallyImpossibleAtRevision: external_exports.boolean().optional(),
