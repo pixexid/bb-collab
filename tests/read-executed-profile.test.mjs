@@ -29,6 +29,18 @@ function activeEvents(providerThreadId, nativeTurnId = "active-turn") {
   ];
 }
 
+function continuationEvents(providerThreadId, nativeTurnId = "continuation-turn") {
+  const firstScope = { kind: "turn", turnId: `bta2647fb7-1-first-turn` };
+  const currentScope = { kind: "turn", turnId: `bta2647fb7-1-${nativeTurnId}` };
+  return [
+    { id: "event-requested", seq: 10, type: "client/turn/requested", data: { requestId: "request-initial" }, createdAt: Date.parse("2026-08-20T00:00:10.000Z") },
+    { id: "event-first-started", seq: 11, type: "turn/started", data: { providerThreadId }, scope: firstScope, createdAt: Date.parse("2026-08-20T00:00:11.000Z") },
+    { id: "event-first-accepted", seq: 12, type: "turn/input/accepted", data: { providerThreadId, clientRequestId: "request-initial" }, scope: firstScope, createdAt: Date.parse("2026-08-20T00:00:11.000Z") },
+    { id: "event-first-completed", seq: 13, type: "turn/completed", data: { status: "completed", providerThreadId, providerCheckpointId: "first-turn" }, scope: firstScope, createdAt: Date.parse("2026-08-20T00:00:13.000Z") },
+    { id: "event-continuation-started", seq: 14, type: "turn/started", data: { providerThreadId }, scope: currentScope, createdAt: Date.parse("2026-08-20T00:00:14.000Z") },
+  ];
+}
+
 function stoppedEvents(providerThreadId, nativeTurnId, status = "interrupted", prefix = "bta2647fb7") {
   const scopeTurnId = prefix === "bta2647fb7" ? `${prefix}-1-${nativeTurnId}` : `${prefix}-${nativeTurnId}`;
   return [
@@ -213,6 +225,97 @@ describe("executed profile read-back", () => {
         executedProfile: { providerId: "codex", model: "gpt-5.6-sol", reasoningLevel: "medium", kind: "executed-provider-native" },
       }],
     });
+  });
+
+  it("DISCRIMINATOR: reads an active Codex continuation from its native turn context", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "018cc251-f400-7000-8000-000000000000";
+    const nativeTurnId = "123e4567-e89b-42d3-a456-426614174000";
+    jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${providerThreadId}.jsonl`), [
+      { type: "session_meta", payload: { id: providerThreadId, originator: "bb", cwd: "/test/project" } },
+      { type: "turn_context", timestamp: "2026-08-20T00:00:14.500Z", payload: { turn_id: nativeTurnId, model: "gpt-5.6-sol", effort: "medium" } },
+    ]);
+    const result = await readExecutedProfiles({
+      thread: { providerId: "codex", status: "active" },
+      environment: { path: "/test/project" },
+      events: continuationEvents(providerThreadId, nativeTurnId),
+      home,
+    });
+    expect(result).toMatchObject({
+      outcome: "known",
+      coverage: { activeTurns: 1, completedTurns: 0, knownTurns: 1, unknownTurns: 0 },
+      turns: [{ phase: "active", status: "known", executedProfile: { providerId: "codex", model: "gpt-5.6-sol", reasoningLevel: "medium" } }],
+    });
+  });
+
+  it("GUARD: does not reuse a prior native profile when a continuation turn has no native turn context", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "018cc251-f400-7000-8000-000000000000";
+    const nativeTurnId = "123e4567-e89b-42d3-a456-426614174000";
+    jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${providerThreadId}.jsonl`), [
+      { type: "session_meta", payload: { id: providerThreadId, originator: "bb", cwd: "/test/project" } },
+      { type: "turn_context", timestamp: "2026-08-20T00:00:14.500Z", payload: { turn_id: "first-turn", model: "STALE_PROFILE", effort: "high" } },
+    ]);
+    const result = await readExecutedProfiles({
+      thread: { providerId: "codex", status: "active" },
+      environment: { path: "/test/project" },
+      events: continuationEvents(providerThreadId, nativeTurnId),
+      home,
+    });
+    expect(result).toMatchObject({ outcome: "unknown", turns: [{ phase: "active", status: "unknown" }] });
+    expect(JSON.stringify(result)).not.toMatch(/STALE_PROFILE|executedProfile/u);
+  });
+
+  it("GUARD: refuses a foreign clientRequestId in an otherwise native continuation turn", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "018cc251-f400-7000-8000-000000000000";
+    const nativeTurnId = "123e4567-e89b-42d3-a456-426614174000";
+    const events = continuationEvents(providerThreadId, nativeTurnId);
+    events.push({
+      id: "event-foreign-accepted",
+      seq: 15,
+      type: "turn/input/accepted",
+      data: { providerThreadId, clientRequestId: "foreign-request" },
+      scope: events.at(-1).scope,
+      createdAt: Date.parse("2026-08-20T00:00:15.000Z"),
+    });
+    jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${providerThreadId}.jsonl`), [
+      { type: "session_meta", payload: { id: providerThreadId, originator: "bb", cwd: "/test/project" } },
+      { type: "turn_context", timestamp: "2026-08-20T00:00:14.500Z", payload: { turn_id: nativeTurnId, model: "DO_NOT_ACCEPT", effort: "medium" } },
+    ]);
+    const result = await readExecutedProfiles({
+      thread: { providerId: "codex", status: "active" },
+      environment: { path: "/test/project" },
+      events,
+      home,
+    });
+    expect(result).toMatchObject({ outcome: "unknown", reason: "BB active turn input correlation is missing or ambiguous" });
+    expect(JSON.stringify(result)).not.toMatch(/DO_NOT_ACCEPT|executedProfile/u);
+  });
+
+  it("DISCRIMINATOR: correlates the current request when multiple legitimate inputs share an active turn", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "018cc251-f400-7000-8000-000000000000";
+    const nativeTurnId = "123e4567-e89b-42d3-a456-426614174000";
+    const scope = { kind: "turn", turnId: `bta2647fb7-1-${nativeTurnId}` };
+    const events = [
+      { id: "event-older-requested", seq: 9, type: "client/turn/requested", data: { requestId: "request-older" }, createdAt: Date.parse("2026-08-20T00:00:09.000Z") },
+      { id: "event-current-requested", seq: 10, type: "client/turn/requested", data: { requestId: "request-current" }, createdAt: Date.parse("2026-08-20T00:00:10.000Z") },
+      { id: "event-current-started", seq: 11, type: "turn/started", data: { providerThreadId }, scope, createdAt: Date.parse("2026-08-20T00:00:11.000Z") },
+      { id: "event-older-accepted", seq: 12, type: "turn/input/accepted", data: { providerThreadId, clientRequestId: "request-older" }, scope, createdAt: Date.parse("2026-08-20T00:00:11.000Z") },
+      { id: "event-current-accepted", seq: 13, type: "turn/input/accepted", data: { providerThreadId, clientRequestId: "request-current" }, scope, createdAt: Date.parse("2026-08-20T00:00:11.000Z") },
+    ];
+    jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${providerThreadId}.jsonl`), [
+      { type: "session_meta", payload: { id: providerThreadId, originator: "bb", cwd: "/test/project" } },
+      { type: "turn_context", timestamp: "2026-08-20T00:00:11.500Z", payload: { turn_id: nativeTurnId, model: "gpt-current", effort: "medium" } },
+    ]);
+    const result = await readExecutedProfiles({
+      thread: { providerId: "codex", status: "active" },
+      environment: { path: "/test/project" },
+      events,
+      home,
+    });
+    expect(result).toMatchObject({ outcome: "known", turns: [{ status: "known", executedProfile: { model: "gpt-current" } }] });
   });
 
   it("DISCRIMINATOR: ignores a queued input and resolves a stopped Codex turn from its BB scope", async () => {

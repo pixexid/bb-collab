@@ -117,20 +117,42 @@ function activeTurn(thread, events) {
   if (typeof start.scope?.turnId !== "string" || start.scope.turnId === "") return { reason: "BB active turn identity is unavailable" };
   const completedAfterStart = events.some((event) => isTerminalTurnEvent(event) && event.seq > start.seq && event.data?.providerThreadId === start.data.providerThreadId);
   if (completedAfterStart) return { reason: "BB thread is active but its latest provider turn is already terminal" };
-  const requested = new Map(events
-    .filter((event) => event?.type === "client/turn/requested" && typeof event.data?.requestId === "string")
-    .map((event) => [event.data.requestId, event]));
-  const accepted = events.filter((event) => event?.type === "turn/input/accepted"
+  const requested = events
+    .filter((event) => event?.type === "client/turn/requested" && typeof event.data?.requestId === "string" && event.data.requestId !== "")
+    .sort((left, right) => left.seq - right.seq);
+  const requestsById = new Map();
+  for (const event of requested) requestsById.set(event.data.requestId, [...(requestsById.get(event.data.requestId) ?? []), event]);
+  const turnInputs = events.filter((event) => event?.type === "turn/input/accepted"
     && event.data?.providerThreadId === start.data.providerThreadId
-    && event.scope?.turnId === start.scope?.turnId
-    && requested.get(event.data?.clientRequestId)?.seq <= start.seq);
-  if (accepted.length !== 1 || typeof accepted[0].data?.clientRequestId !== "string" || accepted[0].data.clientRequestId === "") {
+    && event.scope?.turnId === start.scope?.turnId);
+  const foreignInput = turnInputs.some((event) => !requestsById.has(event.data?.clientRequestId));
+  if (foreignInput) {
     return { reason: "BB active turn input correlation is missing or ambiguous" };
   }
-  const requests = events.filter((event) => event?.type === "client/turn/requested" && event.data?.requestId === accepted[0].data.clientRequestId);
-  if (requests.length !== 1 || !Number.isSafeInteger(requests[0].createdAt)) return { reason: "BB active turn request timestamp is missing or ambiguous" };
+  const requestBeforeStart = requested.filter((event) => Number.isSafeInteger(event.seq) && event.seq <= start.seq).at(-1);
+  const acceptedForRequest = requestBeforeStart
+    ? turnInputs.filter((event) => event.data.clientRequestId === requestBeforeStart.data.requestId)
+    : [];
+  const acceptedForOtherRequest = turnInputs.some((event) => {
+    const inputRequest = requestsById.get(event.data?.clientRequestId)?.at(-1);
+    return inputRequest && Number.isSafeInteger(inputRequest.seq) && inputRequest.seq <= start.seq
+      && inputRequest.data.requestId !== requestBeforeStart?.data.requestId;
+  });
+  if (acceptedForRequest.length > 1) {
+    return { reason: "BB active turn input correlation is missing or ambiguous" };
+  }
+  const priorTerminal = events.some((event) => isTerminalTurnEvent(event)
+    && event.data?.providerThreadId === start.data.providerThreadId
+    && Number.isSafeInteger(event.seq)
+    && event.seq < start.seq);
+  const isContinuation = acceptedForRequest.length === 0 && !acceptedForOtherRequest && priorTerminal;
+  if (!isContinuation && acceptedForRequest.length !== 1) {
+    return { reason: "BB active turn input correlation is missing or ambiguous" };
+  }
+  const requestedAtMs = isContinuation ? start.createdAt : requestBeforeStart?.createdAt;
+  if (!Number.isSafeInteger(requestedAtMs)) return { reason: "BB active turn request timestamp is missing or ambiguous" };
   return {
-    requestedAtMs: requests[0].createdAt,
+    requestedAtMs,
     scopeTurnId: start.scope.turnId,
     turn: {
       eventId: start.id,
