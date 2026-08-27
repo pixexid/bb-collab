@@ -18344,7 +18344,7 @@ exit 1
       { id: "gh643-accepted", threadId, seq: 30, type: "turn/input/accepted", scope: { kind: "turn", turnId }, data: { clientRequestId: "gh643-request-id", providerThreadId }, createdAt: 30 },
       { id: "gh643-completed", threadId, seq: 40, type: "turn/completed", scope: { kind: "turn", turnId }, data: { providerThreadId, status: "completed" }, createdAt: 40 },
     ];
-    const setup = async (mutate: (events: NativeEvent[], host: Awaited<ReturnType<typeof loadedHost>>) => void = () => undefined) => {
+    const setup = async (mutate: (events: NativeEvent[], host: Awaited<ReturnType<typeof loadedHost>>) => void = () => undefined, mutateBeforeBuild = false) => {
       const host = await loadedHost();
       const { db, fenceToken } = seedAndBootstrap(host);
       expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
@@ -18362,6 +18362,7 @@ exit 1
       host.harness.sdk.stub("threads.events.list", (async ({ afterSeq }: { afterSeq?: string }) => events.filter((event) => afterSeq === undefined || event.seq > Number(afterSeq))) as never);
       host.harness.sdk.stub("environments.get", (async () => ({ id: environmentId, projectId: PROJECT_ID })) as never);
       host.harness.sdk.stub("environments.status", (async () => ({ outcome: "available", workspace: { checkout, workingTree } })) as never);
+      if (mutateBeforeBuild) mutate(events, host);
       const builderInput = {
         projectId: PROJECT_ID,
         workItemId: WORK_ITEM_ID,
@@ -18380,7 +18381,7 @@ exit 1
       expect(report).not.toHaveProperty("receivedAtMs");
       const foreignReport = JSON.parse(await host.harness.callAgentTool("build_terminal_report", builderInput, { projectId: PROJECT_ID, threadId: "foreign-same-project-worker" }) as string);
       expect(foreignReport).toMatchObject({ outcome: "TERMINAL_REPORT_AMBIGUOUS", attempted: 0, verified: 0 });
-      mutate(events, host);
+      if (!mutateBeforeBuild) mutate(events, host);
       return { host, db, fenceToken, attempt, report };
     };
 
@@ -18420,9 +18421,37 @@ exit 1
       expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(beforeReplay);
     }
 
+    {
+      const fixture = await setup((events) => {
+        events.splice(2, 0,
+          { id: "gh740-child-request", threadId, seq: 21, type: "client/turn/requested", scope: { kind: "thread" }, data: { requestId: "gh740-child-request-id", source: "system-child-completion" }, createdAt: 21 },
+          { id: "gh740-child-accepted", threadId, seq: 22, type: "turn/input/accepted", scope: { kind: "turn", turnId }, data: { clientRequestId: "gh740-child-request-id", providerThreadId }, createdAt: 22 },
+          { id: "gh742-tell-request", threadId, seq: 23, type: "client/turn/requested", scope: { kind: "thread" }, data: { requestId: "gh742-tell-request-id", source: "tell" }, createdAt: 23 },
+          { id: "gh742-tell-accepted", threadId, seq: 24, type: "turn/input/accepted", scope: { kind: "turn", turnId }, data: { clientRequestId: "gh742-tell-request-id", providerThreadId }, createdAt: 24 },
+          { id: "gh733-wake-request", threadId, seq: 25, type: "client/turn/requested", scope: { kind: "thread" }, data: { requestId: "gh733-wake-request-id", source: "wake" }, createdAt: 25 },
+          { id: "gh733-wake-accepted", threadId, seq: 26, type: "turn/input/accepted", scope: { kind: "turn", turnId }, data: { clientRequestId: "gh733-wake-request-id", providerThreadId }, createdAt: 26 },
+        );
+      }, true);
+      expect(await fixture.host.harness.callRpc("apply", {
+        projectId: PROJECT_ID,
+        operationClass: "execution_attempt_terminal_report",
+        idempotencyKey: "gh732-production-multi-input",
+        actorReceiptId: RECEIPT_ID,
+        expectedConfigRevision: 1,
+        expectedGovernanceEpoch: 1,
+        expectedFenceToken: fixture.fenceToken,
+        repoTargetId: TARGET_ID,
+        expectedResourceRevision: 3,
+        workItemId: WORK_ITEM_ID,
+        executionAttemptId: fixture.attempt.execution_attempt_id,
+        terminalReport: fixture.report,
+      })).toMatchObject({ outcome: "OK", attempted: 1, verified: 1 });
+    }
+
     const negativeCases: Array<[string, (events: NativeEvent[], host: Awaited<ReturnType<typeof loadedHost>>) => void, (report: any) => any]> = [
       ["missing request", (events) => { events.splice(0, 1); }, (report) => report],
       ["duplicate request ID", (events) => { events.splice(1, 0, { ...events[0]!, id: "gh643-request-duplicate", seq: 11 }); }, (report) => report],
+      ["foreign clientRequestId", (events) => { (events[2]!.data as Record<string, unknown>).clientRequestId = "foreign-request-id"; }, (report) => report],
       ["same-page unordered sequence", (events) => { events.splice(0, events.length, events[0]!, events[2]!, events[1]!, events[3]!); }, (report) => report],
       ["request after start", (events) => { events[0]!.seq = 21; events.splice(0, events.length, events[1]!, events[0]!, events[2]!, events[3]!); }, (report) => report],
       ["request after accepted", (events) => { events[0]!.seq = 31; events.splice(0, events.length, events[1]!, events[2]!, events[0]!, events[3]!); }, (report) => report],
@@ -18469,7 +18498,8 @@ exit 1
         executionAttemptId: fixture.attempt.execution_attempt_id,
         terminalReport: reportMutator(fixture.report),
       });
-      expect(result, name).toMatchObject({ outcome: expect.stringMatching(/AMBIGUOUS|UNKNOWN|FOREIGN|EXTERNAL/) , verified: 0 });
+      const foundationRefusal = ["wrong WorkItem", "wrong attempt", "wrong candidate identity", "wrong report environment"].includes(name);
+      expect(result, name).toMatchObject({ outcome: foundationRefusal ? "TERMINAL_REPORT_AMBIGUOUS" : "EXTERNAL_UNAVAILABLE", attempted: foundationRefusal ? 0 : 1, verified: 0 });
       expect(exportFoundation(fixture.db, PROJECT_ID), name).toEqual(before);
     }
 
