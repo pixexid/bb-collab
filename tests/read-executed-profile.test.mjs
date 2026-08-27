@@ -248,6 +248,63 @@ describe("executed profile read-back", () => {
     });
   });
 
+  it("GUARD: refuses zero-input active turns without a prior terminal turn", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "018cc251-f400-7000-8000-000000000000";
+    const nativeTurnId = "123e4567-e89b-42d3-a456-426614174000";
+    const events = continuationEvents(providerThreadId, nativeTurnId).filter((event) => event.id !== "event-first-completed");
+    jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${providerThreadId}.jsonl`), [
+      { type: "session_meta", payload: { id: providerThreadId, originator: "bb", cwd: "/test/project" } },
+      { type: "turn_context", timestamp: "2026-08-20T00:00:14.500Z", payload: { turn_id: nativeTurnId, model: "DO_NOT_ACCEPT", effort: "medium" } },
+    ]);
+    const result = await readExecutedProfiles({
+      thread: { providerId: "codex", status: "active" },
+      environment: { path: "/test/project" },
+      events,
+      home,
+    });
+    expect(result).toMatchObject({
+      outcome: "unknown",
+      coverage: { activeTurns: 1, knownTurns: 0, unknownTurns: 1 },
+      turns: [],
+      reason: "BB active turn input correlation is missing or ambiguous",
+    });
+    expect(JSON.stringify(result)).not.toMatch(/DO_NOT_ACCEPT|executedProfile/u);
+  });
+
+  it("GUARD: refuses zero-input non-continuation turns with another request accepted", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "018cc251-f400-7000-8000-000000000000";
+    const nativeTurnId = "123e4567-e89b-42d3-a456-426614174000";
+    const scope = { kind: "turn", turnId: `bta2647fb7-1-${nativeTurnId}` };
+    const priorScope = { kind: "turn", turnId: "bta2647fb7-1-prior-turn" };
+    const events = [
+      { id: "event-prior-started", seq: 8, type: "turn/started", data: { providerThreadId }, scope: priorScope },
+      { id: "event-prior-completed", seq: 9, type: "turn/completed", data: { status: "completed", providerThreadId, providerCheckpointId: "prior-turn" }, scope: priorScope },
+      { id: "event-older-requested", seq: 10, type: "client/turn/requested", data: { requestId: "request-older" }, createdAt: Date.parse("2026-08-20T00:00:10.000Z") },
+      { id: "event-current-requested", seq: 11, type: "client/turn/requested", data: { requestId: "request-current" }, createdAt: Date.parse("2026-08-20T00:00:11.000Z") },
+      { id: "event-current-started", seq: 12, type: "turn/started", data: { providerThreadId }, scope, createdAt: Date.parse("2026-08-20T00:00:12.000Z") },
+      { id: "event-older-accepted", seq: 13, type: "turn/input/accepted", data: { providerThreadId, clientRequestId: "request-older" }, scope, createdAt: Date.parse("2026-08-20T00:00:12.000Z") },
+    ];
+    jsonl(join(home, ".codex", "sessions", "2024", "01", "01", `rollout-${providerThreadId}.jsonl`), [
+      { type: "session_meta", payload: { id: providerThreadId, originator: "bb", cwd: "/test/project" } },
+      { type: "turn_context", timestamp: "2026-08-20T00:00:12.500Z", payload: { turn_id: nativeTurnId, model: "DO_NOT_ACCEPT", effort: "medium" } },
+    ]);
+    const result = await readExecutedProfiles({
+      thread: { providerId: "codex", status: "active" },
+      environment: { path: "/test/project" },
+      events,
+      home,
+    });
+    expect(result).toMatchObject({
+      outcome: "unknown",
+      coverage: { activeTurns: 1, knownTurns: 0, unknownTurns: 1 },
+      turns: [],
+      reason: "BB active turn input correlation is missing or ambiguous",
+    });
+    expect(JSON.stringify(result)).not.toMatch(/DO_NOT_ACCEPT|executedProfile/u);
+  });
+
   it("GUARD: does not reuse a prior native profile when a continuation turn has no native turn context", async () => {
     const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
     const providerThreadId = "018cc251-f400-7000-8000-000000000000";
@@ -528,6 +585,27 @@ describe("executed profile read-back", () => {
       turns: [{ phase: "active", selectionMismatch: true, executedProfile: { model: "kimi-coding/k3", reasoningLevel: "high" } }],
     });
     expect(JSON.stringify(piResult)).not.toContain("k3-256k");
+  });
+
+  it("GUARD: refuses a stale Pi assistant envelope before the active BB turn request", async () => {
+    const home = mkdtempSync(join(tmpdir(), "bb-collab-profile-"));
+    const providerThreadId = "pi-stale-envelope";
+    jsonl(piBridgeLog(home, providerThreadId), [
+      { type: "session", id: "unrelated-session-header", cwd: "/test/project" },
+      { type: "thinking_level_change", id: "stale-reasoning", parentId: null, thinkingLevel: "high" },
+      { type: "message", id: "stale-assistant", parentId: "stale-reasoning", timestamp: "2026-08-20T00:00:09.000Z", message: { role: "assistant", provider: "kimi-coding", model: "STALE_PI" } },
+    ]);
+    const result = await readExecutedProfiles({
+      thread: { providerId: "pi", status: "active" },
+      environment: { path: "/test/project" },
+      events: activeEvents(providerThreadId),
+      home,
+    });
+    expect(result).toMatchObject({
+      outcome: "unknown",
+      turns: [{ status: "unknown", reason: "active Pi assistant envelope at or after the BB turn request is absent" }],
+    });
+    expect(JSON.stringify(result)).not.toMatch(/STALE_PI|executedProfile/u);
   });
 
   it("DISCRIMINATOR: refuses a colliding Pi bridge neighbour when the requested id sanitizes lossily", async () => {
