@@ -724,8 +724,13 @@ function legacyReviewPendingRequest(
   });
 }
 
-async function acceptedDoneWorkItemFixture(workItemId = WORK_ITEM_ID, outcome: "DONE" | "BLOCKED" = "DONE", accept = true) {
-  const fixture = await assignmentFixture({ withoutGithubIssues: true });
+async function acceptedDoneWorkItemFixture(
+  workItemId = WORK_ITEM_ID,
+  outcome: "DONE" | "BLOCKED" = "DONE",
+  accept = true,
+  existingFixture: Awaited<ReturnType<typeof assignmentFixture>> | undefined = undefined,
+) {
+  const fixture = existingFixture ?? await assignmentFixture({ withoutGithubIssues: true });
   if (workItemId !== WORK_ITEM_ID) {
     expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
       idempotencyKey: `${workItemId}-create`,
@@ -829,6 +834,21 @@ function acceptedReviewPendingRequest(
     },
     ...overrides,
   });
+}
+
+function interleaveWorkItemRevisionMutation(db: Database.Database, workItemId: string): () => void {
+  const originalPrepare = db.prepare;
+  const boundPrepare = originalPrepare.bind(db);
+  let armed = true;
+  db.prepare = ((sql: string) => {
+    const statement = boundPrepare(sql);
+    if (!armed || !sql.includes("UPDATE work_items SET lifecycle_state = ?")) return statement;
+    armed = false;
+    boundPrepare("UPDATE work_items SET resource_revision = resource_revision + 1 WHERE project_id = ? AND work_item_id = ?")
+      .run(PROJECT_ID, workItemId);
+    return statement;
+  }) as typeof db.prepare;
+  return () => { db.prepare = originalPrepare; };
 }
 
 function workItemWaitRequest(
@@ -14856,7 +14876,9 @@ else printf '%s\\n' '[]'; fi
     expect(db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ lifecycle_state: "in_progress", resource_revision: 3 });
     const terminalFields = db.prepare(
       `SELECT state, completed_at_ms, terminalization_class, terminal_result, reported_outcome,
-              terminal_report_digest, terminal_report_json, terminal_event_id, terminal_event_seq
+              terminal_report_digest, terminal_report_json, terminal_event_id, terminal_event_seq,
+              terminal_actual_profile_digest, native_receipt_digest, observed_at_ms,
+              lease_owner_thread_id, progress_json
        FROM execution_attempts WHERE execution_attempt_id = ?`,
     ).get(accepted.attempt.execution_attempt_id);
     const handoff = acceptedReviewPendingRequest(accepted);
@@ -14895,6 +14917,7 @@ else printf '%s\\n' '[]'; fi
     const cases: Array<[string, (accepted: Awaited<ReturnType<typeof acceptedDoneWorkItemFixture>>) => void]> = [
       ["missing event", ({ fixture, attempt }) => fixture.db.prepare("UPDATE state_events SET event_json = '{}' WHERE project_id = ? AND aggregate_id = ? AND event_type = 'execution_attempt_terminal_report_accepted'").run(PROJECT_ID, attempt.execution_attempt_id)],
       ["null digest", ({ fixture, attempt }) => fixture.db.prepare("UPDATE execution_attempts SET terminal_report_digest = NULL WHERE execution_attempt_id = ?").run(attempt.execution_attempt_id)],
+      ["mismatched digest", ({ fixture, attempt }) => fixture.db.prepare("UPDATE execution_attempts SET terminal_report_digest = ? WHERE execution_attempt_id = ?").run("f".repeat(64), attempt.execution_attempt_id)],
       ["non-accepted class", ({ fixture, attempt }) => fixture.db.prepare("UPDATE execution_attempts SET terminalization_class = 'work-item-review-handoff' WHERE execution_attempt_id = ?").run(attempt.execution_attempt_id)],
       ["non-write kind", ({ fixture, attempt }) => fixture.db.prepare("UPDATE execution_attempts SET assignment_kind = 'review' WHERE execution_attempt_id = ?").run(attempt.execution_attempt_id)],
     ];
@@ -14907,6 +14930,29 @@ else printf '%s\\n' '[]'; fi
     }
     const blocked = await acceptedDoneWorkItemFixture(WORK_ITEM_ID, "BLOCKED");
     expect(applyWithFixtureReceipt(blocked.fixture.db, acceptedReviewPendingRequest(blocked))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
+
+    const foreign = await acceptedDoneWorkItemFixture();
+    const foreignWorkItemId = "b5-foreign-work-item";
+    expect(applyWithFixtureReceipt(foreign.fixture.db, workItemCreateRequest(foreign.fixture.fenceToken, {
+      idempotencyKey: "b5-foreign-create",
+      workItemId: foreignWorkItemId,
+      workItem: { workItemId: foreignWorkItemId, title: foreignWorkItemId, body: foreignWorkItemId },
+    })).outcome).toBe("OK");
+    foreign.fixture.db.prepare("UPDATE execution_attempts SET work_item_id = ? WHERE execution_attempt_id = ?")
+      .run(foreignWorkItemId, foreign.attempt.execution_attempt_id);
+    const originalPrepare = foreign.fixture.db.prepare;
+    const boundPrepare = originalPrepare.bind(foreign.fixture.db);
+    foreign.fixture.db.prepare = ((sql: string) => {
+      const statement = boundPrepare(sql);
+      if (!sql.includes("SELECT execution_attempt_id, state, assignment_kind, thread_id") || !sql.includes("ORDER BY attempt_ordinal DESC LIMIT 1")) return statement;
+      return { get: (projectId: string) => statement.get(projectId, foreignWorkItemId) } as Database.Statement;
+    }) as typeof foreign.fixture.db.prepare;
+    try {
+      const foreignWorkItemRequest = acceptedReviewPendingRequest(foreign);
+      expect(applyWithFixtureReceipt(foreign.fixture.db, foreignWorkItemRequest)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
+    } finally {
+      foreign.fixture.db.prepare = originalPrepare;
+    }
   });
 
   it("#723 B6-B8 rejects successors, omitted/foreign attempts, and stale revisions", async () => {
@@ -14927,33 +14973,14 @@ else printf '%s\\n' '[]'; fi
     delete omittedRequest.executionAttemptId;
     expect(applyWithFixtureReceipt(omitted.fixture.db, omittedRequest)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
 
-    const foreign = await acceptedDoneWorkItemFixture();
-    expect(applyWithFixtureReceipt(foreign.fixture.db, workItemCreateRequest(foreign.fixture.fenceToken, {
-      idempotencyKey: "b7-foreign-create",
-      workItemId: "b7-foreign-attempt",
-      workItem: { workItemId: "b7-foreign-attempt", title: "b7-foreign-attempt", body: "b7-foreign-attempt" },
-    })).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(foreign.fixture.db, transitionRequest(foreign.fixture.fenceToken, "ready", 1, {
-      idempotencyKey: "b7-foreign-ready",
-      workItemId: "b7-foreign-attempt",
-    })).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(foreign.fixture.db, transitionRequest(foreign.fixture.fenceToken, "in_progress", 2, {
-      idempotencyKey: "b7-foreign-writer",
-      workItemId: "b7-foreign-attempt",
-    })).outcome).toBe("OK");
-    const foreignAttempt = foreign.fixture.db.prepare(
-      "SELECT execution_attempt_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ? AND assignment_kind = 'write'",
-    ).get(PROJECT_ID, "b7-foreign-attempt") as { execution_attempt_id: string };
-    const foreignRequest = acceptedReviewPendingRequest(foreign);
-    foreignRequest.executionAttemptId = foreignAttempt.execution_attempt_id;
-    foreignRequest.reviewHandoff = { ...foreignRequest.reviewHandoff!, executionAttemptId: foreignAttempt.execution_attempt_id };
-    expect(applyWithFixtureReceipt(foreign.fixture.db, foreignRequest)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
-
     const cas = await acceptedDoneWorkItemFixture();
-    const winner = applyWithFixtureReceipt(cas.fixture.db, acceptedReviewPendingRequest(cas, 3, { idempotencyKey: "b8-winner" }));
-    expect(winner).toMatchObject({ outcome: "OK", currentResourceRevision: 4 });
-    expect(applyWithFixtureReceipt(cas.fixture.db, acceptedReviewPendingRequest(cas, 3, { idempotencyKey: "b8-loser" }))).toMatchObject({ outcome: "WORK_ITEM_REVISION_STALE", attempted: 0, verified: 0 });
-    expect(cas.fixture.db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ lifecycle_state: "review_pending", resource_revision: 4 });
+    const restoreInterleaving = interleaveWorkItemRevisionMutation(cas.fixture.db, WORK_ITEM_ID);
+    try {
+      expect(applyWithFixtureReceipt(cas.fixture.db, acceptedReviewPendingRequest(cas, 3, { idempotencyKey: "b8-interleaved" }))).toMatchObject({ outcome: "WORK_ITEM_REVISION_STALE", attempted: 0, verified: 0 });
+    } finally {
+      restoreInterleaving();
+    }
+    expect(cas.fixture.db.prepare("SELECT lifecycle_state, resource_revision FROM work_items WHERE work_item_id = ?").get(WORK_ITEM_ID)).toEqual({ lifecycle_state: "in_progress", resource_revision: 3 });
   });
 
   it("#723 B9-B11 orders report before handoff, gates legacy policy, and replays exactly", async () => {
@@ -14983,6 +15010,7 @@ else printf '%s\\n' '[]'; fi
     const legacy = await acceptedDoneWorkItemFixture("b10-legacy", "DONE", false);
     const normal = transitionRequest(legacy.fixture.fenceToken, "review_pending", 3, { workItemId: "b10-legacy" });
     expect(applyWithFixtureReceipt(legacy.fixture.db, normal)).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
+    expect(applyWithFixtureReceipt(legacy.fixture.db, legacyReviewPendingRequest(legacy.fixture.db, legacy.fixture.fenceToken, 3, { workItemId: "b10-legacy", reasonCode: "arbitrary-recovery-reason" }))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
     expect(applyWithFixtureReceipt(legacy.fixture.db, legacyReviewPendingRequest(legacy.fixture.db, legacy.fixture.fenceToken, 3, { workItemId: "b10-legacy" }))).toMatchObject({ outcome: "OK" });
 
     const replay = await acceptedDoneWorkItemFixture();
@@ -14997,7 +15025,7 @@ else printf '%s\\n' '[]'; fi
     const direct = await acceptedDoneWorkItemFixture(WORK_ITEM_ID, "DONE", false);
     expect(applyWithFixtureReceipt(direct.fixture.db, transitionRequest(direct.fixture.fenceToken, "succeeded", 3))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
 
-    const interrupted = await acceptedDoneWorkItemFixture("b13-interrupted", "DONE", false);
+    const interrupted = await acceptedDoneWorkItemFixture("b13-interrupted", "DONE", true);
     interrupted.fixture.db.prepare("UPDATE execution_attempts SET state = 'interrupted' WHERE execution_attempt_id = ?").run(interrupted.attempt.execution_attempt_id);
     expect(applyWithFixtureReceipt(interrupted.fixture.db, acceptedReviewPendingRequest(interrupted))).toMatchObject({ outcome: "WORK_ITEM_STATE_INVALID", attempted: 0, verified: 0 });
 
