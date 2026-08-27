@@ -1672,6 +1672,23 @@ describe("GH-733 authoritative WorkItem wait role identity", () => {
     expect(await registerExternalWait(reviewFixture, exactWaitRequest(reviewFixture))).toBe("registered");
   });
 
+  it.each([
+    ["role", { roleId: "director" as const }, "ROLE_HOLDER_MISMATCH"],
+    ["generation", { expectedGeneration: 2 }, "ROLE_GENERATION_STALE"],
+  ] as const)("refuses a caller-declared top-level %s mismatch before correction attempt creation", async (_name, mismatch, expected) => {
+    const fixture = await assignmentFixture({ targetRemoteUrl: `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git` });
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+    const request = transitionRequest(fixture.fenceToken, undefined, 3, {
+      idempotencyKey: `gh733-top-level-${_name}-mismatch`,
+      actorReceiptId: "role-actor-assignment",
+      workAttempt: { laneId: "lane-gh733-mismatch", threadId: "thread-gh733-mismatch", assignmentKind: "write", requestedProfile: ROLE_PROFILE },
+      ...mismatch,
+    });
+    const before = exportFoundation(fixture.db, PROJECT_ID);
+    expect(applyWithFixtureReceipt(fixture.db, request).outcome).toBe(expected);
+    expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+  });
+
   it("refuses every null or foreign exact binding through register_external_wait without mutation", async () => {
     const cases: Array<{ name: string; expected: string; nullActor?: boolean; mutate: (request: ApplyRequest) => ApplyRequest }> = [
       { name: "null role identity", expected: "ROLE_CONTEXT_FOREIGN", nullActor: true, mutate: (request) => request },
