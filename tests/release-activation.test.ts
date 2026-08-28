@@ -160,13 +160,19 @@ describe("inactive release activation", () => {
     const marker = join(markerRoot, "imported");
     const created = fixture(marker);
     const { adapter, state } = fakeAdapter(created.priorRoot);
+    const pending = Buffer.from("prior pending marker\n");
+    const receipt = Buffer.from('{"state":"active","releaseDigest":"prior"}\n');
     try {
+      mkdirSync(created.stateDirectory);
+      writeFileSync(join(created.stateDirectory, "deployment.pending.json"), pending);
+      writeFileSync(join(created.stateDirectory, "deployment.json"), receipt);
+      state.services.push({ name: "prior-service", state: "running" });
       writeFileSync(join(created.releaseDirectory, "node_modules/@bb/plugin-sdk/extra.js"), "unmanifested\n");
       await expect(runFixture(created, adapter)).rejects.toThrow("release runtime closure file set does not match its imports");
       expect(existsSync(marker)).toBe(false);
-      expect(state).toMatchObject({ root: created.priorRoot, bound: false, rollbackCalls: 0 });
-      expect(existsSync(join(created.stateDirectory, "deployment.pending.json"))).toBe(false);
-      expect(existsSync(join(created.stateDirectory, "deployment.json"))).toBe(false);
+      expect(state).toMatchObject({ root: created.priorRoot, status: "running", services: [{ name: "prior-service", state: "running" }], bound: false, rollbackCalls: 0 });
+      expect(readFileSync(join(created.stateDirectory, "deployment.pending.json"))).toEqual(pending);
+      expect(readFileSync(join(created.stateDirectory, "deployment.json"))).toEqual(receipt);
       expect(existsSync(join(created.stateDirectory, "activation.lock"))).toBe(false);
     } finally { cleanup(created.root); rmSync(markerRoot, { recursive: true, force: true }); }
   });
@@ -174,11 +180,17 @@ describe("inactive release activation", () => {
   it("leaves prior state exact when the staged schema import fails", async () => {
     const created = fixture(undefined, true);
     const { adapter, state } = fakeAdapter(created.priorRoot);
+    const pending = Buffer.from("prior pending marker\n");
+    const receipt = Buffer.from('{"state":"active","releaseDigest":"prior"}\n');
     try {
+      mkdirSync(created.stateDirectory);
+      writeFileSync(join(created.stateDirectory, "deployment.pending.json"), pending);
+      writeFileSync(join(created.stateDirectory, "deployment.json"), receipt);
+      state.services.push({ name: "prior-service", state: "running" });
       await expect(runFixture(created, adapter)).rejects.toThrow("schema import failed");
-      expect(state).toMatchObject({ root: created.priorRoot, bound: false, rollbackCalls: 0 });
-      expect(existsSync(join(created.stateDirectory, "deployment.pending.json"))).toBe(false);
-      expect(existsSync(join(created.stateDirectory, "deployment.json"))).toBe(false);
+      expect(state).toMatchObject({ root: created.priorRoot, status: "running", services: [{ name: "prior-service", state: "running" }], bound: false, rollbackCalls: 0 });
+      expect(readFileSync(join(created.stateDirectory, "deployment.pending.json"))).toEqual(pending);
+      expect(readFileSync(join(created.stateDirectory, "deployment.json"))).toEqual(receipt);
       expect(existsSync(join(created.stateDirectory, "activation.lock"))).toBe(false);
     } finally { cleanup(created.root); }
   });
@@ -273,6 +285,7 @@ describe("inactive release activation", () => {
     try {
       await expect(runFixture(created, adapter)).rejects.toThrow("schema-changing activation requires one canonical migration id");
       expect(state.rollbackCalls).toBe(0);
+      expect(existsSync(join(created.stateDirectory, "deployment.pending.json"))).toBe(false);
     } finally { cleanup(created.root); }
   });
 

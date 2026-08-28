@@ -305,6 +305,7 @@ async function activateRelease(options) {
   const priorReceipt = readReceipt(receiptPath);
   const transactionId = `${Date.now()}-${process.pid}`;
   const changed = [];
+  let ownsPending = false;
   try {
     const manifest = verifyRelease(releaseDirectory, join(releaseDirectory, "release-manifest.json"), sourceRoot);
     if (manifest.loadAuthority !== "inactive") throw new Error("activation requires an inactive v2 release candidate");
@@ -338,6 +339,7 @@ async function activateRelease(options) {
       bindings: bindings.map(({ priorStatus, ...binding }) => ({ ...binding, priorStatus: { rootDir: priorStatus.rootDir, status: priorStatus.status, services: priorStatus.services } })),
     };
     atomicWrite(pendingPath, pending);
+    ownsPending = true;
     for (const binding of bindings) {
       const currentSource = adapter.source(binding.pluginId);
       const current = adapter.list().find(({ id }) => id === binding.pluginId);
@@ -371,7 +373,7 @@ async function activateRelease(options) {
         proveRollback(changed, adapter.list(), new Map(ids.map((id) => [id, adapter.source(id)])));
       } catch (rollbackError) { rollbackErrors.push(rollbackError.message); }
     }
-    rmSync(pendingPath, { force: true });
+    if (ownsPending) rmSync(pendingPath, { force: true });
     if (rollbackErrors.length) throw new Error(`${error.message}; rollback failed: ${rollbackErrors.join("; ")}`);
     throw error;
   } finally {
