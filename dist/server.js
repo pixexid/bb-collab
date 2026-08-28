@@ -14783,7 +14783,7 @@ function assertGithubIssueBriefBinding(brief, expected) {
 var PLUGIN_ID = "bb-collab";
 var BB_VERSION_RANGE = ">=0.37.0";
 var PLUGIN_SDK_VERSION = "0.4.1";
-var RUNTIME_CONTRACT_VERSION = 33;
+var RUNTIME_CONTRACT_VERSION = 34;
 var SCHEMA_VERSION = 35;
 var PREVIOUS_RUNTIME_CONTRACT_VERSION = 27;
 var DEFAULT_WRITING_LANE_CEILING = 3;
@@ -17086,15 +17086,6 @@ var executionProfileSchema = external_exports.object({
   serviceTier: id,
   visibility: external_exports.enum(["visible", "hidden"])
 }).strict();
-var uiUxRoutingPolicySchema = external_exports.object({
-  repoTargetId: id,
-  allowedProfiles: external_exports.array(executionProfileSchema).min(1).max(128)
-}).strict().superRefine((policy, ctx) => {
-  const profiles = policy.allowedProfiles.map(canonicalJson);
-  if (new Set(profiles).size !== profiles.length) {
-    ctx.addIssue({ code: "custom", path: ["allowedProfiles"], message: "UI/UX routing policy profiles must be unique" });
-  }
-});
 var workAttemptSchema = external_exports.object({
   laneId: id,
   threadId: id.optional(),
@@ -17213,9 +17204,6 @@ var reviewPolicySchema = external_exports.object({ connectors: reviewConnectorsS
 function profileIsOneOf(profile, profiles) {
   const value = canonicalJson(profile);
   return profiles.some((candidate) => value === canonicalJson(candidate));
-}
-function hasRoutingSuffix(profile) {
-  return /\[[^\]]+\]$/u.test(profile.model);
 }
 function isRatifiedDirectorSeatRequirement(requirement) {
   return requirement.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID && profileIsOneOf(requirement.executedProfile, directorSeatProfiles) && profileIsOneOf(requirement.standbyProfile, directorSeatProfiles) && canonicalJson(requirement.executedProfile) !== canonicalJson(requirement.standbyProfile);
@@ -17942,16 +17930,7 @@ function stableValue(value, path = "$", seen = /* @__PURE__ */ new Set()) {
 function canonicalJson(value) {
   return JSON.stringify(stableValue(value));
 }
-function uiUxRoutingPolicyFromConfig(value) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
-  const extensions = value.extensions;
-  if (extensions === null || typeof extensions !== "object" || Array.isArray(extensions)) return null;
-  const bbCollab = extensions.bbCollab;
-  if (bbCollab === null || typeof bbCollab !== "object" || Array.isArray(bbCollab)) return null;
-  const parsed = uiUxRoutingPolicySchema.safeParse(bbCollab.uiUxRoutingPolicy);
-  return parsed.success ? parsed.data : null;
-}
-function validateConfig(value, providerMatrix = []) {
+function validateConfig(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw refusal("MALFORMED_JSON", "config must be a JSON object");
   }
@@ -17993,32 +17972,6 @@ function validateConfig(value, providerMatrix = []) {
       if (domains !== void 0) {
         const parsed = domainsSchema.safeParse(domains);
         if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
-      }
-      const uiUxRoutingPolicy = bbCollab.uiUxRoutingPolicy;
-      const parsedPolicy = uiUxRoutingPolicy === void 0 ? null : uiUxRoutingPolicySchema.safeParse(uiUxRoutingPolicy);
-      if (parsedPolicy && !parsedPolicy.success) throw refusal("INVALID_INPUT", parsedPolicy.error.message);
-      const requirements = roleRequirements !== void 0 ? roleRequirementsSchema.parse(roleRequirements) : domains !== void 0 ? domainsSchema.parse(domains).flatMap((domain2) => domain2.roleRequirements) : [];
-      const suffixRequirements = requirements.filter((requirement) => requirement.roleRequirementId !== DIRECTOR_SEAT_ROLE_REQUIREMENT_ID && hasRoutingSuffix(requirement.executedProfile));
-      if (suffixRequirements.length > 0) {
-        const requirement = suffixRequirements.length === 1 ? suffixRequirements[0] : null;
-        const policy = parsedPolicy?.success ? parsedPolicy.data : null;
-        const profile = requirement?.executedProfile;
-        const matrixProfile = requirement && profile ? {
-          repoTargetId: requirement.repoTargetId,
-          providerId: profile.providerId,
-          model: profile.model,
-          reasoningLevel: profile.reasoningLevel,
-          serviceTier: profile.serviceTier
-        } : null;
-        if (!requirement || requirement.roleId !== "worker" || requirement.repoTargetId === null || !policy || policy.repoTargetId !== requirement.repoTargetId || !matrixProfile || !profileIsOneOf(matrixProfile, providerMatrix)) {
-          throw refusal("INVALID_INPUT", "routing-suffix SKU models require one exact policy-bound worker profile and authoritative provider matrix match");
-        }
-      }
-      if (parsedPolicy?.success) {
-        const policyRequirements = requirements.filter((requirement) => requirement.roleId === "worker" && requirement.repoTargetId === parsedPolicy.data.repoTargetId && profileIsOneOf(requirement.executedProfile, parsedPolicy.data.allowedProfiles));
-        if (policyRequirements.length !== 1 || !hasRoutingSuffix(policyRequirements[0].executedProfile)) {
-          throw refusal("INVALID_INPUT", "UI/UX routing policy must bind one exact routing-suffix worker profile");
-        }
       }
       const writingLaneCeiling = bbCollab.writingLaneCeiling;
       if (writingLaneCeiling !== void 0 && (!Number.isInteger(writingLaneCeiling) || Number(writingLaneCeiling) < 0 || Number(writingLaneCeiling) > MAX_WRITING_LANE_CEILING)) {
@@ -18186,11 +18139,16 @@ function dispatchTargetIdentity(row) {
     targetDigest: row.target_digest
   };
 }
-function dispatchRoleRequirement(db, projectId, configRevision, repoTargetId, domainId, taskClass, requestedProfile, assignmentKind = "write") {
+function dispatchWorkerScope(db, projectId, configRevision, repoTargetId, domainId, taskClass) {
   const domain2 = domainForTaskClass(configuredDomains(db, projectId, configRevision), taskClass, domainId);
-  const roleId = assignmentKind === "review" ? "independent-reviewer" : "worker";
-  const requirements = domain2.roleRequirements.filter((requirement) => requirement.roleId === roleId && requirement.repoTargetId === repoTargetId && dispatchProfileMatches(requestedProfile, requirement.executedProfile));
-  if (requirements.length !== 1) throw refusal("PROJECT_CONFIG_STALE", "the exact worker role requirement is missing or ambiguous across the config revision");
+  const requirements = domain2.roleRequirements.filter((requirement) => requirement.roleId === "worker" && requirement.repoTargetId === repoTargetId);
+  if (requirements.length === 0) throw refusal("PROJECT_CONFIG_STALE", "the exact worker scope is missing from the config revision");
+  return { roleId: "worker", repoTargetId, domainId };
+}
+function dispatchRoleRequirement(db, projectId, configRevision, repoTargetId, domainId, taskClass, requestedProfile) {
+  const domain2 = domainForTaskClass(configuredDomains(db, projectId, configRevision), taskClass, domainId);
+  const requirements = domain2.roleRequirements.filter((requirement) => requirement.roleId === "independent-reviewer" && requirement.repoTargetId === repoTargetId && dispatchProfileMatches(requestedProfile, requirement.executedProfile));
+  if (requirements.length !== 1) throw refusal("PROJECT_CONFIG_STALE", "the exact independent-reviewer role requirement is missing or ambiguous across the config revision");
   return { ...requirements[0], domainId };
 }
 function dispatchReviewerAuthority(db, projectId, configRevision, repoTargetId, domainId, requirement) {
@@ -18249,11 +18207,16 @@ function proveWorkItemDispatchConfig(db, request, committedConfigRevision) {
   if (!currentTarget || !historicalTarget) throw refusal("PROJECT_CONFIG_STALE", "the exact WorkItem target is missing from a config revision");
   const assignmentKind = request.assignmentKind ?? "write";
   if (assignmentKind === "probe") throw refusal("WORK_ITEM_STATE_INVALID", "probe cannot use WorkItem lane dispatch");
-  const historicalRole = dispatchRoleRequirement(db, request.projectId, workItem.config_revision, request.repoTargetId, workItem.domain_id, workItem.task_class, request.requestedProfile, assignmentKind);
-  const currentRole = dispatchRoleRequirement(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, workItem.task_class, request.requestedProfile, assignmentKind);
+  const historicalWorkerScope = assignmentKind === "write" ? dispatchWorkerScope(db, request.projectId, workItem.config_revision, request.repoTargetId, workItem.domain_id, workItem.task_class) : void 0;
+  const currentWorkerScope = assignmentKind === "write" ? dispatchWorkerScope(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, workItem.task_class) : void 0;
+  const historicalRole = assignmentKind === "review" ? dispatchRoleRequirement(db, request.projectId, workItem.config_revision, request.repoTargetId, workItem.domain_id, workItem.task_class, request.requestedProfile) : void 0;
+  const currentRole = assignmentKind === "review" ? dispatchRoleRequirement(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, workItem.task_class, request.requestedProfile) : void 0;
   const reviewerAuthority = assignmentKind === "review" && request.candidateKind === "local" ? dispatchReviewerAuthority(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, currentRole) : void 0;
   const requestedProfile = dispatchProfileIdentity(request.requestedProfile);
-  if (!dispatchProfileMatches(request.requestedProfile, historicalRole.executedProfile) || !dispatchProfileMatches(request.requestedProfile, currentRole.executedProfile)) {
+  if (assignmentKind === "write" && canonicalJson(historicalWorkerScope) !== canonicalJson(currentWorkerScope)) {
+    throw refusal("PROJECT_CONFIG_STALE", "dispatch worker scope is not equivalent across config revisions");
+  }
+  if (assignmentKind === "review" && (!historicalRole || !currentRole || !dispatchProfileMatches(request.requestedProfile, historicalRole.executedProfile) || !dispatchProfileMatches(request.requestedProfile, currentRole.executedProfile))) {
     throw refusal("PROJECT_CONFIG_STALE", "dispatch profile does not equal the exact historical and current worker requirement");
   }
   const historicalConfigJson = storedConfigJson(db, request.projectId, workItem.config_revision);
@@ -18265,7 +18228,7 @@ function proveWorkItemDispatchConfig(db, request, committedConfigRevision) {
     domainId: workItem.domain_id,
     taskClass: workItem.task_class,
     assignmentKind,
-    roleRequirement: historicalRole,
+    roleRequirement: assignmentKind === "write" ? historicalWorkerScope : historicalRole,
     target: dispatchTargetIdentity(historicalTarget),
     ...reviewerAuthority === void 0 ? {} : { reviewerAuthority }
   };
@@ -18276,7 +18239,7 @@ function proveWorkItemDispatchConfig(db, request, committedConfigRevision) {
     domainId: workItem.domain_id,
     taskClass: workItem.task_class,
     assignmentKind,
-    roleRequirement: currentRole,
+    roleRequirement: assignmentKind === "write" ? currentWorkerScope : currentRole,
     target: dispatchTargetIdentity(currentTarget),
     ...reviewerAuthority === void 0 ? {} : { reviewerAuthority }
   };
@@ -18915,7 +18878,7 @@ function deriveBootstrapActor(db, request, digest2) {
     }
   };
 }
-function applyBootstrap(db, request, digest2, providerMatrix) {
+function applyBootstrap(db, request, digest2) {
   if (request.expectedConfigRevision !== null) {
     throw refusal("PROJECT_CONFIG_STALE", "bootstrap requires an empty config head");
   }
@@ -18927,7 +18890,7 @@ function applyBootstrap(db, request, digest2, providerMatrix) {
   if (request.expectedGovernanceEpoch !== null || request.expectedFenceToken !== null) {
     throw refusal("GOVERNOR_CAS_FAILED", "bootstrap requires an empty governorship head");
   }
-  const config2 = request.config === void 0 ? void 0 : validateConfig(request.config, providerMatrix);
+  const config2 = request.config === void 0 ? void 0 : validateConfig(request.config);
   if (!config2) throw refusal("INVALID_INPUT", "bootstrap requires a config object");
   const targets = requireTargetCollection(request, "bootstrap");
   requireMappedTargets(config2, targets);
@@ -19032,7 +18995,7 @@ function applyBootstrap(db, request, digest2, providerMatrix) {
     }
   );
 }
-function applyConfigRevision(db, request, digest2, providerMatrix) {
+function applyConfigRevision(db, request, digest2) {
   const currentRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
@@ -19040,7 +19003,7 @@ function applyConfigRevision(db, request, digest2, providerMatrix) {
     requireTarget(db, request.projectId, currentRevision, request.repoTargetId);
     throw refusal("INVALID_INPUT", "config revision requires config and target collection");
   }
-  const configJson = validateConfig(request.config, providerMatrix);
+  const configJson = validateConfig(request.config);
   const targets = requireTargetCollection(request, "config revision");
   requireMappedTargets(configJson, targets);
   const nextRevision = currentRevision + 1;
@@ -22799,7 +22762,9 @@ function applyWorkItemTransition(db, request, digest2, githubObservation, github
       expectedResourceRevision: request.expectedResourceRevision ?? void 0
     });
     if (prior?.state === "interrupted") supersedeInterruptedAttempt(db, request.projectId, prior.execution_attempt_id);
-    else if (prior) terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "superseded");
+    else if (prior && WORK_ITEM_CAPACITY_ATTEMPT_STATES.includes(prior.state)) {
+      terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "superseded");
+    }
     const createdAtMs = now();
     const executionAttemptId2 = insertWorkItemAttempt(db, {
       projectId: request.projectId,
@@ -24122,7 +24087,7 @@ function isConstraintError(error48) {
 function unavailableResult(subject, message) {
   return result("CANONICAL_STORE_UNAVAILABLE", subject, 1, 0, 0, { message });
 }
-function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, executionAttemptEvidenceReader = null, dryRun = false, authenticatedNativeCaller = null, providerMatrix = []) {
+function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, executionAttemptEvidenceReader = null, dryRun = false, authenticatedNativeCaller = null) {
   let request;
   try {
     request = parseApplyRequest(input);
@@ -24131,9 +24096,9 @@ function applyAuthorizedMutation(db, input, githubAdapter = null, roleFactReader
     return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error48) });
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun, authenticatedNativeCaller, providerMatrix);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun, authenticatedNativeCaller);
 }
-async function applyAuthorizedMutationAsync(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, executionAttemptEvidenceReader = null, dryRun = false, providerMatrix = []) {
+async function applyAuthorizedMutationAsync(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, executionAttemptEvidenceReader = null, dryRun = false) {
   let request;
   try {
     request = parseApplyRequest(input);
@@ -24143,7 +24108,7 @@ async function applyAuthorizedMutationAsync(db, input, githubAdapter = null, rol
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
   if (request.operationClass !== "github_issue_projection" || !githubAdapter?.readAsync || !githubAdapter.mutateAsync) {
-    return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun, null, providerMatrix);
+    return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun);
   }
   try {
     return await applyGithubIssueProjectionAsync(db, request, mutationRequestDigest(request), githubAdapter);
@@ -24152,7 +24117,7 @@ async function applyAuthorizedMutationAsync(db, input, githubAdapter = null, rol
     return result("INTERNAL_ERROR", request.projectId, 1, 0, 0, { message: "internal mutation error" });
   }
 }
-function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, executionAttemptEvidenceReader = null, dryRun = false, authenticatedNativeCaller = null, providerMatrix = []) {
+function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = null, nativeAssignmentAdapter = null, reviewFactReader = null, githubIssueReader = null, executionAttemptEvidenceReader = null, dryRun = false, authenticatedNativeCaller = null) {
   let request;
   try {
     request = parseApplyRequest(input);
@@ -24198,9 +24163,9 @@ function applyFixtureMutation(db, input, githubAdapter = null, roleFactReader = 
       if (replay) return replay;
       switch (request.operationClass) {
         case "bootstrap":
-          return applyBootstrap(db, request, digest2, providerMatrix);
+          return applyBootstrap(db, request, digest2);
         case "config_revision":
-          return applyConfigRevision(db, request, digest2, providerMatrix);
+          return applyConfigRevision(db, request, digest2);
         case "governor_claim":
           return applyGovernorClaim(db, request, digest2);
         case "migration_prepare":
@@ -27686,6 +27651,10 @@ async function dispatchLane(bb, db, input, authenticatedNativeCaller = null) {
   }
   const environmentRefusal = await dispatchEnvironmentPreflight(bb, request.projectId, preparedDispatchSpawn.environment, configProof, request.workAttempt);
   if (environmentRefusal) return environmentRefusal;
+  if (!localReview) {
+    const routeRefusal = await liveProviderRoute(bb, request.projectId, configProof.hostId, requestedProfile);
+    if (routeRefusal) return routeRefusal;
+  }
   const briefTarget = localReview ? null : githubIssueBriefTarget(db, request.projectId, request.workItemId ?? "");
   if (briefTarget === "invalid") {
     return { outcome: "EXTERNAL_RESPONSE_INVALID", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "GitHub issue projection identity is malformed or ambiguous" };
@@ -28695,34 +28664,36 @@ async function prepareWorkItemAttemptTerminalization(bb, db, request, policy) {
   }
   return null;
 }
-async function liveProviderMatrix(bb, request) {
-  if (request.operationClass !== "bootstrap" && request.operationClass !== "config_revision") return [];
-  const policy = uiUxRoutingPolicyFromConfig(request.config);
-  if (!policy) return [];
-  const target = request.targets?.find((candidate) => candidate.repoTargetId === policy.repoTargetId);
-  if (!target) return [];
+async function liveProviderRoute(bb, projectId, hostId, profile) {
+  if (profile.visibility !== "visible") {
+    return { outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "requested provider route must be visible" };
+  }
   try {
-    const matrix = [];
-    const providers = await bb.sdk.providers.list({ hostId: target.hostId });
-    for (const profile of policy.allowedProfiles) {
-      const provider = providers.find((candidate) => candidate.id === profile.providerId && candidate.available);
-      if (!provider || !provider.capabilities.permissionModes.includes(profile.permissionMode)) continue;
-      const response = await bb.sdk.providers.models({ hostId: target.hostId, providerId: profile.providerId });
-      const model = response.modelLoadError === null ? response.models.find((candidate) => candidate.model === profile.model && candidate.supportedReasoningEfforts.some((effort) => effort.reasoningEffort === profile.reasoningLevel)) : null;
-      const serviceTierValid = profile.serviceTier === "default" || provider.capabilities.supportsServiceTier && profile.serviceTier === "fast";
-      if (model && serviceTierValid) {
-        matrix.push({
-          repoTargetId: policy.repoTargetId,
-          providerId: profile.providerId,
-          model: profile.model,
-          reasoningLevel: profile.reasoningLevel,
-          serviceTier: profile.serviceTier
-        });
-      }
+    const providers = await bb.sdk.providers.list({ hostId });
+    const provider = providers.find((candidate) => candidate.id === profile.providerId);
+    if (!provider || !provider.available) {
+      return { outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "requested provider is unavailable on the exact target host" };
     }
-    return matrix;
+    if (!provider.capabilities.permissionModes.includes(profile.permissionMode)) {
+      return { outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "requested permission mode is unsupported by the provider" };
+    }
+    const response = await bb.sdk.providers.models({ hostId, providerId: profile.providerId });
+    if (response.modelLoadError !== null) {
+      return { outcome: "EXTERNAL_UNAVAILABLE", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "authoritative provider model matrix is unavailable" };
+    }
+    const model = response.models.find((candidate) => candidate.model === profile.model);
+    if (!model) {
+      return { outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "requested model is unavailable on the exact target host" };
+    }
+    if (!model.supportedReasoningEfforts.some((effort) => effort.reasoningEffort === profile.reasoningLevel)) {
+      return { outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "requested reasoning level is unsupported by the model" };
+    }
+    if (profile.serviceTier !== "default" && !(provider.capabilities.supportsServiceTier && profile.serviceTier === "fast")) {
+      return { outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "requested service tier is unsupported by the provider" };
+    }
+    return null;
   } catch (error48) {
-    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `authoritative provider matrix is unavailable: ${String(error48)}` };
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: projectId, expected: 1, attempted: 1, verified: 0, message: `authoritative provider matrix is unavailable: ${String(error48)}` };
   }
 }
 async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRollout = false, terminalizationPolicy = "refuse-active", githubIssueReader = null, githubAdapter = null, preMutationGuard, allowThreadlessPreparedClosure = false, allowStrandedExecutionAttemptClosure = false, authenticatedNativeCaller = null) {
@@ -28766,8 +28737,6 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
     }
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
-  const providerMatrix = parsed.success ? await liveProviderMatrix(bb, parsed.data) : [];
-  if ("outcome" in providerMatrix) return providerMatrix;
   const preMutationRefusal = preMutationGuard === void 0 ? null : await preMutationGuard();
   if (preMutationRefusal) return preMutationRefusal;
   let evidenceReader = null;
@@ -28780,7 +28749,7 @@ async function applyLiveAuthorizedMutation(bb, db, input, allowCachedConsumerRol
     if ("outcome" in resolved) return resolved;
     evidenceReader = resolved;
   }
-  const result2 = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader ?? (parsed.success ? projectGithubIssueReader(db, parsed.data.projectId) : readGithubIssueForBackfill), evidenceReader, false, authenticatedNativeCaller, providerMatrix);
+  const result2 = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader ?? (parsed.success ? projectGithubIssueReader(db, parsed.data.projectId) : readGithubIssueForBackfill), evidenceReader, false, authenticatedNativeCaller);
   await deliverSucceededRoleGenerationBrief(bb, db, input, result2);
   return result2;
 }
@@ -28797,8 +28766,6 @@ async function applyLiveAuthorizedMutationAsync(bb, db, input, allowCachedConsum
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
-  const providerMatrix = parsed.success ? await liveProviderMatrix(bb, parsed.data) : [];
-  if ("outcome" in providerMatrix) return providerMatrix;
   let evidenceReader = null;
   if (parsed.success && db && parsed.data.operationClass === "execution_attempt_terminal_report") {
     const resolved = await liveTerminalReader(bb.sdk, db, parsed.data);
@@ -28809,7 +28776,7 @@ async function applyLiveAuthorizedMutationAsync(bb, db, input, allowCachedConsum
     if ("outcome" in resolved) return resolved;
     evidenceReader = resolved;
   }
-  const result2 = await applyAuthorizedMutationAsync(db, input, githubAdapter, reader, null, null, githubIssueReader ?? (parsed.success ? projectGithubIssueReader(db, parsed.data.projectId) : readGithubIssueForBackfill), evidenceReader, false, providerMatrix);
+  const result2 = await applyAuthorizedMutationAsync(db, input, githubAdapter, reader, null, null, githubIssueReader ?? (parsed.success ? projectGithubIssueReader(db, parsed.data.projectId) : readGithubIssueForBackfill), evidenceReader);
   await deliverSucceededRoleGenerationBrief(bb, db, input, result2);
   return result2;
 }
