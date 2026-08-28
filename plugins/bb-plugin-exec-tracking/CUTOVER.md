@@ -23,23 +23,13 @@ restores the prior roots, registration, receipt, and running plugins.
 
 An unchanged canonical schema fingerprint requires no backup, export, lane
 lull, or cross-project canary. When the fingerprint changes, first use the
-governed schema-cutover process to create the backup and quiescence proof, then
-pass one private JSON evidence file with this exact shape:
-
-```json
-{
-  "version": 1,
-  "projectId": "PROJECT_ID",
-  "priorSchemaFingerprint": "64-hex",
-  "candidateSchemaFingerprint": "64-hex",
-  "backup": { "path": "BACKUP_PATH", "sha256": "64-hex" },
-  "quiescence": { "verified": true, "digest": "64-hex" }
-}
-```
-
-The activation command verifies the backup bytes and exact schema binding
-before changing any plugin root. Caller flags and filenames never classify the
-schema. Keep the remainder of this document only for the pre-v2 legacy
+governed migration seam to freeze the exact project and record quiescence plus
+its canonical export. Pass that active migration id with
+`--schema-cutover MIGRATION_ID`. Activation reads the live doctor itself and
+requires the exact frozen governor/fence, exported migration, retained export,
+zero active or blind writers, and unchanged canonical facts before every bind.
+Caller JSON, files, flags, and filenames are not evidence. Keep the remainder
+of this document only for the pre-v2 legacy
 same-id cutover and its explicit rollback procedure.
 
 This deployment runbook is valid only after PR #576 merges. It converges the

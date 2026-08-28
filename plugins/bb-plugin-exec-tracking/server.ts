@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { residentServerIdentity } from "../../src/deployment-identity.js";
 
 const SCRIPT_REL = path.join("bin", "record_executed_triples.py");
 const ROLE_RESOLVER_REL = path.join("bin", "resolve_role_wake.py");
@@ -102,8 +103,8 @@ export default function plugin(bb: BbPluginApi): void {
       name: "emit",
       summary: "Emit a pr-artifacts or heartbeat semantic wake",
       usage: "bb silent-wake emit --project <id> --producer <pr-artifacts|heartbeat> --semantic <sha256>",
-    }],
-    run: (argv) => runWakeCli(bb, settings, db, argv, scheduleRetry),
+    }, { name: "activation-identity", summary: "Return the resident server generation", usage: "bb silent-wake activation-identity --json" }],
+    run: (argv) => argv[0] === "activation-identity" ? { exitCode: 0, stdout: `${JSON.stringify(residentServerIdentity("exec-tracking", import.meta.url))}\n` } : runWakeCli(bb, settings, db, argv, scheduleRetry),
   });
 
   // The SDK is bind-gated during factory evaluation. One next-turn reconcile

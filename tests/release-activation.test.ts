@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -27,11 +28,14 @@ function fixture() {
   writeFileSync(join(sourceRoot, "package.json"), JSON.stringify(sourceManifest));
   writeFileSync(join(sourceRoot, "dist/server.js"), "export const schemaDigest = 'unused';\nexport default () => {};\n");
   writeFileSync(join(sourceRoot, "dist/app.js"), "candidate app\n");
+  writeFileSync(join(sourceRoot, "dist/app.meta.json"), "{}\n");
   writeFileSync(join(releaseDirectory, "dist/server.js"), "export const schemaDigest = 'unused';\nexport default () => {};\n");
   writeFileSync(join(releaseDirectory, "dist/app.js"), "candidate app\n");
+  writeFileSync(join(releaseDirectory, "dist/app.meta.json"), "{}\n");
   writeFileSync(join(priorRoot, "package.json"), JSON.stringify(sourceManifest));
   writeFileSync(join(priorRoot, "dist/server.js"), "prior server\n");
   writeFileSync(join(priorRoot, "dist/app.js"), "prior app\n");
+  writeFileSync(join(priorRoot, "dist/app.meta.json"), "{}\n");
   execFileSync("git", ["init", "--quiet"], { cwd: sourceRoot });
   execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: sourceRoot });
   execFileSync("git", ["config", "user.name", "Test"], { cwd: sourceRoot });
@@ -48,16 +52,42 @@ function fakeAdapter(priorRoot: string, options: {
   bind?: (state: AdapterState, binding: any) => void;
   settle?: (state: AdapterState) => void;
   rollback?: (state: AdapterState) => void;
+  resident?: (state: AdapterState, binding: any) => Record<string, unknown>;
+  lawfulSchemaCutover?: boolean;
 } = {}) {
   const priorSource = { requested: `path:${priorRoot}`, resolved: `path:${priorRoot}`, engines: {}, installedAt: 1, history: [] };
-  const state: AdapterState = { root: priorRoot, source: priorSource, status: "running", services: [], bound: false, rollbackCalls: 0 };
+  const state: AdapterState = { root: priorRoot, source: priorSource, status: "running", services: [], bound: false, rollbackCalls: 0, binding: null };
+  const appHash = () => {
+    const hash = createHash("sha256").update(readFileSync(join(state.root, "dist/app.js")));
+    if (existsSync(join(state.root, "dist/app.css"))) hash.update(readFileSync(join(state.root, "dist/app.css")));
+    hash.update(readFileSync(join(state.root, "dist/app.meta.json")));
+    return hash.digest("hex").slice(0, 16);
+  };
+  const doctor = () => ({
+    outcome: "OK",
+    evidence: {
+      project: { id: PROJECT_ID },
+      schema: { digest: state.bound ? CANDIDATE_SCHEMA : (options.priorSchema ?? CANDIDATE_SCHEMA) },
+      ...(options.lawfulSchemaCutover ? {
+        governorshipHead: { project_id: PROJECT_ID, governance_epoch: 7, fence_token: "a".repeat(48), state: "frozen" },
+        activeMigrationRun: { migration_id: "migration-schema-change", state: "exported", target_runtime_id: "bb-collab", retentionExpired: false, unresolvedProof: [], quiescence_digest: "b".repeat(64), source_export_digest: "c".repeat(64) },
+        capacity: { activeWriterCount: 0, blindWriterLaneIds: [] },
+      } : {}),
+    },
+  });
   const adapter = {
     status: () => ({ project: { id: PROJECT_ID } }),
-    list: () => [{ id: "bb-collab", rootDir: state.root, status: state.status, services: state.services, app: { hasApp: true, bundle: { compatible: true } } }],
+    list: () => [{ id: "bb-collab", rootDir: state.root, status: state.status, services: state.services, app: { hasApp: true, bundle: { compatible: true, hash: appHash() } } }],
     source: () => state.source,
-    doctor: () => ({ outcome: "OK", evidence: { schema: { digest: state.bound ? CANDIDATE_SCHEMA : (options.priorSchema ?? CANDIDATE_SCHEMA) } } }),
+    doctor,
+    resident(binding: any) {
+      if (options.resident) return options.resident(state, binding);
+      const server = binding.expectedFiles.find((file: any) => file.path === "dist/server.js");
+      return { pluginId: binding.pluginId, serverEntry: binding.serverEntry, serverSha256: server.sha256, services: [] };
+    },
     bind(binding: any) {
       state.bound = true;
+      state.binding = binding;
       state.root = binding.resolvedRoot;
       state.source = { requested: `path:${binding.resolvedRoot}`, resolved: `path:${binding.resolvedRoot}`, engines: {}, installedAt: 2, history: [] };
       options.bind?.(state, binding);
@@ -85,6 +115,7 @@ interface AdapterState {
   services: Array<{ name: string; state: string }>;
   bound: boolean;
   rollbackCalls: number;
+  binding: any;
 }
 
 function cleanup(path: string) {
@@ -163,9 +194,10 @@ describe("inactive release activation", () => {
 
   it("rejects reload success while the prior generation remains resident", async () => {
     const created = fixture();
-    const { adapter, state } = fakeAdapter(created.priorRoot, { bind: (current) => { current.root = created.priorRoot; } });
+    const priorServer = createHash("sha256").update(readFileSync(join(created.priorRoot, "dist/server.js"))).digest("hex");
+    const { adapter, state } = fakeAdapter(created.priorRoot, { resident: (_current, binding) => ({ pluginId: binding.pluginId, serverEntry: binding.serverEntry, serverSha256: priorServer, services: [] }) });
     try {
-      await expect(runFixture(created, adapter)).rejects.toThrow("loaded generation is not bound to candidate");
+      await expect(runFixture(created, adapter)).rejects.toThrow("resident server generation mismatch");
       expect(state.rollbackCalls).toBe(1);
     } finally { cleanup(created.root); }
   });
@@ -186,8 +218,38 @@ describe("inactive release activation", () => {
     const created = fixture();
     const { adapter, state } = fakeAdapter(created.priorRoot, { priorSchema: PRIOR_SCHEMA });
     try {
-      await expect(runFixture(created, adapter)).rejects.toThrow("schema-changing activation requires backup and quiescence evidence");
+      await expect(runFixture(created, adapter)).rejects.toThrow("schema-changing activation requires one canonical migration id");
       expect(state.rollbackCalls).toBe(0);
+    } finally { cleanup(created.root); }
+  });
+
+  it("restores the prior path registration when bind mutates and then throws", async () => {
+    const created = fixture();
+    const { adapter, state } = fakeAdapter(created.priorRoot, { bind: () => { throw new Error("reload failed after registration moved"); } });
+    try {
+      await expect(runFixture(created, adapter)).rejects.toThrow("reload failed after registration moved");
+      expect(state.root).toBe(created.priorRoot);
+      expect(state.source.requested).toBe(`path:${created.priorRoot}`);
+      expect(state.rollbackCalls).toBe(1);
+    } finally { cleanup(created.root); }
+  });
+
+  it("refuses caller-crafted schema evidence", async () => {
+    const created = fixture();
+    const { adapter, state } = fakeAdapter(created.priorRoot, { priorSchema: PRIOR_SCHEMA });
+    try {
+      await expect(runFixture(created, adapter, { schemaCutoverId: JSON.stringify({ verified: true, quiescence: "d".repeat(64) }) })).rejects.toThrow("one canonical migration id");
+      expect(state.rollbackCalls).toBe(0);
+    } finally { cleanup(created.root); }
+  });
+
+  it("accepts a schema change only with the live frozen canonical cutover", async () => {
+    const created = fixture();
+    const { adapter } = fakeAdapter(created.priorRoot, { priorSchema: PRIOR_SCHEMA, lawfulSchemaCutover: true });
+    try {
+      const result = await runFixture(created, adapter, { schemaCutoverId: "migration-schema-change" });
+      expect(result.outcome).toBe("activated");
+      expect(result.receipt.schemaEvidenceDigest).toMatch(/^[0-9a-f]{64}$/u);
     } finally { cleanup(created.root); }
   });
 });

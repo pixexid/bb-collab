@@ -15,6 +15,7 @@ const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const slash = (value) => value.split(sep).join("/");
 const pluginId = (name) => name.replace(/^@[^/]+\//u, "").replace(/^bb-plugin-/u, "");
 const sourceKind = (source) => /^(path|git|npm):/u.exec(source)?.[1] ?? "unknown";
+const identityCommand = (id) => id === "bb-collab" ? "collab" : id === "exec-tracking" ? "silent-wake" : id;
 const defaultStateDirectory = (dataDir) => join(resolve(dataDir), "deployments", "bb-collab");
 
 function jsonCommand(command, args, options = {}) {
@@ -135,8 +136,9 @@ function systemAdapter(projectId, stateDirectory) {
   const doctor = () => jsonCommand("bb", ["collab", "doctor", "--project", projectId]);
   const installPath = (path) => jsonCommand("bb", ["plugin", "install", "--yes", "--json", `path:${path}`]);
   const reload = (id) => jsonCommand("bb", ["plugin", "reload", id, "--json"]);
+  const resident = (binding) => jsonCommand("bb", [binding.identityCommand, "activation-identity", "--json"]);
   return {
-    status, list, source, doctor,
+    status, list, source, doctor, resident,
     settle: () => new Promise((resolvePromise) => setTimeout(resolvePromise, SETTLE_MS)),
     bind(binding, transactionId) {
       if (binding.sourceKind === "path") {
@@ -161,7 +163,7 @@ function systemAdapter(projectId, stateDirectory) {
       return { adapter: "managed-root-symlink", retainedRoot };
     },
     rollback(binding, result) {
-      if (result.adapter === "path-install") installPath(binding.priorRoot);
+      if (binding.sourceKind === "path") installPath(binding.priorRoot);
       else {
         if (lstatSync(binding.registeredRoot).isSymbolicLink()) unlinkSync(binding.registeredRoot);
         renameSync(result.retainedRoot, binding.registeredRoot);
@@ -171,16 +173,21 @@ function systemAdapter(projectId, stateDirectory) {
   };
 }
 
-function evidenceForSchemaChange(path, projectId, prior, candidate) {
-  if (!path) throw new Error("schema-changing activation requires backup and quiescence evidence");
-  const evidence = JSON.parse(readFileSync(path, "utf8"));
-  if (evidence?.version !== 1 || evidence.projectId !== projectId || evidence.priorSchemaFingerprint !== prior || evidence.candidateSchemaFingerprint !== candidate
-    || typeof evidence.backup?.path !== "string" || !isAbsolute(evidence.backup.path) || !/^[0-9a-f]{64}$/u.test(evidence.backup.sha256 ?? "")
-    || !existsSync(evidence.backup.path) || sha256(readFileSync(evidence.backup.path)) !== evidence.backup.sha256
-    || evidence.quiescence?.verified !== true || !/^[0-9a-f]{64}$/u.test(evidence.quiescence.digest ?? "")) {
-    throw new Error("schema-changing activation evidence is invalid");
+function schemaCutoverEvidence(doctor, migrationId, projectId, prior, candidate, liveSchema = prior) {
+  if (!migrationId || !/^[a-z0-9][a-z0-9-]{2,127}$/u.test(migrationId)) throw new Error("schema-changing activation requires one canonical migration id");
+  const evidence = doctor?.evidence;
+  const governor = evidence?.governorshipHead;
+  const migration = evidence?.activeMigrationRun;
+  if (doctor.outcome !== "OK" || evidence?.project?.id !== projectId || evidence?.schema?.digest !== liveSchema
+    || governor?.project_id !== projectId || governor.state !== "frozen" || !/^[0-9a-f]{48}$/u.test(governor.fence_token ?? "")
+    || migration?.migration_id !== migrationId || migration.state !== "exported" || migration.target_runtime_id !== "bb-collab"
+    || migration.retentionExpired !== false || migration.unresolvedProof?.length !== 0
+    || !/^[0-9a-f]{64}$/u.test(migration.quiescence_digest ?? "") || !/^[0-9a-f]{64}$/u.test(migration.source_export_digest ?? "")
+    || evidence.capacity?.activeWriterCount !== 0 || evidence.capacity?.blindWriterLaneIds?.length !== 0) {
+    throw new Error("canonical schema-cutover evidence is unavailable or stale");
   }
-  return sha256(canonicalJson(evidence));
+  const bound = { projectId, priorSchemaFingerprint: prior, candidateSchemaFingerprint: candidate, governor, migration };
+  return { digest: sha256(canonicalJson(bound)), fence: canonicalJson({ governor, migration }) };
 }
 
 async function candidateSchemaFingerprint(artifactRoot) {
@@ -207,26 +214,42 @@ function classifyBindings({ manifest, sourceRoot, artifactRoot, installed, sourc
     if (canonicalJson(stagedManifest) !== canonicalJson(wrapperManifest(packageManifest, files))) throw new Error(`staged binding manifest mismatch: ${id}`);
     const serverEntry = files.some(({ path }) => path === "dist/server.js") ? realpathSync(join(resolvedRoot, "dist/server.js")) : null;
     return {
-      pluginId: id, packageRoot, sourceKind: kind, registeredRoot: resolve(current.rootDir), priorRoot, resolvedRoot,
+      pluginId: id, packageRoot, sourceKind: kind, identityCommand: identityCommand(id), registeredRoot: resolve(current.rootDir), priorRoot, resolvedRoot,
       serverEntry, frontendArtifacts: files.filter(({ path }) => path === "dist/app.js" || path === "dist/app.css").map(({ path }) => realpathSync(join(resolvedRoot, path))),
       expectedFiles: files, priorSource: currentSource, priorStatus: current,
     };
   }).sort((a, b) => (a.pluginId === "bb-collab" ? 1 : b.pluginId === "bb-collab" ? -1 : a.pluginId.localeCompare(b.pluginId)));
 }
 
-function proveLoaded(bindings, installed, sources) {
+function expectedAppHash(binding) {
+  const paths = ["dist/app.js", "dist/app.css", "dist/app.meta.json"];
+  const files = new Map(binding.expectedFiles.map((file) => [file.path, file]));
+  if (!files.has("dist/app.js")) return null;
+  const hash = createHash("sha256").update(readFileSync(join(binding.resolvedRoot, "dist/app.js")));
+  if (files.has("dist/app.css")) hash.update(readFileSync(join(binding.resolvedRoot, "dist/app.css")));
+  hash.update(readFileSync(join(binding.resolvedRoot, "dist/app.meta.json")));
+  return hash.digest("hex").slice(0, 16);
+}
+
+function proveLoaded(bindings, installed, sources, residents) {
   const installedById = new Map(installed.map((entry) => [entry.id, entry]));
   for (const binding of bindings) {
     const current = installedById.get(binding.pluginId);
     const currentSource = sources.get(binding.pluginId);
     if (!current || current.status !== "running" || current.services?.some(({ state }) => state !== "running")) throw new Error(`plugin health failed: ${binding.pluginId}`);
     const expectsApp = binding.frontendArtifacts.some((path) => path.endsWith("/app.js"));
-    if (Boolean(current.app?.hasApp) !== expectsApp || (expectsApp && current.app?.bundle?.compatible !== true)) throw new Error(`plugin frontend health failed: ${binding.pluginId}`);
     if (realpathSync(current.rootDir) !== realpathSync(binding.resolvedRoot)) throw new Error(`loaded generation is not bound to candidate: ${binding.pluginId}`);
+    if (Boolean(current.app?.hasApp) !== expectsApp || (expectsApp && (current.app?.bundle?.compatible !== true || current.app.bundle.hash !== expectedAppHash(binding)))) throw new Error(`resident frontend generation mismatch: ${binding.pluginId}`);
     if (binding.sourceKind === "path" && (currentSource.requested !== `path:${binding.resolvedRoot}` || currentSource.resolved !== `path:${binding.resolvedRoot}`)) throw new Error(`registered root remains on prior release: ${binding.pluginId}`);
     const packageManifest = JSON.parse(readFileSync(join(current.rootDir, "package.json"), "utf8"));
     const actualServer = packageManifest.bb?.server ? realpathSync(join(current.rootDir, packageManifest.bb.server)) : null;
     if (actualServer !== binding.serverEntry || actualServer?.endsWith("server.ts")) throw new Error(`server entry is not candidate dist/server.js: ${binding.pluginId}`);
+    const resident = residents.get(binding.pluginId);
+    const expectedServer = binding.expectedFiles.find(({ path }) => path === "dist/server.js")?.sha256 ?? null;
+    if (!resident || resident.pluginId !== binding.pluginId || resident.serverEntry !== binding.serverEntry || resident.serverSha256 !== expectedServer) throw new Error(`resident server generation mismatch: ${binding.pluginId}`);
+    const expectedServices = (current.services ?? []).map(({ name }) => name).sort();
+    const residentServices = (resident.services ?? []).map(({ name, serverSha256 }) => ({ name, serverSha256 }));
+    if (residentServices.length !== expectedServices.length || residentServices.some(({ name, serverSha256 }, index) => name !== expectedServices[index] || serverSha256 !== expectedServer)) throw new Error(`old or orphaned service generation remains authoritative: ${binding.pluginId}`);
     verifyBindingFiles(binding);
   }
 }
@@ -246,7 +269,7 @@ function verifyActiveReceipt({ stateDirectory, adapter }) {
   if (receipt?.version !== RECEIPT_VERSION || receipt.state !== "active" || !/^proj_[a-z0-9]+$/u.test(receipt.projectId ?? "")) throw new Error("active deployment receipt is unavailable");
   const runtime = adapter ?? systemAdapter(receipt.projectId, stateDirectory);
   const ids = receipt.bindings.map(({ pluginId: id }) => id);
-  proveLoaded(receipt.bindings, runtime.list(), new Map(ids.map((id) => [id, runtime.source(id)])));
+  proveLoaded(receipt.bindings, runtime.list(), new Map(ids.map((id) => [id, runtime.source(id)])), new Map(receipt.bindings.map((binding) => [binding.pluginId, runtime.resident(binding)])));
   const doctor = runtime.doctor();
   if (doctor.outcome !== "OK" || doctor.evidence?.schema?.digest !== receipt.schemaFingerprint) throw new Error("active receipt schema fingerprint is not loaded");
   return receipt;
@@ -283,11 +306,12 @@ async function activateRelease(options) {
     if (priorReceipt.value?.state === "active" && priorReceipt.value.releaseDigest === manifest.releaseDigest) {
       const bindings = priorReceipt.value.bindings;
       const ids = bindings.map(({ pluginId }) => pluginId);
-      proveLoaded(bindings, adapter.list(), new Map(ids.map((id) => [id, adapter.source(id)])));
+      proveLoaded(bindings, adapter.list(), new Map(ids.map((id) => [id, adapter.source(id)])), new Map(bindings.map((binding) => [binding.pluginId, adapter.resident(binding)])));
       if (doctorBefore.evidence.schema.digest !== priorReceipt.value.schemaFingerprint) throw new Error("active receipt schema fingerprint is not loaded");
       return { outcome: "already_active", receipt: priorReceipt.value };
     }
-    const schemaEvidenceDigest = priorSchema === candidateSchema ? null : evidenceForSchemaChange(options.schemaEvidencePath, projectId, priorSchema, candidateSchema);
+    const schemaCutover = priorSchema === candidateSchema ? null : schemaCutoverEvidence(doctorBefore, options.schemaCutoverId, projectId, priorSchema, candidateSchema);
+    const schemaEvidenceDigest = schemaCutover?.digest ?? null;
     const installed = adapter.list();
     const ids = manifest.artifactRoots.map((distRoot) => pluginId(sourceManifest(sourceRoot, dirname(distRoot) === "." ? "." : dirname(distRoot)).name));
     if (new Set(ids).size !== ids.length) throw new Error("release artifact roots do not map to unique installed plugin ids");
@@ -305,13 +329,18 @@ async function activateRelease(options) {
       const currentSource = adapter.source(binding.pluginId);
       const current = adapter.list().find(({ id }) => id === binding.pluginId);
       if (canonicalJson(currentSource) !== canonicalJson(binding.priorSource) || !current || realpathSync(current.rootDir) !== binding.priorRoot) throw new Error(`activation fence moved before binding: ${binding.pluginId}`);
-      changed.push({ binding, result: adapter.bind(binding, transactionId) });
+      if (schemaCutover && schemaCutoverEvidence(adapter.doctor(), options.schemaCutoverId, projectId, priorSchema, candidateSchema).fence !== schemaCutover.fence) throw new Error("schema-cutover fence moved before binding");
+      const change = { binding, result: null };
+      if (binding.sourceKind === "path") changed.push(change);
+      change.result = adapter.bind(binding, transactionId);
+      if (binding.sourceKind !== "path") changed.push(change);
     }
     await adapter.settle();
     const afterSources = new Map(ids.map((id) => [id, adapter.source(id)]));
-    proveLoaded(bindings, adapter.list(), afterSources);
+    proveLoaded(bindings, adapter.list(), afterSources, new Map(bindings.map((binding) => [binding.pluginId, adapter.resident(binding)])));
     const doctorAfter = adapter.doctor();
     if (doctorAfter.outcome !== "OK" || doctorAfter.evidence?.schema?.digest !== candidateSchema) throw new Error("loaded canonical schema fingerprint does not identify the candidate generation");
+    if (schemaCutover && schemaCutoverEvidence(doctorAfter, options.schemaCutoverId, projectId, priorSchema, candidateSchema, candidateSchema).fence !== schemaCutover.fence) throw new Error("schema-cutover fence moved after binding");
     if (priorReceipt.bytes === null ? existsSync(receiptPath) : !readReceipt(receiptPath).bytes?.equals(priorReceipt.bytes)) throw new Error("deployment receipt changed concurrently");
     const receipt = { ...pending, state: "active", activatedAt: Date.now() };
     atomicWrite(receiptPath, receipt);
@@ -340,12 +369,12 @@ async function activateRelease(options) {
 
 function parseArgs(argv) {
   const value = (name) => { const index = argv.indexOf(name); return index < 0 ? undefined : argv[index + 1]; };
-  if (argv[0] !== "activate") throw new Error("usage: activate-release.mjs activate --release <absolute-directory> --project <project-id> [--schema-evidence <absolute-json>]");
+  if (argv[0] !== "activate") throw new Error("usage: activate-release.mjs activate --release <absolute-directory> --project <project-id> [--schema-cutover <canonical-migration-id>]");
   const projectId = value("--project");
   const status = jsonCommand("bb", ["status", "--json"]);
   return {
     releaseDirectory: resolve(value("--release") ?? ""), sourceRoot: process.cwd(), stateDirectory: defaultStateDirectory(status.dataDir),
-    projectId, schemaEvidencePath: value("--schema-evidence"),
+    projectId, schemaCutoverId: value("--schema-cutover"),
   };
 }
 

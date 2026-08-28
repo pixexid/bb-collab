@@ -3,7 +3,7 @@ export interface ActivationOptions {
   sourceRoot: string;
   stateDirectory: string;
   projectId: string;
-  schemaEvidencePath?: string;
+  schemaCutoverId?: string;
   adapter?: unknown;
   candidateSchemaFingerprint?: (artifactRoot: string) => Promise<string>;
 }

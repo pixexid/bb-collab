@@ -18485,7 +18485,7 @@ exit 1
     const host = await loadedHost();
     const registrations = host.harness.inspection.registrations;
     expect(registrations.rpcMethods).not.toContain("seed-fixture-receipt");
-    expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["doctor", "export", "apply", "register-project", "dispatch-lane", "github-issue-backfill", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "archive-sweep", "worktree-cleanup", "send-to-operator", "inbox"]);
+    expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["activation-identity", "doctor", "export", "apply", "register-project", "dispatch-lane", "github-issue-backfill", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "archive-sweep", "worktree-cleanup", "send-to-operator", "inbox"]);
     expect(registrations.httpRoutes).toEqual([]);
     expect(seedFixtureDecision).toBeTypeOf("function");
   });

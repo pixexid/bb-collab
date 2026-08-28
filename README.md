@@ -28,7 +28,7 @@ the matching live deployment.
 Schema classification comes only from the current doctor and the candidate
 server's exported canonical schema digest. An unchanged digest needs no backup,
 export, queue lull, or cross-project canary. A changed digest refuses unless
-`--schema-evidence` names the governed backup-and-quiescence evidence described
+`--schema-cutover` names the governed canonical migration described
 in the cutover runbook.
 
 ## Deploy sequence

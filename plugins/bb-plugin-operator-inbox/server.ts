@@ -1,4 +1,5 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { registerDeploymentIdentityCli } from "../../src/deployment-identity.js";
 import type { z } from "zod";
 import {
   messageMutationInputSchema,
@@ -34,6 +35,7 @@ async function withTimeout<T>(promise: Promise<T>, method: string, timeoutMs = R
 }
 
 export default function plugin(bb: BbPluginApi) {
+  registerDeploymentIdentityCli(bb, "operator-inbox", "operator-inbox", import.meta.url);
   const reads = new Map<string, Promise<unknown>>();
   const idempotentMutations = new Map<string, Promise<unknown>>();
   const replies = new Map<string, Promise<unknown>>();
