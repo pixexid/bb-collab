@@ -2,7 +2,8 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync, closeSync, cpSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync,
-  readdirSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
+  readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync,
+  unlinkSync, utimesSync, writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -10,6 +11,11 @@ import { canonicalJson, verifyRelease, verifyRuntimeClosure } from "./release-ar
 
 const RECEIPT_VERSION = 1;
 const SETTLE_MS = 15_000;
+const STAGING_CONTRACT_VERSION = 2;
+const SOURCE_EPOCH_MS = Date.UTC(2000, 0, 1);
+const APP_EPOCH_MS = SOURCE_EPOCH_MS + 60_000;
+const MTIME_MARGIN_MS = APP_EPOCH_MS - SOURCE_EPOCH_MS;
+const HOST_IGNORED_SEGMENTS = new Set(["dist", "node_modules", ".git"]);
 
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const slash = (value) => value.split(sep).join("/");
@@ -100,6 +106,55 @@ function makeWritable(path) {
   if (lstatSync(path).isDirectory()) for (const entry of readdirSync(path)) makeWritable(join(path, entry));
 }
 
+function treeEntries(path, base = path) {
+  return readdirSync(path, { withFileTypes: true }).flatMap((entry) => {
+    const child = join(path, entry.name);
+    if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) throw new Error(`staged release contains a mutable or unsupported entry: ${slash(relative(base, child))}`);
+    return entry.isDirectory() ? [...treeEntries(child, base), child] : [child];
+  });
+}
+
+function normalizeStageMtimes(root, artifactRoots) {
+  for (const path of [...treeEntries(root), root]) utimesSync(path, SOURCE_EPOCH_MS / 1000, SOURCE_EPOCH_MS / 1000);
+  for (const distRoot of artifactRoots) {
+    const app = join(root, distRoot, "app.js");
+    if (existsSync(app)) utimesSync(app, APP_EPOCH_MS / 1000, APP_EPOCH_MS / 1000);
+  }
+}
+
+function latestHostInspectedMtime(root) {
+  let latest = statSync(root).mtimeMs;
+  const pending = [""];
+  while (pending.length) {
+    const directory = pending.pop();
+    for (const entry of readdirSync(join(root, directory), { withFileTypes: true })) {
+      const relativePath = join(directory, entry.name);
+      if (relativePath.split(sep).some((segment) => HOST_IGNORED_SEGMENTS.has(segment))) continue;
+      const path = join(root, relativePath);
+      latest = Math.max(latest, statSync(path).mtimeMs);
+      if (entry.isDirectory()) pending.push(relativePath);
+    }
+  }
+  return latest;
+}
+
+function verifyStageMtimes(root, artifactRoots, deterministic = true) {
+  for (const distRoot of artifactRoots) {
+    const packageRoot = dirname(distRoot) === "." ? root : join(root, dirname(distRoot));
+    const app = join(root, distRoot, "app.js");
+    if (!existsSync(app)) continue;
+    const appMtime = statSync(app).mtimeMs;
+    const sourceMtime = latestHostInspectedMtime(packageRoot);
+    if (appMtime < sourceMtime + MTIME_MARGIN_MS || (deterministic && (appMtime !== APP_EPOCH_MS || sourceMtime !== SOURCE_EPOCH_MS))) {
+      throw new Error(`staged app mtime contract failed: ${slash(relative(root, packageRoot) || ".")}`);
+    }
+  }
+}
+
+function verifyReadOnlyTree(root) {
+  for (const path of [...treeEntries(root), root]) if ((lstatSync(path).mode & 0o222) !== 0) throw new Error(`staged release is mutable: ${slash(relative(root, path) || ".")}`);
+}
+
 function verifyBindingFiles(binding) {
   for (const file of binding.expectedFiles) {
     const path = join(binding.resolvedRoot, file.path);
@@ -108,11 +163,13 @@ function verifyBindingFiles(binding) {
 }
 
 async function stageRelease({ releaseDirectory, sourceRoot, stateDirectory, manifest }) {
-  const releases = join(stateDirectory, "releases");
+  const releases = join(stateDirectory, "releases", `path-load-v${STAGING_CONTRACT_VERSION}`);
   const artifactRoot = join(releases, manifest.releaseDigest);
   const temporary = `${artifactRoot}.tmp-${process.pid}`;
   if (existsSync(artifactRoot)) {
     verifyRuntimeClosure(artifactRoot, manifest, true);
+    verifyStageMtimes(artifactRoot, manifest.artifactRoots);
+    verifyReadOnlyTree(artifactRoot);
     return artifactRoot;
   }
   mkdirSync(releases, { recursive: true, mode: 0o700 });
@@ -130,9 +187,13 @@ async function stageRelease({ releaseDirectory, sourceRoot, stateDirectory, mani
       writeFileSync(join(wrapper, "package.json"), `${canonicalJson(stagedManifest)}\n`);
     }
     cpSync(join(releaseDirectory, "node_modules"), join(temporary, "node_modules"), { recursive: true });
+    normalizeStageMtimes(temporary, manifest.artifactRoots);
+    verifyStageMtimes(temporary, manifest.artifactRoots);
     makeReadOnly(temporary);
     verifyRuntimeClosure(temporary, manifest, true);
+    verifyReadOnlyTree(temporary);
     renameSync(temporary, artifactRoot);
+    verifyStageMtimes(artifactRoot, manifest.artifactRoots);
   } catch (error) {
     makeWritable(temporary);
     rmSync(temporary, { recursive: true, force: true });
@@ -141,48 +202,219 @@ async function stageRelease({ releaseDirectory, sourceRoot, stateDirectory, mani
   return artifactRoot;
 }
 
-function systemAdapter(projectId, stateDirectory) {
-  const status = () => jsonCommand("bb", ["status", "--json"]);
-  const list = () => jsonCommand("bb", ["plugin", "list", "--json"]).plugins;
-  const source = (id) => jsonCommand("bb", ["plugin", "source", id, "--json"]);
-  const doctor = () => jsonCommand("bb", ["collab", "doctor", "--project", projectId]);
-  const installPath = (path) => jsonCommand("bb", ["plugin", "install", "--yes", "--json", `path:${path}`]);
-  const reload = (id) => jsonCommand("bb", ["plugin", "reload", id, "--json"]);
-  const resident = (binding) => jsonCommand("bb", [binding.identityCommand, "activation-identity", "--json"]);
+function systemAdapter(projectId, stateDirectory, runner = jsonCommand) {
+  const run = (args) => runner("bb", args, { cwd: stateDirectory });
+  const status = () => run(["status", "--json"]);
+  const list = () => run(["plugin", "list", "--json"]).plugins;
+  const source = (id) => run(["plugin", "source", id, "--json"]);
+  const doctor = () => run(["collab", "doctor", "--project", projectId]);
+  const reload = (binding) => run(["plugin", "reload", binding.pluginId, "--json"]);
+  const resident = (binding) => run([binding.identityCommand, "activation-identity", "--json"]);
   return {
-    status, list, source, doctor, resident,
+    status, list, source, doctor, resident, reload,
+    version: () => execFileSync("bb", ["--version"], { cwd: stateDirectory, encoding: "utf8" }).trim(),
     settle: () => new Promise((resolvePromise) => setTimeout(resolvePromise, SETTLE_MS)),
-    bind(binding, transactionId) {
-      if (binding.sourceKind === "path") {
-        installPath(binding.resolvedRoot);
-        return { adapter: "path-install" };
-      }
-      const dataDir = resolve(status().dataDir);
-      const registeredRoot = resolve(binding.registeredRoot);
-      if (!registeredRoot.startsWith(`${dataDir}${sep}`)) throw new Error(`${binding.pluginId} managed root is outside the BB data directory`);
-      const retainedRoot = join(stateDirectory, "rollback", transactionId, binding.pluginId);
-      mkdirSync(dirname(retainedRoot), { recursive: true, mode: 0o700 });
-      if (existsSync(retainedRoot) || lstatSync(registeredRoot).isSymbolicLink()) throw new Error(`${binding.pluginId} managed root is not safely bindable`);
-      renameSync(registeredRoot, retainedRoot);
-      symlinkSync(binding.resolvedRoot, registeredRoot);
-      try { reload(binding.pluginId); }
-      catch (error) {
-        unlinkSync(registeredRoot);
-        renameSync(retainedRoot, registeredRoot);
-        try { reload(binding.pluginId); } catch (rollbackError) { throw new Error(`${error.message}; immediate rollback failed: ${rollbackError.message}`); }
-        throw error;
-      }
-      return { adapter: "managed-root-symlink", retainedRoot };
-    },
-    rollback(binding, result) {
-      if (binding.sourceKind === "path") installPath(binding.priorRoot);
-      else {
-        if (lstatSync(binding.registeredRoot).isSymbolicLink()) unlinkSync(binding.registeredRoot);
-        renameSync(result.retainedRoot, binding.registeredRoot);
-        reload(binding.pluginId);
-      }
-    },
   };
+}
+
+function appMeta(root) {
+  const path = join(root, "dist", "app.meta.json");
+  if (!existsSync(path)) return null;
+  const meta = JSON.parse(readFileSync(path, "utf8"));
+  if (typeof meta.sdkVersion !== "string" || typeof meta.builtWith?.bbVersion !== "string" || meta.builtWith.pluginSdkVersion !== meta.sdkVersion) {
+    throw new Error(`invalid app metadata: ${path}`);
+  }
+  return meta;
+}
+
+function appHash(root) {
+  const app = join(root, "dist", "app.js");
+  if (!existsSync(app)) return null;
+  const hash = createHash("sha256").update(readFileSync(app));
+  const css = join(root, "dist", "app.css");
+  if (existsSync(css)) hash.update(readFileSync(css));
+  hash.update(readFileSync(join(root, "dist", "app.meta.json")));
+  return hash.digest("hex").slice(0, 16);
+}
+
+function authoritativeFiles(root) {
+  const paths = [join(root, "package.json")];
+  const dist = join(root, "dist");
+  if (existsSync(dist)) paths.push(...treeEntries(dist).filter((path) => lstatSync(path).isFile()));
+  return paths.map((path) => ({ path: slash(relative(root, path)), sha256: sha256(readFileSync(path)) })).sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function hashObservedFiles(root, files) {
+  try {
+    return files.map(({ path }) => ({ path, sha256: sha256(readFileSync(join(root, path))) }));
+  } catch {
+    return null;
+  }
+}
+
+function exactBuffer(current, prior) {
+  return current === null ? prior === null : prior !== null && current.equals(prior);
+}
+
+function pathWithin(parent, child) {
+  return child === parent || child.startsWith(`${parent}${sep}`);
+}
+
+function assertNonOverlappingRoots(bindings) {
+  for (let index = 0; index < bindings.length; index += 1) for (let other = index + 1; other < bindings.length; other += 1) {
+    const left = resolve(bindings[index].registeredRoot);
+    const right = resolve(bindings[other].registeredRoot);
+    if (pathWithin(left, right) || pathWithin(right, left)) throw new Error(`overlapping registered roots are not supported: ${bindings[index].pluginId}/${bindings[other].pluginId}`);
+  }
+}
+
+function requireAppBaseline(root, toolchain, label, deterministic = false) {
+  const meta = appMeta(root);
+  if (meta === null) return null;
+  if (meta.sdkVersion !== toolchain.pluginSdkVersion || meta.builtWith.pluginSdkVersion !== toolchain.pluginSdkVersion) throw new Error(`${label} SDK does not match the exact activation host baseline`);
+  if (meta.builtWith.bbVersion !== toolchain.bbVersion) throw new Error(`${label} BB version does not match the exact activation host baseline`);
+  const appMtime = statSync(join(root, "dist", "app.js")).mtimeMs;
+  const sourceMtime = latestHostInspectedMtime(root);
+  if (appMtime < sourceMtime + MTIME_MARGIN_MS || (deterministic && (appMtime !== APP_EPOCH_MS || sourceMtime !== SOURCE_EPOCH_MS))) throw new Error(`${label} app mtime is not build-free`);
+  return meta;
+}
+
+function createPlan(binding, transactionId, stateDirectory, dataDir, priorReceipt) {
+  const registeredRoot = resolve(binding.registeredRoot);
+  if (binding.sourceKind !== "path" && !pathWithin(resolve(dataDir), registeredRoot)) throw new Error(`${binding.pluginId} managed root is outside the BB data directory`);
+  if (pathWithin(registeredRoot, binding.resolvedRoot) || pathWithin(binding.resolvedRoot, registeredRoot)) throw new Error(`${binding.pluginId} candidate and registered roots overlap`);
+  const retainedRoot = join(stateDirectory, "rollback", transactionId, binding.pluginId, "prior-root");
+  if (existsSync(retainedRoot)) throw new Error(`${binding.pluginId} rollback root already exists`);
+  const slot = lstatSync(registeredRoot);
+  if (slot.isDirectory() && !slot.isSymbolicLink()) return {
+    adapter: "root-overlay-v2", pluginId: binding.pluginId, registeredRoot, candidateRoot: binding.resolvedRoot,
+    retainedRoot, priorSlotKind: "directory", priorSymlinkTarget: null,
+  };
+  if (!slot.isSymbolicLink()) throw new Error(`${binding.pluginId} registered root is not safely bindable`);
+  const priorBinding = priorReceipt.value?.state === "active" ? priorReceipt.value.bindings?.find(({ pluginId: id }) => id === binding.pluginId) : null;
+  const priorTarget = readlinkSync(registeredRoot);
+  if (priorBinding?.plan?.adapter !== "root-overlay-v2" || resolve(priorBinding.plan.registeredRoot) !== registeredRoot
+    || realpathSync(registeredRoot) !== binding.priorRoot || resolve(priorBinding.resolvedRoot) !== binding.priorRoot) {
+    throw new Error(`${binding.pluginId} registered root is an arbitrary or unreceipted symlink`);
+  }
+  return {
+    adapter: "root-overlay-v2", pluginId: binding.pluginId, registeredRoot, candidateRoot: binding.resolvedRoot,
+    retainedRoot, priorSlotKind: "owned-symlink", priorSymlinkTarget: priorTarget,
+  };
+}
+
+function prepareBindings({ bindings, adapter, manifest, priorReceipt, stateDirectory, dataDir, transactionId }) {
+  assertNonOverlappingRoots(bindings);
+  return bindings.map((binding) => {
+    const stagedManifest = JSON.parse(readFileSync(join(binding.resolvedRoot, "package.json"), "utf8"));
+    if (binding.sourceKind === "path" && stagedManifest.bb?.host) throw new Error(`${binding.pluginId} path host artifacts are not immutable-loadable`);
+    requireAppBaseline(binding.resolvedRoot, manifest.toolchain, `${binding.pluginId} candidate`, true);
+    const current = binding.priorStatus;
+    const resident = adapter.resident(binding);
+    const priorManifest = JSON.parse(readFileSync(join(binding.priorRoot, "package.json"), "utf8"));
+    if (binding.sourceKind === "path" && priorManifest.bb?.host) throw new Error(`${binding.pluginId} prior path host artifact is not rollback-safe`);
+    requireAppBaseline(binding.priorRoot, manifest.toolchain, `${binding.pluginId} prior`);
+    const priorFiles = authoritativeFiles(binding.priorRoot);
+    const residentServer = resident?.serverEntry ? realpathSync(resident.serverEntry) : null;
+    const residentDigest = residentServer && pathWithin(binding.priorRoot, residentServer) ? sha256(readFileSync(residentServer)) : null;
+    if (!resident || resident.pluginId !== binding.pluginId || residentServer === null || resident.serverSha256 !== residentDigest) throw new Error(`${binding.pluginId} prior resident does not match prior authoritative bytes`);
+    const priorAppHash = appHash(binding.priorRoot);
+    if (Boolean(current.app?.hasApp) !== (priorAppHash !== null) || (priorAppHash !== null && current.app?.bundle?.hash !== priorAppHash)) throw new Error(`${binding.pluginId} prior frontend resident does not match prior bytes`);
+    const serviceNames = (current.services ?? []).map(({ name }) => name).sort();
+    const residentServices = (resident.services ?? []).map(({ name, serverSha256 }) => ({ name, serverSha256 }));
+    if (residentServices.length !== serviceNames.length || residentServices.some(({ name, serverSha256 }, index) => name !== serviceNames[index] || serverSha256 !== residentDigest)) throw new Error(`${binding.pluginId} prior services do not match prior resident`);
+    const priorSnapshot = {
+      source: binding.priorSource, registeredRoot: binding.registeredRoot, resolvedRoot: binding.priorRoot,
+      status: current.status, services: current.services ?? [], app: current.app ?? { hasApp: false, bundle: null }, resident,
+      authoritativeFiles: priorFiles, receiptDigest: priorReceipt.bytes ? sha256(priorReceipt.bytes) : null,
+      rollbackReloadSafe: true,
+    };
+    return { ...binding, priorSnapshot, plan: createPlan(binding, transactionId, stateDirectory, dataDir, priorReceipt) };
+  });
+}
+
+function applyOverlay(plan, adapter) {
+  adapter.beforeOverlay?.(plan);
+  mkdirSync(dirname(plan.retainedRoot), { recursive: true, mode: 0o700 });
+  if (plan.priorSlotKind === "directory") renameSync(plan.registeredRoot, plan.retainedRoot);
+  else unlinkSync(plan.registeredRoot);
+  adapter.afterRename?.(plan);
+  symlinkSync(plan.candidateRoot, plan.registeredRoot);
+  adapter.afterSymlink?.(plan);
+}
+
+function slotObservation(plan) {
+  const retained = existsSync(plan.retainedRoot);
+  if (!existsSync(plan.registeredRoot)) return { kind: retained ? "rename-only" : "missing", retained };
+  const slot = lstatSync(plan.registeredRoot);
+  if (slot.isSymbolicLink()) {
+    const target = readlinkSync(plan.registeredRoot);
+    if (realpathSync(plan.registeredRoot) === realpathSync(plan.candidateRoot) && retained === (plan.priorSlotKind === "directory")) return { kind: "candidate", retained, target };
+    if (plan.priorSlotKind === "owned-symlink" && target === plan.priorSymlinkTarget && !retained) return { kind: "prior", retained, target };
+    return { kind: "unknown", retained, target };
+  }
+  if (slot.isDirectory() && plan.priorSlotKind === "directory" && !retained) return { kind: "prior", retained };
+  return { kind: "unknown", retained };
+}
+
+function priorBackingRoot(binding, slot) {
+  if (binding.plan.priorSlotKind === "owned-symlink") return binding.priorSnapshot.resolvedRoot;
+  return slot.retained ? binding.plan.retainedRoot : binding.plan.registeredRoot;
+}
+
+function observeChange(binding, adapter, receiptPath) {
+  const slot = slotObservation(binding.plan);
+  const current = adapter.list().find(({ id }) => id === binding.pluginId) ?? null;
+  let resident = null;
+  try { resident = adapter.resident(binding); } catch {}
+  return {
+    slot, current, resident, source: adapter.source(binding.pluginId), receipt: readReceipt(receiptPath).bytes,
+    priorFiles: hashObservedFiles(priorBackingRoot(binding, slot), binding.priorSnapshot.authoritativeFiles),
+  };
+}
+
+function residentIsPrior(observation, snapshot) {
+  return canonicalJson(observation.resident) === canonicalJson(snapshot.resident)
+    && observation.current?.status === snapshot.status
+    && canonicalJson(observation.current?.services ?? []) === canonicalJson(snapshot.services)
+    && canonicalJson(observation.current?.app ?? { hasApp: false, bundle: null }) === canonicalJson(snapshot.app);
+}
+
+function assertExactPrior(observation, binding, priorReceiptBytes) {
+  const snapshot = binding.priorSnapshot;
+  if (observation.slot.kind !== "prior" || canonicalJson(observation.source) !== canonicalJson(snapshot.source)
+    || !residentIsPrior(observation, snapshot) || canonicalJson(observation.priorFiles) !== canonicalJson(snapshot.authoritativeFiles)
+    || !exactBuffer(observation.receipt, priorReceiptBytes)) throw new Error(`prior exact deployment was not restored: ${binding.pluginId}`);
+}
+
+function restorePriorSlot(plan, observation) {
+  if (observation.slot.kind === "prior") return;
+  if (observation.slot.kind === "candidate") unlinkSync(plan.registeredRoot);
+  else if (observation.slot.kind !== "rename-only") throw new Error("rollback filesystem topology is unowned or ambiguous");
+  if (plan.priorSlotKind === "directory") renameSync(plan.retainedRoot, plan.registeredRoot);
+  else symlinkSync(plan.priorSymlinkTarget, plan.registeredRoot);
+}
+
+function recoverChange(binding, adapter, receiptPath, priorReceiptBytes) {
+  let observation = observeChange(binding, adapter, receiptPath);
+  try { assertExactPrior(observation, binding, priorReceiptBytes); return { action: "no-op" }; } catch {}
+  if (canonicalJson(observation.source) !== canonicalJson(binding.priorSnapshot.source)) {
+    if (new Set(["candidate", "rename-only"]).has(observation.slot.kind)) restorePriorSlot(binding.plan, observation);
+    throw new Error("registration drift is not exactly recoverable without path install");
+  }
+  if (!exactBuffer(observation.receipt, priorReceiptBytes)) throw new Error("deployment receipt changed during activation");
+  if (canonicalJson(observation.priorFiles) !== canonicalJson(binding.priorSnapshot.authoritativeFiles)) throw new Error("prior authoritative bytes changed during activation");
+  restorePriorSlot(binding.plan, observation);
+  observation = observeChange(binding, adapter, receiptPath);
+  if (residentIsPrior(observation, binding.priorSnapshot)) {
+    assertExactPrior(observation, binding, priorReceiptBytes);
+    return { action: "filesystem-only" };
+  }
+  if (!binding.priorSnapshot.rollbackReloadSafe) throw new Error("prior generation was not proven reloadable without rebuild");
+  adapter.reload(binding);
+  observation = observeChange(binding, adapter, receiptPath);
+  assertExactPrior(observation, binding, priorReceiptBytes);
+  return { action: "reload-prior" };
 }
 
 function schemaCutoverEvidence(doctor, migrationId, projectId, prior, candidate, liveSchema = prior) {
@@ -234,13 +466,7 @@ function classifyBindings({ manifest, sourceRoot, artifactRoot, installed, sourc
 }
 
 function expectedAppHash(binding) {
-  const paths = ["dist/app.js", "dist/app.css", "dist/app.meta.json"];
-  const files = new Map(binding.expectedFiles.map((file) => [file.path, file]));
-  if (!files.has("dist/app.js")) return null;
-  const hash = createHash("sha256").update(readFileSync(join(binding.resolvedRoot, "dist/app.js")));
-  if (files.has("dist/app.css")) hash.update(readFileSync(join(binding.resolvedRoot, "dist/app.css")));
-  hash.update(readFileSync(join(binding.resolvedRoot, "dist/app.meta.json")));
-  return hash.digest("hex").slice(0, 16);
+  return appHash(binding.resolvedRoot);
 }
 
 function proveLoaded(bindings, installed, sources, residents) {
@@ -250,9 +476,9 @@ function proveLoaded(bindings, installed, sources, residents) {
     const currentSource = sources.get(binding.pluginId);
     if (!current || current.status !== "running" || current.services?.some(({ state }) => state !== "running")) throw new Error(`plugin health failed: ${binding.pluginId}`);
     const expectsApp = binding.frontendArtifacts.some((path) => path.endsWith("/app.js"));
-    if (realpathSync(current.rootDir) !== realpathSync(binding.resolvedRoot)) throw new Error(`loaded generation is not bound to candidate: ${binding.pluginId}`);
+    if (resolve(current.rootDir) !== resolve(binding.registeredRoot) || realpathSync(current.rootDir) !== realpathSync(binding.resolvedRoot)) throw new Error(`loaded generation is not bound to candidate: ${binding.pluginId}`);
     if (Boolean(current.app?.hasApp) !== expectsApp || (expectsApp && (current.app?.bundle?.compatible !== true || current.app.bundle.hash !== expectedAppHash(binding)))) throw new Error(`resident frontend generation mismatch: ${binding.pluginId}`);
-    if (binding.sourceKind === "path" && (currentSource.requested !== `path:${binding.resolvedRoot}` || currentSource.resolved !== `path:${binding.resolvedRoot}`)) throw new Error(`registered root remains on prior release: ${binding.pluginId}`);
+    if (canonicalJson(currentSource) !== canonicalJson(binding.priorSource)) throw new Error(`registered source changed during activation: ${binding.pluginId}`);
     const packageManifest = JSON.parse(readFileSync(join(current.rootDir, "package.json"), "utf8"));
     const actualServer = packageManifest.bb?.server ? realpathSync(join(current.rootDir, packageManifest.bb.server)) : null;
     if (actualServer !== binding.serverEntry || actualServer?.endsWith("server.ts")) throw new Error(`server entry is not candidate dist/server.js: ${binding.pluginId}`);
@@ -266,14 +492,8 @@ function proveLoaded(bindings, installed, sources, residents) {
   }
 }
 
-function proveRollback(changes, installed, sources) {
-  const installedById = new Map(installed.map((entry) => [entry.id, entry]));
-  for (const { binding } of changes) {
-    const current = installedById.get(binding.pluginId);
-    const currentSource = sources.get(binding.pluginId);
-    if (!current || current.status !== binding.priorStatus.status || realpathSync(current.rootDir) !== binding.priorRoot) throw new Error(`prior loaded generation was not restored: ${binding.pluginId}`);
-    if (binding.sourceKind === "path" && (currentSource.requested !== binding.priorSource.requested || currentSource.resolved !== binding.priorSource.resolved)) throw new Error(`prior registration was not restored: ${binding.pluginId}`);
-  }
+function proveRollback(changes, adapter, receiptPath, priorReceiptBytes) {
+  for (const { binding } of changes) assertExactPrior(observeChange(binding, adapter, receiptPath), binding, priorReceiptBytes);
 }
 
 function verifyActiveReceipt({ stateDirectory, adapter }) {
@@ -306,11 +526,14 @@ async function activateRelease(options) {
   const transactionId = `${Date.now()}-${process.pid}`;
   const changed = [];
   let ownsPending = false;
+  let pending = null;
   try {
     const manifest = verifyRelease(releaseDirectory, join(releaseDirectory, "release-manifest.json"), sourceRoot);
     if (manifest.loadAuthority !== "inactive") throw new Error("activation requires an inactive v2 release candidate");
     const hostStatus = initialHostStatus;
     if (hostStatus.project?.id !== projectId && hostStatus.projectId !== projectId) throw new Error("activation project does not match the current BB project");
+    const hostVersion = adapter.version();
+    if (hostVersion !== manifest.toolchain.bbVersion) throw new Error(`activation BB version ${hostVersion} does not match pinned ${manifest.toolchain.bbVersion}`);
     const artifactRoot = await stageRelease({ releaseDirectory, sourceRoot, stateDirectory, manifest });
     const candidateSchema = await candidateSchemaFingerprint(artifactRoot);
     verifyRuntimeClosure(artifactRoot, manifest, true);
@@ -330,25 +553,29 @@ async function activateRelease(options) {
     const ids = manifest.artifactRoots.map((distRoot) => pluginId(sourceManifest(sourceRoot, dirname(distRoot) === "." ? "." : dirname(distRoot)).name));
     if (new Set(ids).size !== ids.length) throw new Error("release artifact roots do not map to unique installed plugin ids");
     const sources = new Map(ids.map((id) => [id, adapter.source(id)]));
-    const bindings = classifyBindings({ manifest, sourceRoot, artifactRoot, installed, sources });
+    const bindings = prepareBindings({
+      bindings: classifyBindings({ manifest, sourceRoot, artifactRoot, installed, sources }), adapter, manifest, priorReceipt,
+      stateDirectory, dataDir: hostStatus.dataDir ?? stateDirectory, transactionId,
+    });
     for (const binding of bindings) verifyBindingFiles(binding);
-    const pending = {
+    pending = {
       version: RECEIPT_VERSION, state: "activating", transactionId, projectId, sourceCommit: manifest.sourceCommit,
       releaseDigest: manifest.releaseDigest, artifactRoot, schemaFingerprint: candidateSchema, priorSchemaFingerprint: priorSchema,
+      stagingContractVersion: STAGING_CONTRACT_VERSION, sourceEpochMs: SOURCE_EPOCH_MS, appEpochMs: APP_EPOCH_MS,
       schemaEvidenceDigest, previousReceiptDigest: priorReceipt.bytes ? sha256(priorReceipt.bytes) : null,
-      bindings: bindings.map(({ priorStatus, ...binding }) => ({ ...binding, priorStatus: { rootDir: priorStatus.rootDir, status: priorStatus.status, services: priorStatus.services } })),
+      bindings: bindings.map(({ priorStatus, ...binding }) => ({ ...binding, priorStatus: { rootDir: priorStatus.rootDir, status: priorStatus.status, services: priorStatus.services, app: priorStatus.app } })),
     };
     atomicWrite(pendingPath, pending);
     ownsPending = true;
     for (const binding of bindings) {
       const currentSource = adapter.source(binding.pluginId);
       const current = adapter.list().find(({ id }) => id === binding.pluginId);
-      if (canonicalJson(currentSource) !== canonicalJson(binding.priorSource) || !current || realpathSync(current.rootDir) !== binding.priorRoot) throw new Error(`activation fence moved before binding: ${binding.pluginId}`);
+      if (canonicalJson(currentSource) !== canonicalJson(binding.priorSource) || !current || resolve(current.rootDir) !== binding.registeredRoot || realpathSync(current.rootDir) !== binding.priorRoot) throw new Error(`activation fence moved before binding: ${binding.pluginId}`);
       if (schemaCutover && schemaCutoverEvidence(adapter.doctor(), options.schemaCutoverId, projectId, priorSchema, candidateSchema).fence !== schemaCutover.fence) throw new Error("schema-cutover fence moved before binding");
-      const change = { binding, result: null };
-      if (binding.sourceKind === "path") changed.push(change);
-      change.result = adapter.bind(binding, transactionId);
-      if (binding.sourceKind !== "path") changed.push(change);
+      const change = { binding };
+      changed.push(change);
+      applyOverlay(binding.plan, adapter);
+      adapter.reload(binding);
     }
     await adapter.settle();
     const afterSources = new Map(ids.map((id) => [id, adapter.source(id)]));
@@ -365,16 +592,16 @@ async function activateRelease(options) {
     const rollbackErrors = [];
     const rollbackOrder = [...changed].reverse();
     for (const change of rollbackOrder) {
-      try { adapter.rollback(change.binding, change.result); } catch (rollbackError) { rollbackErrors.push(`${change.binding.pluginId}: ${rollbackError.message}`); }
+      try { recoverChange(change.binding, adapter, receiptPath, priorReceipt.bytes); } catch (rollbackError) { rollbackErrors.push(`${change.binding.pluginId}: ${rollbackError.message}`); }
     }
     if (changed.length && rollbackErrors.length === 0) {
-      try {
-        const ids = changed.map(({ binding }) => binding.pluginId);
-        proveRollback(changed, adapter.list(), new Map(ids.map((id) => [id, adapter.source(id)])));
-      } catch (rollbackError) { rollbackErrors.push(rollbackError.message); }
+      try { proveRollback(changed, adapter, receiptPath, priorReceipt.bytes); } catch (rollbackError) { rollbackErrors.push(rollbackError.message); }
+    }
+    if (rollbackErrors.length) {
+      if (ownsPending) atomicWrite(pendingPath, { ...pending, state: "rollback_failed", failedAt: Date.now(), activationError: error.message, rollbackErrors });
+      throw new Error(`${error.message}; rollback failed: ${rollbackErrors.join("; ")}`);
     }
     if (ownsPending) rmSync(pendingPath, { force: true });
-    if (rollbackErrors.length) throw new Error(`${error.message}; rollback failed: ${rollbackErrors.join("; ")}`);
     throw error;
   } finally {
     if (lock !== undefined) closeSync(lock);
@@ -397,4 +624,4 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.
   activateRelease(parseArgs(process.argv.slice(2))).then((result) => console.log(canonicalJson(result))).catch((error) => { console.error(error.message); process.exitCode = 1; });
 }
 
-export { activateRelease, classifyBindings, defaultStateDirectory, proveLoaded, proveRollback, verifyActiveReceipt };
+export { activateRelease, assertNonOverlappingRoots, classifyBindings, defaultStateDirectory, proveLoaded, proveRollback, systemAdapter, verifyActiveReceipt };
