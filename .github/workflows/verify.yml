@@ -21,19 +21,38 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - name: Set up Node.js 22
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Set up pinned Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
+          node-version: 22.23.1
           cache: npm
       - name: Install dependencies
         run: npm ci
       - name: Run verification
-        run: npm exec --yes --package=bb-app@0.39.0 -- npm run verify
-      - name: Check committed dist freshness
-        run: npm exec --yes --package=bb-app@0.39.0 -- node scripts/check-dist.mjs
+        run: npm run verify
+      - name: Require clean source verification
+        shell: bash
+        run: |
+          test -z "$(git ls-files 'dist/**' 'plugins/*/dist/**')"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - name: Reproduce release digest
+        shell: bash
+        run: |
+          cp release/release-manifest.json "$RUNNER_TEMP/release-manifest.json"
+          npm run release
+          cmp "$RUNNER_TEMP/release-manifest.json" release/release-manifest.json
+          node scripts/check-dist.mjs --release release
       - name: Check BB plugin types
         run: npm exec --yes --package=bb-app@0.39.0 -- bb plugin types --check
+      - name: Upload exact-head release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bb-collab-release-${{ github.event.pull_request.head.sha || github.sha }}
+          path: release/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
       - name: Check pull-request review tier
         if: github.event_name == 'pull_request'
         env:

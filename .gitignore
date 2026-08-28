@@ -1,11 +1,5 @@
 node_modules/
 dist/
-!dist/
-dist/*
-!dist/server.js
-!dist/server.meta.json
-!dist/app.js
-!dist/app.css
-!dist/app.meta.json
-/plugins/**/dist/*.map
+release/
+.bb-collab-release.json
 npm-debug.log*

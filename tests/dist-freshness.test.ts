@@ -1,137 +1,72 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { canonicalJson, manifestFor, verifyRelease } from "../scripts/release-artifact.mjs";
 
-const script = join(process.cwd(), "scripts/check-dist.mjs");
+const script = join(process.cwd(), "scripts/release-artifact.mjs");
 
-describe("dist freshness gate", () => {
-  it("makes verify reject a divergent committed bundle", () => {
-    const root = mkdtempSync(join(tmpdir(), "bb-collab-verify-dist-"));
+function fixture() {
+  const root = mkdtempSync(join(tmpdir(), "bb-collab-release-"));
+  mkdirSync(join(root, "dist"));
+  writeFileSync(join(root, "package.json"), JSON.stringify({ scripts: { build: "node -e 0" } }));
+  writeFileSync(join(root, "dist/server.js"), "release bytes\n");
+  execFileSync("git", ["init", "--quiet"], { cwd: root });
+  execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
+  execFileSync("git", ["config", "user.name", "Test"], { cwd: root });
+  execFileSync("git", ["add", "."], { cwd: root });
+  execFileSync("git", ["commit", "--quiet", "-m", "fixture"], { cwd: root });
+  const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
+  const manifest = manifestFor(root, commit);
+  const manifestPath = join(root, "release-manifest.json");
+  writeFileSync(manifestPath, `${canonicalJson(manifest)}\n`);
+  return { root, manifestPath };
+}
+
+describe("release artifact gate", () => {
+  it("keeps generated output outside source authority", () => {
+    const tracked = execFileSync("git", ["ls-files", "dist/**", "plugins/*/dist/**"], { encoding: "utf8" });
+    expect(tracked).toBe("");
+    expect(JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")).scripts.verify).not.toContain("check-dist.mjs");
+  });
+
+  it("refuses an ambient release toolchain", () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-ambient-bb-"));
     try {
-      mkdirSync(join(root, "dist"));
-      mkdirSync(join(root, "scripts"));
-      writeFileSync(join(root, "dist/app.js"), "committed\n");
-      writeFileSync(join(root, "scripts/check-css-bundle.mjs"), "");
-      writeFileSync(join(root, "scripts/role-brief-bundle.mjs"), "");
-      copyFileSync(script, join(root, "scripts/check-dist.mjs"));
-      const { verify } = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")).scripts;
-      writeFileSync(join(root, "package.json"), JSON.stringify({ scripts: { typecheck: "node -e 0", test: "node -e 0", build: "node -e 0", verify } }));
-      execFileSync("git", ["init", "--quiet"], { cwd: root });
-      execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
-      execFileSync("git", ["config", "user.name", "Test"], { cwd: root });
-      execFileSync("git", ["add", "."], { cwd: root });
-      execFileSync("git", ["commit", "--quiet", "-m", "fixture"], { cwd: root });
-
-      writeFileSync(join(root, "dist/app.js"), "divergent\n");
-      const result = spawnSync("npm", ["run", "verify"], { cwd: root, encoding: "utf8" });
+      const bb = join(bin, "bb");
+      writeFileSync(bb, "#!/bin/sh\necho 0.40.0\n");
+      chmodSync(bb, 0o755);
+      const result = spawnSync(process.execPath, [script, "build"], {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: { ...process.env, BB_COLLAB_RELEASE_PINNED: "1", PATH: `${bin}:${process.env.PATH ?? ""}` },
+      });
       expect(result.status).toBe(1);
-      expect(result.stderr).toContain("working tree dist/ differs from commit");
-      expect(result.stderr).toContain("dist/app.js");
+      expect(result.stderr).toContain("release build requires Node v22.23.1 and bb 0.39.0");
+    } finally {
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts matching bytes and rejects a stale artifact independently", () => {
+    const { root, manifestPath } = fixture();
+    try {
+      expect(verifyRelease(root, manifestPath, root).releaseDigest).toMatch(/^[0-9a-f]{64}$/u);
+      writeFileSync(join(root, "dist/server.js"), "stale bytes\n");
+      expect(() => verifyRelease(root, manifestPath, root)).toThrow("release artifact digest mismatch: dist/server.js");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  it("does not ignore a force-tracked source map", () => {
-    const root = mkdtempSync(join(tmpdir(), "bb-collab-dist-map-"));
+  it("rejects a release manifest from another source commit", () => {
+    const { root, manifestPath } = fixture();
     try {
-      mkdirSync(join(root, "dist"));
-      writeFileSync(join(root, "dist/server.js.map"), "map\n");
-      writeFileSync(join(root, ".gitignore"), "dist/*\n");
-      execFileSync("git", ["init", "--quiet"], { cwd: root });
-      execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
-      execFileSync("git", ["config", "user.name", "Test"], { cwd: root });
-      execFileSync("git", ["add", ".gitignore"], { cwd: root });
-      execFileSync("git", ["commit", "--quiet", "-m", "fixture"], { cwd: root });
-      execFileSync("git", ["add", "-f", "dist/server.js.map"], { cwd: root });
-      writeFileSync(join(root, "dist/server.js.map"), "changed map\n");
-      const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain("dist/server.js.map");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("rejects a committed source-only change when a nested bundle is not rebuilt", () => {
-    const root = mkdtempSync(join(tmpdir(), "bb-collab-nested-dist-"));
-    const packageRoot = join(root, "packages", "nested");
-    try {
-      mkdirSync(join(packageRoot, "src"), { recursive: true });
-      mkdirSync(join(packageRoot, "dist"));
-      writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ scripts: { build: "node build.mjs" } }));
-      writeFileSync(join(packageRoot, "build.mjs"), [
-        'import { readFileSync, writeFileSync } from "node:fs";',
-        'const source = readFileSync("src/message.txt", "utf8");',
-        'writeFileSync("dist/bundle.js", `export default ${JSON.stringify(source)};\\n`);',
-        "",
-      ].join("\n"));
-      writeFileSync(join(packageRoot, "src/message.txt"), "first\n");
-      execFileSync("npm", ["run", "build", "--silent"], { cwd: packageRoot });
-      execFileSync("git", ["init", "--quiet"], { cwd: root });
-      execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
-      execFileSync("git", ["config", "user.name", "Test"], { cwd: root });
-      execFileSync("git", ["add", "."], { cwd: root });
-      execFileSync("git", ["commit", "--quiet", "-m", "fixture"], { cwd: root });
-
-      writeFileSync(join(packageRoot, "src/message.txt"), "second\n");
-      execFileSync("git", ["add", "packages/nested/src/message.txt"], { cwd: root });
-      execFileSync("git", ["commit", "--quiet", "-m", "source-only change"], { cwd: root });
-
-      const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain("packages/nested/dist/bundle.js");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("passes an honest artifact and names a hand-edited artifact when it fails", () => {
-    const root = mkdtempSync(join(tmpdir(), "bb-collab-dist-freshness-"));
-    try {
-      mkdirSync(join(root, "dist"));
-      writeFileSync(join(root, "dist/server.js"), "honest\n");
-      execFileSync("git", ["init", "--quiet"], { cwd: root });
-      execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
-      execFileSync("git", ["config", "user.name", "Test"], { cwd: root });
-      execFileSync("git", ["add", "dist/server.js"], { cwd: root });
-      execFileSync("git", ["commit", "--quiet", "-m", "fixture"], { cwd: root });
-      const sourceRoot = join(root, "source-checkout");
-      mkdirSync(sourceRoot);
-
-      const honest = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
-      expect(honest.status).toBe(0);
-      expect(honest.stdout).toContain("working tree dist/ matches commit");
-
-      const deployedHonest = spawnSync(process.execPath, [script, "--deployed"], { cwd: root, encoding: "utf8" });
-      expect(deployedHonest.status).toBe(0);
-      expect(deployedHonest.stdout).toBe("");
-      expect(deployedHonest.stderr).toBe("");
-
-      writeFileSync(join(root, "dist/server.js"), "hand edited\n");
-      const stale = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
-      expect(stale.status).toBe(1);
-      expect(stale.stderr).toContain("dist/server.js");
-
-      execFileSync("git", ["add", "dist/server.js"], { cwd: root });
-      const deployedStale = spawnSync(process.execPath, [script, "--deployed"], { cwd: root, encoding: "utf8" });
-      expect(deployedStale.status).toBe(1);
-      expect(deployedStale.stderr).toContain("deployed working tree dist/");
-      expect(deployedStale.stderr).toContain("dist/server.js");
-
-      const cleanRoot = join(root, "clean-checkout");
-      mkdirSync(join(cleanRoot, "dist"), { recursive: true });
-      writeFileSync(join(cleanRoot, "dist/server.js"), "clean\n");
-      execFileSync("git", ["init", "--quiet"], { cwd: cleanRoot });
-      execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: cleanRoot });
-      execFileSync("git", ["config", "user.name", "Test"], { cwd: cleanRoot });
-      execFileSync("git", ["add", "."], { cwd: cleanRoot });
-      execFileSync("git", ["commit", "--quiet", "-m", "clean"], { cwd: cleanRoot });
-      const redirected = spawnSync(process.execPath, [script, "--deployed"], { cwd: root, encoding: "utf8", env: { ...process.env, BB_COLLAB_DEPLOYED_ROOT: cleanRoot } });
-      expect(redirected.status).toBe(1);
-      expect(redirected.stderr).toContain("deployed working tree dist/");
+      writeFileSync(join(root, "source.txt"), "new source\n");
+      execFileSync("git", ["add", "source.txt"], { cwd: root });
+      execFileSync("git", ["commit", "--quiet", "-m", "move source"], { cwd: root });
+      expect(() => verifyRelease(root, manifestPath, root)).toThrow(/does not match deployed commit/u);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

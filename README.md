@@ -4,15 +4,13 @@ BB-native project governance, work lifecycle, and collaboration runtime.
 
 ## Deployed artifact check
 
-The recurring `fleet-watchdog` schedule runs
-`npm run --silent check:deployed-dist`'s underlying read-only check every five
-minutes while the plugin is loaded. You can also run
-`npm run --silent check:deployed-dist` from any checkout. It resolves the
-installed `bb-collab` path through bb and refuses an absent or non-path source.
-It is silent when tracked `dist/` there matches the deployed commit; otherwise
-it exits nonzero and names every divergent artifact against the deployed
-commit. The scheduled check reports divergence;
-it never rebuilds, repairs, or commits the deployed checkout.
+The recurring `fleet-watchdog` schedule runs the read-only
+`npm run --silent check:deployed-dist` every five minutes while the plugin is
+loaded. It requires the installed release manifest to name the checkout's exact
+commit and refuses any missing, extra, or digest-mismatched generated file. The
+scheduled check reports divergence; it never rebuilds or repairs the deployed
+checkout. Generated `dist/` is ignored source output, not committed review
+authority.
 
 ## Deploy sequence
 
@@ -22,11 +20,17 @@ burst. Immediately after a lane finishes, run its terminal WorkItem transition;
 otherwise a completed lane is indistinguishable from a silent one and coverage
 goes blind for the wrong reason.
 
-Run this sequence from the deploy checkout:
+Resolve and download the unique successful push artifact before changing the
+deploy checkout, then install it only after the checkout reaches that commit:
 
 ```sh
+git fetch origin main
+EXPECTED_HEAD="$(git rev-parse origin/main)"
+RUN_ID="$(gh run list --commit "$EXPECTED_HEAD" --workflow Verify --event push --status success --json databaseId --jq 'if length == 1 then .[0].databaseId else error("expected one successful push run") end')"
+RELEASE_DIR="$(mktemp -d)"
+gh run download "$RUN_ID" --name "bb-collab-release-$EXPECTED_HEAD" --dir "$RELEASE_DIR"
 git merge --ff-only origin/main
-find dist -type f -exec touch {} +
+node scripts/release-artifact.mjs install "$RELEASE_DIR"
 node scripts/check-dist.mjs --deployed
 bb plugin reload bb-collab
 bb plugin list
@@ -36,19 +40,14 @@ node scripts/check-dist.mjs --deployed
 # Run the change's live acceptance query against SQLite with ?mode=ro.
 ```
 
-The fast-forward merge binds the deploy to the current integrated main and
-refuses accidental local history. The first `check-dist` proves the deployed
-checkout before the host can load it; reload then makes that checked artifact
-the running revision. Doctor checks the live project's store conformance before
-acceptance, and the final query is the change's own live proof rather than a
-green build standing in for it.
-
-Touch `dist` after the merge so the deployed artifacts are newer than the
-sources before the pre-load check. The BB host rebuilds `dist/app.js` and
-`dist/app.css` during plugin load when a source is newer; without this margin,
-the load can write build-location paths into the deployed artifact and the
-next deploy fails its check. Equal mtimes currently pass because the gate is
-“exceeds”; the real margin avoids that boundary condition.
+The successful exact-head workflow run is release provenance; its manifest
+records the reproducible digest and the install command consumes and rechecks
+those exact bytes. The fast-forward merge binds deployment to integrated main,
+and install refuses a manifest for any other commit before replacing `dist/`.
+Installing after the merge also makes generated files newer than source before
+the host can consider a fallback rebuild. Doctor checks live store conformance;
+the final query remains the change's own live proof rather than a green build
+standing in for it.
 
 `reload-exit=0` is only the loader's verdict. `bb plugin list` is required
 because a reload once left the old lane-watcher resident with a closed database

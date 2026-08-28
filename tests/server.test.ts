@@ -5237,8 +5237,9 @@ else printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue:startable"}]}]]'; 
     expect(source).toMatch(/execFile\(process\.execPath, \[join\(root, "scripts", "check-dist\.mjs"\)/u);
     expect(source).not.toMatch(/spawnSync\(process\.execPath, \[join\(root, "scripts", "check-dist\.mjs"\)/u);
     expect(source).toContain("cwd: root");
-    expect(script).toContain("return process.cwd();");
-    expect(script).not.toContain("BB_COLLAB_DEPLOYED_ROOT");
+    expect(script).toContain("const root = process.cwd();");
+    expect(script).toContain(".bb-collab-release.json");
+    expect(script).not.toContain("git");
   });
 
   it("keeps every composite key distinct for legal identifier content", () => {
