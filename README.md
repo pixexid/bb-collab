@@ -2,17 +2,17 @@
 
 BB-native project governance, work lifecycle, and collaboration runtime.
 
-## Deployed artifact check
+## Inactive release candidate
 
-The recurring `fleet-watchdog` schedule runs
-`npm run --silent check:deployed-dist`'s underlying read-only check every five
-minutes while the plugin is loaded. You can also run
-`npm run --silent check:deployed-dist` from any checkout. It resolves the
-installed `bb-collab` path through bb and refuses an absent or non-path source.
-It is silent when tracked `dist/` there matches the deployed commit; otherwise
-it exits nonzero and names every divergent artifact against the deployed
-commit. The scheduled check reports divergence;
-it never rebuilds, repairs, or commits the deployed checkout.
+CI builds generated bundles with the pinned toolchain and publishes one
+exact-head release manifest and digest. The v2 manifest is a closed-world
+candidate inventory with `loadAuthority: "inactive"`; generated `dist/` remains
+ignored output and is not committed source-review authority.
+
+`npm run --silent check:deployed-dist` intentionally refuses with `release
+candidate is inactive: loaded-authority activation is owned by #423`. Do not
+install, rebind, reload, or deploy this candidate. #423 owns the future
+loaded-authority activation and production procedure.
 
 ## Deploy sequence
 
@@ -22,33 +22,8 @@ burst. Immediately after a lane finishes, run its terminal WorkItem transition;
 otherwise a completed lane is indistinguishable from a silent one and coverage
 goes blind for the wrong reason.
 
-Run this sequence from the deploy checkout:
-
-```sh
-git merge --ff-only origin/main
-find dist -type f -exec touch {} +
-node scripts/check-dist.mjs --deployed
-bb plugin reload bb-collab
-bb plugin list
-bb collab doctor --project <id>
-# Wait more than 15 seconds.
-node scripts/check-dist.mjs --deployed
-# Run the change's live acceptance query against SQLite with ?mode=ro.
-```
-
-The fast-forward merge binds the deploy to the current integrated main and
-refuses accidental local history. The first `check-dist` proves the deployed
-checkout before the host can load it; reload then makes that checked artifact
-the running revision. Doctor checks the live project's store conformance before
-acceptance, and the final query is the change's own live proof rather than a
-green build standing in for it.
-
-Touch `dist` after the merge so the deployed artifacts are newer than the
-sources before the pre-load check. The BB host rebuilds `dist/app.js` and
-`dist/app.css` during plugin load when a source is newer; without this margin,
-the load can write build-location paths into the deployed artifact and the
-next deploy fails its check. Equal mtimes currently pass because the gate is
-“exceeds”; the real margin avoids that boundary condition.
+The #716 release candidate is not a deploy input. Existing production handling
+continues unchanged until #423 activates a verified loaded-artifact contract.
 
 `reload-exit=0` is only the loader's verdict. `bb plugin list` is required
 because a reload once left the old lane-watcher resident with a closed database

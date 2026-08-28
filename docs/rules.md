@@ -98,7 +98,7 @@ The bound is the intended delivery path, not the word "operator": a direct reply
 
 ## Lifecycle disposition
 
-> Every pull request carries exactly one disposition line: `Closes #NN` plus `Acceptance: complete`, or `Related GH-NN` naming an OPEN issue, or `No issue:` followed by a reason. Run both canonical body gates before pushing: `scripts/pr-lifecycle.mjs` and `scripts/check-review-tier.mjs` (exactly one line matching its `Review tier` pattern). Tier A is forced by any path matched by that script's `tierA` patterns; Tier C applies only when no Tier-A path matches and every path matches `tierC`. Because `dist/` is Tier A, a docs-only `docs/rules.md` edit that regenerates `dist/role-briefs.json` requires Tier A.
+> Every pull request carries exactly one disposition line: `Closes #NN` plus `Acceptance: complete`, or `Related GH-NN` naming an OPEN issue, or `No issue:` followed by a reason. Run both canonical body gates before pushing: `scripts/pr-lifecycle.mjs` and `scripts/check-review-tier.mjs` (exactly one line matching its `Review tier` pattern). Tier A is forced by any path matched by that script's `tierA` patterns; Tier C applies only when no Tier-A path matches and every path matches `tierC`. Generated `dist/` is ignored release output and does not participate in source tier derivation. Changes to build, manifest, deployment-consumption, or release-policy seams remain Tier A.
 
 Commit messages carry no linkage at all unless the PR closes an issue and the commit names that same issue with a closing keyword; any other commit-side mention fails the gate even when the body is correct.
 
@@ -127,6 +127,8 @@ Inside the stated subject means inside what the ruling actually addressed, not a
 > A change is not live until a deployed revision CONTAINING it is what host supervision is running. Merged, deployed, and loaded are three states; reporting the first as the third is the most comfortable error available.
 
 The check is per-change: name the deployed revision, establish containment and supervision — equality with `main` is not the test. "Merged, not deployed" is a complete and honest terminal status. Deploys run under the standing policy: orchestrator-run under standing authorization, zero-lane lull, store snapshot before, store-verified after, deployed SHA recorded in the handoff. Path plugins update via checkout-advance plus `bb plugin reload <id>`; `bb plugin update` refuses pinned sources.
+
+Generated bundles are release artifacts, not committed source-review authority. CI builds an exact-head candidate with the pinned toolchain and publishes its manifest and digest; source verification may generate ignored output but stays clean. The candidate is explicitly inactive: do not install, rebind, reload, or deploy it until #423 supplies and proves loaded-authority activation. A Git comparison of generated files is neither release provenance nor a deployment gate.
 
 The deploy policy splits by surface. Canonical/store/fleet-state plugins retain
 the zero-lane lull, pre-deploy snapshot, and post-deploy store verification.

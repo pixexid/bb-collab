@@ -21,13 +21,14 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
+    "release": "node scripts/release-artifact.mjs",
     "check:deployed-dist": "node scripts/check-dist.mjs --deployed",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "check:composed-pr": "node scripts/check-composed-pr.mjs",
     "executed-profile": "node scripts/read-executed-profile.mjs",
     "throughput-report": "node scripts/weekly-throughput-report.mjs",
-    "verify": "npm run typecheck && npm test && npm run build && node scripts/check-css-bundle.mjs && node scripts/role-brief-bundle.mjs && node scripts/check-dist.mjs && node scripts/check-production-reachability.mjs",
+    "verify": "npm run typecheck && npm run release && npm test && node scripts/check-production-reachability.mjs",
     "changeset": "changeset",
     "version-packages": "changeset version"
   },

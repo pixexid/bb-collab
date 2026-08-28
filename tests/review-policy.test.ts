@@ -32,11 +32,14 @@ describe("pull-request review tier policy", () => {
     expect(tierB.status).toBe(0);
     expect(tierB.stderr).not.toContain("Review finding");
     expect(tierB.stdout).toContain("post-merge in parallel");
-    for (const file of ["src/foundation.ts", "server.ts", "app.tsx", "dist/server.js", "plugins/example/dist/server.js", "scripts/build.mjs"]) {
+    for (const file of ["src/foundation.ts", "server.ts", "app.tsx", "scripts/build.mjs"]) {
       const tierA = check("Review tier: A", [file]);
       expect(tierA.status, file).toBe(0);
       expect(tierA.stderr, file).not.toContain("Review finding");
       expect(tierA.stdout, file).toContain("before merge");
+    }
+    for (const file of ["dist/server.js", "plugins/example/dist/server.js"]) {
+      expect(check("Review tier: C", [file]).status, file).toBe(0);
     }
   });
 
@@ -59,6 +62,8 @@ describe("pull-request review tier policy", () => {
       "scripts/read-executed-profile.mjs",
       "scripts/review-verdict-acceptance.mjs",
       "scripts/check-css-bundle.mjs",
+      "scripts/release-artifact.mjs",
+      "scripts/release-artifact.d.mts",
       "package.json",
     ]) {
       expect(check("Review tier: A", [file]).status, `${file} Tier A`).toBe(0);
