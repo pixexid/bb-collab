@@ -6860,6 +6860,92 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
   });
 
+  it("refuses a worker permission above the host-resolved provider ceiling before durable preparation or native spawn", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    const before = exportFoundation(fixture.db, PROJECT_ID);
+    const provider = {
+      id: ROLE_PROFILE.providerId,
+      displayName: "Codex",
+      available: true,
+      logoUrl: null,
+      composerActions: [],
+      capabilities: {
+        permissionModes: ["full", "auto"], supportsFork: true, supportsNativeUserQuestion: false,
+        supportsServiceTier: false, supportsSessionRewind: false, supportsThreadArchive: true, supportsThreadRename: true,
+      },
+    };
+    fixture.host.harness.sdk.stub("providers.list", (async () => [provider]) as never);
+    fixture.host.harness.sdk.stub("providers.models", (async () => ({
+      modelLoadError: null,
+      models: [{
+        id: ROLE_PROFILE.model,
+        model: ROLE_PROFILE.model,
+        displayName: "Luna",
+        description: "fixture",
+        isDefault: true,
+        defaultReasoningEffort: ROLE_PROFILE.reasoningLevel,
+        supportedReasoningEfforts: [{ reasoningEffort: ROLE_PROFILE.reasoningLevel, description: "fixture" }],
+      }],
+      selectedOnlyModels: [],
+      permissionCeiling: "auto",
+      providers: [provider],
+    })) as never);
+    let spawnCalls = 0;
+    fixture.host.harness.sdk.stub("threads.spawn", (async () => { spawnCalls += 1; throw new Error("permission ceiling refusal must precede spawn"); }) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+      spawn: dispatchSpawn(fixture.orchestratorThreadId),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result).toMatchObject({
+      outcome: "INVALID_INPUT",
+      attempted: 0,
+      verified: 0,
+      message: "requested permission mode exceeds the host provider permission ceiling",
+    });
+    expect(spawnCalls).toBe(0);
+    expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("accepts a worker permission at the host-resolved provider ceiling", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    const profile = { ...ROLE_PROFILE, permissionMode: "auto" as const };
+    const provider = {
+      id: ROLE_PROFILE.providerId,
+      displayName: "Codex",
+      available: true,
+      logoUrl: null,
+      composerActions: [],
+      capabilities: {
+        permissionModes: ["full", "auto"], supportsFork: true, supportsNativeUserQuestion: false,
+        supportsServiceTier: false, supportsSessionRewind: false, supportsThreadArchive: true, supportsThreadRename: true,
+      },
+    };
+    fixture.host.harness.sdk.stub("providers.list", (async () => [provider]) as never);
+    fixture.host.harness.sdk.stub("providers.models", (async () => ({
+      modelLoadError: null,
+      models: [{
+        id: ROLE_PROFILE.model,
+        model: ROLE_PROFILE.model,
+        displayName: "Luna",
+        description: "fixture",
+        isDefault: true,
+        defaultReasoningEffort: ROLE_PROFILE.reasoningLevel,
+        supportedReasoningEfforts: [{ reasoningEffort: ROLE_PROFILE.reasoningLevel, description: "fixture" }],
+      }],
+      selectedOnlyModels: [],
+      permissionCeiling: "auto",
+      providers: [provider],
+    })) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2, {
+        workAttempt: { laneId: "ceiling-equal", threadId: undefined, assignmentKind: "write", requestedProfile: profile },
+      }),
+      spawn: dispatchSpawn(fixture.orchestratorThreadId, profile),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result).toMatchObject({ outcome: "OK" });
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item' ORDER BY rowid DESC LIMIT 1").get()).toEqual({ state: "running" });
+  });
+
   it.each([
     ["hidden route", { visibility: "hidden" }, "INVALID_INPUT", "requested provider route must be visible"],
     ["missing model", { model: "missing-model" }, "INVALID_INPUT", "requested model is unavailable on the exact target host"],
