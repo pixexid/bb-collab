@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { builtinModules, createRequire } from "node:module";
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -83,8 +84,116 @@ function filesBelow(directory, base = directory) {
   if (!existsSync(directory)) return [];
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
     const path = join(directory, entry.name);
-    return entry.isDirectory() ? filesBelow(path, base) : [relative(base, path).split(sep).join("/")];
+    if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) throw new Error(`release closure contains a mutable or unsupported entry: ${slash(relative(base, path))}`);
+    return entry.isDirectory() ? filesBelow(path, base) : [slash(relative(base, path))];
   });
+}
+
+const slash = (value) => value.split(sep).join("/");
+const builtins = new Set([...builtinModules, ...builtinModules.map((name) => `node:${name}`)]);
+
+function importSpecifiers(path) {
+  if (!/\.(?:c|m)?js$/u.test(path)) return [];
+  const source = readFileSync(path, "utf8");
+  const specifiers = [];
+  const patterns = [
+    /\b(?:import|export)\s+(?:[^"']*?\s+from\s+)?["']([^"']+)["']/gu,
+    /\b(?:import|require)\s*\(\s*["']([^"']+)["']\s*\)/gu,
+  ];
+  for (const pattern of patterns) for (const match of source.matchAll(pattern)) specifiers.push(match[1]);
+  return [...new Set(specifiers)].filter((specifier) => !builtins.has(specifier)).sort();
+}
+
+function packageManifest(path, closureRoot) {
+  for (let directory = dirname(path); directory.startsWith(`${closureRoot}${sep}`); directory = dirname(directory)) {
+    const manifest = join(directory, "package.json");
+    if (existsSync(manifest)) return manifest;
+  }
+  throw new Error(`runtime closure file has no candidate-owned package manifest: ${slash(relative(closureRoot, path))}`);
+}
+
+function runtimeEntries(directory, artifactRoots) {
+  return artifactRoots.flatMap((artifactRoot) => {
+    const entry = join(directory, artifactRoot, "server.js");
+    return existsSync(entry) ? [{ entry: `${artifactRoot}/server.js`, specifiers: importSpecifiers(entry).filter((specifier) => !specifier.startsWith(".")) }] : [];
+  });
+}
+
+function requiredClosureFiles(directory, artifactRoots) {
+  const directoryRoot = realpathSync(directory);
+  const closurePath = join(directoryRoot, "node_modules");
+  if (existsSync(closurePath) && lstatSync(closurePath).isSymbolicLink()) throw new Error("release closure contains a mutable or unsupported entry: node_modules");
+  const closureRoot = existsSync(closurePath) ? realpathSync(closurePath) : closurePath;
+  const entries = runtimeEntries(directory, artifactRoots);
+  const required = new Set();
+  const visited = new Set();
+  const queue = entries.flatMap(({ entry, specifiers }) => specifiers.map((specifier) => ({ importer: join(directory, entry), specifier })));
+  while (queue.length) {
+    const { importer, specifier } = queue.shift();
+    let resolved;
+    try { resolved = createRequire(importer).resolve(specifier); }
+    catch { throw new Error(`runtime external is missing from candidate closure: ${specifier} (${slash(relative(directory, importer))})`); }
+    const real = realpathSync(resolved);
+    if (!real.startsWith(`${closureRoot}${sep}`)) throw new Error(`runtime external resolved outside candidate closure: ${specifier} (${slash(relative(directory, importer))})`);
+    if (visited.has(real)) continue;
+    visited.add(real);
+    required.add(slash(relative(directoryRoot, real)));
+    required.add(slash(relative(directoryRoot, packageManifest(real, closureRoot))));
+    for (const nested of importSpecifiers(real)) queue.push({ importer: real, specifier: nested });
+  }
+  return { entries, files: [...required].sort() };
+}
+
+function closureFiles(directory) {
+  return filesBelow(join(directory, "node_modules")).map((path) => `node_modules/${path}`).sort();
+}
+
+function assertRuntimeClosure(directory, artifactRoots, expectedEntries) {
+  const required = requiredClosureFiles(directory, artifactRoots);
+  if (expectedEntries && canonicalJson(required.entries) !== canonicalJson(expectedEntries)) throw new Error("release runtime external inventory does not match server entries");
+  if (canonicalJson(closureFiles(directory)) !== canonicalJson(required.files)) throw new Error("release runtime closure file set does not match its imports");
+  return required;
+}
+
+function assertReadOnlyTree(directory, rootDirectory = directory) {
+  if (!existsSync(directory)) return;
+  const stat = lstatSync(directory);
+  if (stat.isSymbolicLink() || (stat.mode & 0o222) !== 0) throw new Error(`staged runtime closure is mutable: ${slash(relative(rootDirectory, directory)) || "."}`);
+  if (!stat.isDirectory()) return;
+  for (const entry of readdirSync(directory)) assertReadOnlyTree(join(directory, entry), rootDirectory);
+}
+
+function verifyRuntimeClosure(directory, manifest, requireReadOnly = false) {
+  assertManifestShape(manifest);
+  const runtimeClosure = assertRuntimeClosure(directory, manifest.artifactRoots, manifest.runtimeExternals);
+  const actual = [...artifactFiles(directory, manifest.artifactRoots), ...runtimeClosure.files].sort();
+  const expected = manifest.files.map(({ path }) => path);
+  if (canonicalJson(actual) !== canonicalJson(expected)) throw new Error("staged release file set does not match its manifest");
+  for (const { path, sha256: digest } of manifest.files) {
+    if (sha256(readFileSync(join(directory, path))) !== digest) throw new Error(`staged release digest mismatch: ${path}`);
+  }
+  if (requireReadOnly) assertReadOnlyTree(join(directory, "node_modules"));
+  return runtimeClosure;
+}
+
+function copyRuntimeClosure(sourceDirectory, directory, artifactRoots) {
+  const sourceNodeModules = realpathSync(join(sourceDirectory, "node_modules"));
+  const queue = runtimeEntries(sourceDirectory, artifactRoots).flatMap(({ entry, specifiers }) => specifiers.map((specifier) => ({ importer: join(sourceDirectory, entry), specifier })));
+  const copied = new Set();
+  while (queue.length) {
+    const { importer, specifier } = queue.shift();
+    const resolved = realpathSync(createRequire(importer).resolve(specifier));
+    if (!resolved.startsWith(`${sourceNodeModules}${sep}`)) throw new Error(`runtime external resolved outside source dependency root: ${specifier}`);
+    if (copied.has(resolved)) continue;
+    copied.add(resolved);
+    const manifest = packageManifest(resolved, sourceNodeModules);
+    for (const source of [manifest, resolved]) {
+      const target = join(directory, relative(sourceDirectory, source));
+      mkdirSync(dirname(target), { recursive: true });
+      cpSync(source, target);
+    }
+    for (const nested of importSpecifiers(resolved)) queue.push({ importer: resolved, specifier: nested });
+  }
 }
 
 function artifactFiles(directory, artifactRoots) {
@@ -102,22 +211,25 @@ function sourceCommit(directory = root) {
 function manifestFor(directory, commit = sourceCommit(root), sourceDirectory = root) {
   const artifactRoots = declaredArtifactRoots(sourceDirectory);
   assertArtifactRoots(artifactRoots, observedArtifactRoots(directory));
-  const paths = artifactFiles(directory, artifactRoots);
-  const unmanifested = paths.find((path) => path.endsWith(".map"));
+  const artifacts = artifactFiles(directory, artifactRoots);
+  const unmanifested = artifacts.find((path) => path.endsWith(".map"));
   if (unmanifested) throw new Error(`unmanifested release file: ${unmanifested}`);
   for (const artifactRoot of artifactRoots) {
-    if (!paths.some((path) => path.startsWith(`${artifactRoot}/`))) throw new Error(`empty artifact root: ${artifactRoot}`);
+    if (!artifacts.some((path) => path.startsWith(`${artifactRoot}/`))) throw new Error(`empty artifact root: ${artifactRoot}`);
   }
+  const runtimeClosure = assertRuntimeClosure(directory, artifactRoots);
+  const paths = [...artifacts, ...runtimeClosure.files].sort();
   const files = paths.map((path) => ({ path, sha256: sha256(readFileSync(join(directory, path))) }));
-  const payload = { version: 2, sourceCommit: commit, toolchain: pinnedToolchain, loadAuthority: "inactive", artifactRoots, files };
+  const payload = { version: 2, sourceCommit: commit, toolchain: pinnedToolchain, loadAuthority: "inactive", artifactRoots, runtimeExternals: runtimeClosure.entries, files };
   return { ...payload, releaseDigest: sha256(canonicalJson(payload)) };
 }
 
 function assertManifestShape(manifest) {
-  if (!manifest || typeof manifest !== "object" || canonicalJson(Object.keys(manifest).sort()) !== canonicalJson(["artifactRoots", "files", "loadAuthority", "releaseDigest", "sourceCommit", "toolchain", "version"])) {
+  if (!manifest || typeof manifest !== "object" || canonicalJson(Object.keys(manifest).sort()) !== canonicalJson(["artifactRoots", "files", "loadAuthority", "releaseDigest", "runtimeExternals", "sourceCommit", "toolchain", "version"])) {
     throw new Error("invalid release manifest fields");
   }
   const artifactRoots = Array.isArray(manifest.artifactRoots) ? manifest.artifactRoots : [];
+  const runtimeExternals = Array.isArray(manifest.runtimeExternals) ? manifest.runtimeExternals : [];
   const files = Array.isArray(manifest.files) ? manifest.files : [];
   if (manifest.version !== 2 || !/^[0-9a-f]{40}$/u.test(manifest.sourceCommit ?? "")) throw new Error("invalid release manifest identity");
   if (canonicalJson(manifest.toolchain) !== canonicalJson(pinnedToolchain)) throw new Error("release manifest does not name the pinned toolchain");
@@ -128,7 +240,11 @@ function assertManifestShape(manifest) {
   if (new Set(artifactRoots).size !== artifactRoots.length || artifactRoots.some((path, index) => index > 0 && artifactRoots[index - 1] > path)) {
     throw new Error("release manifest artifact roots must be unique and sorted");
   }
-  if (files.length === 0 || files.some(({ path, sha256: digest }) => typeof path !== "string" || path.startsWith("/") || path.includes("\\") || path.split("/").includes("..") || !artifactRoots.some((artifactRoot) => path.startsWith(`${artifactRoot}/`)) || path.endsWith(".map") || !/^[0-9a-f]{64}$/u.test(digest ?? ""))) {
+  if (runtimeExternals.some(({ entry, specifiers }) => typeof entry !== "string" || !artifactRoots.some((artifactRoot) => entry === `${artifactRoot}/server.js`) || !Array.isArray(specifiers) || specifiers.some((specifier) => typeof specifier !== "string" || specifier.startsWith(".") || builtins.has(specifier)) || new Set(specifiers).size !== specifiers.length || specifiers.some((specifier, index) => index > 0 && specifiers[index - 1] > specifier))) {
+    throw new Error("invalid release runtime external inventory");
+  }
+  if (new Set(runtimeExternals.map(({ entry }) => entry)).size !== runtimeExternals.length || runtimeExternals.some(({ entry }, index) => index > 0 && runtimeExternals[index - 1].entry > entry)) throw new Error("release runtime external inventory must be unique and sorted");
+  if (files.length === 0 || files.some(({ path, sha256: digest }) => typeof path !== "string" || path.startsWith("/") || path.includes("\\") || path.split("/").includes("..") || (!artifactRoots.some((artifactRoot) => path.startsWith(`${artifactRoot}/`)) && !path.startsWith("node_modules/")) || path.endsWith(".map") || !/^[0-9a-f]{64}$/u.test(digest ?? ""))) {
     throw new Error("invalid release manifest files");
   }
   const paths = files.map(({ path }) => path);
@@ -147,14 +263,15 @@ function verifyRelease(directory, manifestPath, sourceDirectory = root) {
   const declared = declaredArtifactRoots(sourceDirectory);
   if (canonicalJson(manifest.artifactRoots) !== canonicalJson(declared)) throw new Error("release artifact roots do not match source package topology");
   assertArtifactRoots(manifest.artifactRoots, observedArtifactRoots(directory));
+  for (const { path, sha256: digest } of manifest.files) {
+    if (!existsSync(join(directory, path)) || sha256(readFileSync(join(directory, path))) !== digest) throw new Error(`release artifact digest mismatch: ${path}`);
+  }
+  const runtimeClosure = assertRuntimeClosure(directory, manifest.artifactRoots, manifest.runtimeExternals);
   const expected = manifest.files.map(({ path }) => path);
-  const actual = artifactFiles(directory, manifest.artifactRoots);
+  const actual = [...artifactFiles(directory, manifest.artifactRoots), ...runtimeClosure.files].sort();
   const unmanifested = actual.find((path) => path.endsWith(".map"));
   if (unmanifested) throw new Error(`unmanifested release file: ${unmanifested}`);
   if (canonicalJson(actual) !== canonicalJson(expected)) throw new Error("release artifact file set does not match its manifest");
-  for (const { path, sha256: digest } of manifest.files) {
-    if (sha256(readFileSync(join(directory, path))) !== digest) throw new Error(`release artifact digest mismatch: ${path}`);
-  }
   return manifest;
 }
 
@@ -193,6 +310,7 @@ function buildRelease() {
     mkdirSync(dirname(target), { recursive: true });
     cpSync(join(root, path), target);
   }
+  copyRuntimeClosure(root, releaseDirectory, artifactRoots);
   const manifest = manifestFor(releaseDirectory);
   writeFileSync(join(releaseDirectory, manifestName), `${canonicalJson(manifest)}\n`);
   verifyRelease(releaseDirectory, join(releaseDirectory, manifestName));
@@ -225,4 +343,4 @@ function main(argv) {
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) main(process.argv.slice(2));
 
-export { canonicalJson, manifestFor, pinnedToolchain, verifyRelease };
+export { canonicalJson, manifestFor, pinnedToolchain, verifyRelease, verifyRuntimeClosure };

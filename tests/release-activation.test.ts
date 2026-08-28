@@ -5,13 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { activateRelease } from "../scripts/activate-release.mjs";
-import { canonicalJson, manifestFor } from "../scripts/release-artifact.mjs";
+import { canonicalJson, manifestFor, verifyRuntimeClosure } from "../scripts/release-artifact.mjs";
 
 const PROJECT_ID = "proj_activationfixture";
 const PRIOR_SCHEMA = "1".repeat(64);
 const CANDIDATE_SCHEMA = "2".repeat(64);
 
-function fixture() {
+function fixture(schemaImportMarker?: string, failSchemaImport = false) {
   const root = mkdtempSync(join(tmpdir(), "bb-collab-activation-"));
   const sourceRoot = join(root, "source");
   const releaseDirectory = join(root, "release");
@@ -26,16 +26,21 @@ function fixture() {
     bb: { name: "bb-collab", description: "fixture", branding: { icon: "Box" }, server: "./dist/server.js", app: "./app.tsx", skills: [] },
   };
   writeFileSync(join(sourceRoot, "package.json"), JSON.stringify(sourceManifest));
-  writeFileSync(join(sourceRoot, "dist/server.js"), "export const schemaDigest = 'unused';\nexport default () => {};\n");
+  const server = `import { defineRpcContract } from "@bb/plugin-sdk";\n${schemaImportMarker ? `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(schemaImportMarker)}, "imported");\n` : ""}${failSchemaImport ? 'throw new Error("schema import failed");\n' : ""}export const schemaDigest = '${CANDIDATE_SCHEMA}';\nexport default () => defineRpcContract;\n`;
+  writeFileSync(join(sourceRoot, "dist/server.js"), server);
   writeFileSync(join(sourceRoot, "dist/app.js"), "candidate app\n");
   writeFileSync(join(sourceRoot, "dist/app.meta.json"), "{}\n");
-  writeFileSync(join(releaseDirectory, "dist/server.js"), "export const schemaDigest = 'unused';\nexport default () => {};\n");
+  writeFileSync(join(releaseDirectory, "dist/server.js"), server);
   writeFileSync(join(releaseDirectory, "dist/app.js"), "candidate app\n");
   writeFileSync(join(releaseDirectory, "dist/app.meta.json"), "{}\n");
   writeFileSync(join(priorRoot, "package.json"), JSON.stringify(sourceManifest));
   writeFileSync(join(priorRoot, "dist/server.js"), "prior server\n");
   writeFileSync(join(priorRoot, "dist/app.js"), "prior app\n");
   writeFileSync(join(priorRoot, "dist/app.meta.json"), "{}\n");
+  const sdkRoot = join(releaseDirectory, "node_modules/@bb/plugin-sdk");
+  mkdirSync(join(sdkRoot, "dist"), { recursive: true });
+  writeFileSync(join(sdkRoot, "package.json"), JSON.stringify({ name: "@bb/plugin-sdk", version: "0.4.1", type: "module", exports: { ".": "./dist/index.js" } }));
+  writeFileSync(join(sdkRoot, "dist/index.js"), "export const defineRpcContract = {};\n");
   execFileSync("git", ["init", "--quiet"], { cwd: sourceRoot });
   execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: sourceRoot });
   execFileSync("git", ["config", "user.name", "Test"], { cwd: sourceRoot });
@@ -136,12 +141,60 @@ async function runFixture(created: ReturnType<typeof fixture>, adapter: ReturnTy
     stateDirectory: created.stateDirectory,
     projectId: PROJECT_ID,
     adapter,
-    candidateSchemaFingerprint: async () => CANDIDATE_SCHEMA,
     ...extra,
   });
 }
 
 describe("inactive release activation", () => {
+  it("imports schema from the staged wrapper without source node_modules", async () => {
+    const created = fixture();
+    const { adapter } = fakeAdapter(created.priorRoot);
+    try {
+      expect(existsSync(join(created.sourceRoot, "node_modules"))).toBe(false);
+      await expect(runFixture(created, adapter)).resolves.toMatchObject({ outcome: "activated" });
+    } finally { cleanup(created.root); }
+  });
+
+  it("rejects an invalid closure before schema import or activation state", async () => {
+    const markerRoot = mkdtempSync(join(tmpdir(), "bb-collab-schema-import-marker-"));
+    const marker = join(markerRoot, "imported");
+    const created = fixture(marker);
+    const { adapter, state } = fakeAdapter(created.priorRoot);
+    try {
+      writeFileSync(join(created.releaseDirectory, "node_modules/@bb/plugin-sdk/extra.js"), "unmanifested\n");
+      await expect(runFixture(created, adapter)).rejects.toThrow("release runtime closure file set does not match its imports");
+      expect(existsSync(marker)).toBe(false);
+      expect(state).toMatchObject({ root: created.priorRoot, bound: false, rollbackCalls: 0 });
+      expect(existsSync(join(created.stateDirectory, "deployment.pending.json"))).toBe(false);
+      expect(existsSync(join(created.stateDirectory, "deployment.json"))).toBe(false);
+      expect(existsSync(join(created.stateDirectory, "activation.lock"))).toBe(false);
+    } finally { cleanup(created.root); rmSync(markerRoot, { recursive: true, force: true }); }
+  });
+
+  it("leaves prior state exact when the staged schema import fails", async () => {
+    const created = fixture(undefined, true);
+    const { adapter, state } = fakeAdapter(created.priorRoot);
+    try {
+      await expect(runFixture(created, adapter)).rejects.toThrow("schema import failed");
+      expect(state).toMatchObject({ root: created.priorRoot, bound: false, rollbackCalls: 0 });
+      expect(existsSync(join(created.stateDirectory, "deployment.pending.json"))).toBe(false);
+      expect(existsSync(join(created.stateDirectory, "deployment.json"))).toBe(false);
+      expect(existsSync(join(created.stateDirectory, "activation.lock"))).toBe(false);
+    } finally { cleanup(created.root); }
+  });
+
+  it("refuses a mutable staged closure independently", async () => {
+    const created = fixture();
+    const { adapter } = fakeAdapter(created.priorRoot);
+    try {
+      const result = await runFixture(created, adapter);
+      const manifest = JSON.parse(readFileSync(join(created.releaseDirectory, "release-manifest.json"), "utf8"));
+      const sdk = join(result.receipt.artifactRoot, "node_modules/@bb/plugin-sdk/dist/index.js");
+      chmodSync(sdk, 0o644);
+      expect(() => verifyRuntimeClosure(result.receipt.artifactRoot, manifest, true)).toThrow("staged runtime closure is mutable");
+    } finally { cleanup(created.root); }
+  });
+
   it("activates an unchanged schema without backup or quiescence ceremony", async () => {
     const created = fixture();
     const { adapter } = fakeAdapter(created.priorRoot);
