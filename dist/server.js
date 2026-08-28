@@ -28681,6 +28681,10 @@ async function liveProviderRoute(bb, projectId, hostId, profile) {
     if (response.modelLoadError !== null) {
       return { outcome: "EXTERNAL_UNAVAILABLE", subject: projectId, expected: 1, attempted: 1, verified: 0, message: "authoritative provider model matrix is unavailable" };
     }
+    const permissionRank = { "accept-edits": 0, auto: 1, full: 2 };
+    if ((permissionRank[profile.permissionMode] ?? 99) > permissionRank[response.permissionCeiling]) {
+      return { outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "requested permission mode exceeds the host provider permission ceiling" };
+    }
     const model = response.models.find((candidate) => candidate.model === profile.model);
     if (!model) {
       return { outcome: "INVALID_INPUT", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "requested model is unavailable on the exact target host" };
