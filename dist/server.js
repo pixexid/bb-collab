@@ -27816,11 +27816,19 @@ function dispatchInventoryEvidence(threads, projectId, executionAttemptId, dispa
     snapshotDigest: sha256(canonicalJson({ projectId, executionAttemptId, dispatchMarker, population, active, archived }))
   };
 }
-async function closeThreadlessPreparedAttempt(bb, db, input) {
+async function closeThreadlessPreparedAttempt(bb, db, input, authenticatedNativeCaller = null) {
   const parsed = threadlessPreparedClosureInputSchema.safeParse(input);
   if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "threadless-prepared-closure", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
   const { request, correctionId, dispatchIntentIdempotencyKey } = parsed.data;
+  if (!authenticatedNativeCaller) return { outcome: "ROLE_HOLDER_MISMATCH", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure caller is not an authenticated native seat" };
+  if (authenticatedNativeCaller.projectId !== request.projectId) return { outcome: "ROLE_CONTEXT_FOREIGN", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "authenticated native caller belongs to a different project" };
   if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
+  const projectCallerRefusal = recoveryCallerRefusal(db, request.projectId, authenticatedNativeCaller.threadId);
+  if (projectCallerRefusal) return projectCallerRefusal;
+  const domain2 = db.prepare("SELECT domain_id FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, request.workItemId);
+  if (!domain2) return { outcome: "WORK_ITEM_UNKNOWN", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure WorkItem domain is unavailable" };
+  const domainCallerRefusal = recoveryCallerRefusal(db, request.projectId, authenticatedNativeCaller.threadId, domain2.domain_id);
+  if (domainCallerRefusal) return domainCallerRefusal;
   const existing = db.prepare(
     "SELECT request_digest, outcome_json, committed_event_sequence, operation_class FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?"
   ).get(request.projectId, request.idempotencyKey);
@@ -27960,7 +27968,7 @@ async function closeThreadlessPreparedAttempt(bb, db, input) {
         ]
       }
     };
-    return applyLiveAuthorizedMutation(bb, db, closureRequest, false, "refuse-active", readGithubIssueForBackfill, null, preMutationGuard, true);
+    return applyLiveAuthorizedMutation(bb, db, closureRequest, false, "refuse-active", readGithubIssueForBackfill, null, preMutationGuard, true, false, authenticatedNativeCaller);
   });
 }
 function isStructuredDestroyedEnvironmentError(error48) {
@@ -32205,8 +32213,7 @@ ${thread.titleFallback ?? ""}`);
     instructions: "Use only for a prepared work-item writing attempt with no native thread or native evidence. This path never spawns or retries.",
     parameters: threadlessPreparedClosureInputSchema,
     async execute(input, context) {
-      if (input.request.projectId !== context.projectId) throw new Error("request projectId must exactly match the current thread project");
-      return JSON.stringify(await closeThreadlessPreparedAttempt(bb, db, input));
+      return JSON.stringify(await closeThreadlessPreparedAttempt(bb, db, input, { projectId: context.projectId, threadId: context.threadId }));
     }
   });
   bb.agents.registerTool({

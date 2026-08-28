@@ -1900,11 +1900,20 @@ async function closeThreadlessPreparedAttempt(
   bb: BbPluginApi,
   db: SqliteDatabase | null,
   input: unknown,
+  authenticatedNativeCaller: AuthenticatedNativeCaller | null = null,
 ): Promise<FoundationResult> {
   const parsed = threadlessPreparedClosureInputSchema.safeParse(input);
   if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "threadless-prepared-closure", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
   const { request, correctionId, dispatchIntentIdempotencyKey } = parsed.data;
+  if (!authenticatedNativeCaller) return { outcome: "ROLE_HOLDER_MISMATCH", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure caller is not an authenticated native seat" };
+  if (authenticatedNativeCaller.projectId !== request.projectId) return { outcome: "ROLE_CONTEXT_FOREIGN", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "authenticated native caller belongs to a different project" };
   if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
+  const projectCallerRefusal = recoveryCallerRefusal(db, request.projectId, authenticatedNativeCaller.threadId);
+  if (projectCallerRefusal) return projectCallerRefusal;
+  const domain = db.prepare("SELECT domain_id FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, request.workItemId) as { domain_id: string } | undefined;
+  if (!domain) return { outcome: "WORK_ITEM_UNKNOWN", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure WorkItem domain is unavailable" };
+  const domainCallerRefusal = recoveryCallerRefusal(db, request.projectId, authenticatedNativeCaller.threadId, domain.domain_id);
+  if (domainCallerRefusal) return domainCallerRefusal;
   const existing = db.prepare(
     "SELECT request_digest, outcome_json, committed_event_sequence, operation_class FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?",
   ).get(request.projectId, request.idempotencyKey) as { request_digest: string; outcome_json: string; committed_event_sequence: number; operation_class: string } | undefined;
@@ -2055,7 +2064,7 @@ async function closeThreadlessPreparedAttempt(
         ],
       },
     };
-    return applyLiveAuthorizedMutation(bb, db, closureRequest, false, "refuse-active", readGithubIssueForBackfill, null, preMutationGuard, true);
+    return applyLiveAuthorizedMutation(bb, db, closureRequest, false, "refuse-active", readGithubIssueForBackfill, null, preMutationGuard, true, false, authenticatedNativeCaller);
   });
 }
 
@@ -6892,8 +6901,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     instructions: "Use only for a prepared work-item writing attempt with no native thread or native evidence. This path never spawns or retries.",
     parameters: threadlessPreparedClosureInputSchema,
     async execute(input, context) {
-      if (input.request.projectId !== context.projectId) throw new Error("request projectId must exactly match the current thread project");
-      return JSON.stringify(await closeThreadlessPreparedAttempt(bb, db, input));
+      return JSON.stringify(await closeThreadlessPreparedAttempt(bb, db, input, { projectId: context.projectId, threadId: context.threadId }));
     },
   });
   bb.agents.registerTool({
