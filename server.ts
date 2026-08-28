@@ -49,6 +49,7 @@ import {
   registerProjectRequestSchema,
   refusal,
   roleContextPreflightRefusal,
+  uiUxRoutingPolicyFromConfig,
   writingLaneCeilingFromJson,
   proveWorkItemDispatchConfig,
   WORK_ITEM_NON_TERMINAL_STATES,
@@ -75,6 +76,7 @@ import {
   type ExecutionAttemptEvidenceReader,
   type SqliteDatabase,
   type WorkItemDispatchConfigProof,
+  type ProviderMatrixProfile,
 } from "./src/foundation.js";
 import {
   GITHUB_ISSUE_COMMENT_TAIL_LIMIT,
@@ -2934,6 +2936,42 @@ async function prepareWorkItemAttemptTerminalization(
   return null;
 }
 
+async function liveProviderMatrix(bb: BbPluginApi, request: ApplyRequest): Promise<ProviderMatrixProfile[] | FoundationResult> {
+  if (request.operationClass !== "bootstrap" && request.operationClass !== "config_revision") return [];
+  const policy = uiUxRoutingPolicyFromConfig(request.config);
+  if (!policy) return [];
+  const target = request.targets?.find((candidate) => candidate.repoTargetId === policy.repoTargetId);
+  if (!target) return [];
+  try {
+    const matrix: ProviderMatrixProfile[] = [];
+    const providers = await bb.sdk.providers.list({ hostId: target.hostId });
+    for (const profile of policy.allowedProfiles) {
+      const provider = providers.find((candidate) => candidate.id === profile.providerId && candidate.available);
+      if (!provider || !provider.capabilities.permissionModes.includes(profile.permissionMode as "full" | "auto" | "accept-edits")) continue;
+      const response = await bb.sdk.providers.models({ hostId: target.hostId, providerId: profile.providerId });
+      const model = response.modelLoadError === null
+        ? response.models.find((candidate) => candidate.model === profile.model && candidate.supportedReasoningEfforts.some((effort) => effort.reasoningEffort === profile.reasoningLevel))
+        : null;
+      const serviceTiers = (provider as typeof provider & { serviceTiers?: Array<{ id: string }> }).serviceTiers;
+      const serviceTierValid = provider.capabilities.supportsServiceTier
+        ? serviceTiers?.some((tier) => tier.id === profile.serviceTier) === true
+        : profile.serviceTier === "default";
+      if (model && serviceTierValid) {
+        matrix.push({
+          repoTargetId: policy.repoTargetId,
+          providerId: profile.providerId,
+          model: profile.model,
+          reasoningLevel: profile.reasoningLevel,
+          serviceTier: profile.serviceTier,
+        });
+      }
+    }
+    return matrix;
+  } catch (error) {
+    return { outcome: "EXTERNAL_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 1, verified: 0, message: `authoritative provider matrix is unavailable: ${String(error)}` };
+  }
+}
+
 async function applyLiveAuthorizedMutation(
   bb: BbPluginApi,
   db: SqliteDatabase | null,
@@ -2989,6 +3027,8 @@ async function applyLiveAuthorizedMutation(
     }
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
+  const providerMatrix = parsed.success ? await liveProviderMatrix(bb, parsed.data) : [];
+  if ("outcome" in providerMatrix) return providerMatrix;
   const preMutationRefusal = preMutationGuard === undefined ? null : await preMutationGuard();
   if (preMutationRefusal) return preMutationRefusal;
   let evidenceReader: ExecutionAttemptEvidenceReader | null = null;
@@ -3001,7 +3041,7 @@ async function applyLiveAuthorizedMutation(
     if ("outcome" in resolved) return resolved;
     evidenceReader = resolved;
   }
-  const result = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader ?? (parsed.success ? projectGithubIssueReader(db, parsed.data.projectId) : readGithubIssueForBackfill), evidenceReader, false, authenticatedNativeCaller);
+  const result = applyAuthorizedMutation(db, input, githubAdapter, reader, null, null, githubIssueReader ?? (parsed.success ? projectGithubIssueReader(db, parsed.data.projectId) : readGithubIssueForBackfill), evidenceReader, false, authenticatedNativeCaller, providerMatrix);
   await deliverSucceededRoleGenerationBrief(bb, db, input, result);
   return result;
 }
@@ -3027,6 +3067,8 @@ async function applyLiveAuthorizedMutationAsync(
     return cachedConsumerRolloutRefusal(parsed.data.projectId, "cached-consumer rollout evidence is accepted only through the live rollout caller");
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
+  const providerMatrix = parsed.success ? await liveProviderMatrix(bb, parsed.data) : [];
+  if ("outcome" in providerMatrix) return providerMatrix;
   let evidenceReader: ExecutionAttemptEvidenceReader | null = null;
   if (parsed.success && db && parsed.data.operationClass === "execution_attempt_terminal_report") {
     const resolved = await liveTerminalReader(bb.sdk, db, parsed.data);
@@ -3037,7 +3079,7 @@ async function applyLiveAuthorizedMutationAsync(
     if ("outcome" in resolved) return resolved;
     evidenceReader = resolved;
   }
-  const result = await applyAuthorizedMutationAsync(db, input, githubAdapter, reader, null, null, githubIssueReader ?? (parsed.success ? projectGithubIssueReader(db, parsed.data.projectId) : readGithubIssueForBackfill), evidenceReader);
+  const result = await applyAuthorizedMutationAsync(db, input, githubAdapter, reader, null, null, githubIssueReader ?? (parsed.success ? projectGithubIssueReader(db, parsed.data.projectId) : readGithubIssueForBackfill), evidenceReader, false, providerMatrix);
   await deliverSucceededRoleGenerationBrief(bb, db, input, result);
   return result;
 }

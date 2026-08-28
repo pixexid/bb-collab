@@ -11,7 +11,7 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
-export const RUNTIME_CONTRACT_VERSION = 32;
+export const RUNTIME_CONTRACT_VERSION = 33;
 export const SCHEMA_VERSION = 35;
 // v27 records correlated terminal evidence and first-class interrupted attempts.
 const PREVIOUS_RUNTIME_CONTRACT_VERSION = 27;
@@ -2478,6 +2478,25 @@ const executionProfileSchema = z
     visibility: z.enum(["visible", "hidden"]),
   })
   .strict();
+export type ProviderMatrixProfile = Readonly<{
+  repoTargetId: string;
+  providerId: string;
+  model: string;
+  reasoningLevel: string;
+  serviceTier: string;
+}>;
+const uiUxRoutingPolicySchema = z
+  .object({
+    repoTargetId: id,
+    allowedProfiles: z.array(executionProfileSchema).min(1).max(128),
+  })
+  .strict()
+  .superRefine((policy, ctx) => {
+    const profiles = policy.allowedProfiles.map(canonicalJson);
+    if (new Set(profiles).size !== profiles.length) {
+      ctx.addIssue({ code: "custom", path: ["allowedProfiles"], message: "UI/UX routing policy profiles must be unique" });
+    }
+  });
 const workAttemptSchema = z
   .object({
     laneId: id,
@@ -2613,6 +2632,10 @@ function profileIsOneOf(profile: unknown, profiles: readonly unknown[]): boolean
   return profiles.some((candidate) => value === canonicalJson(candidate));
 }
 
+function hasRoutingSuffix(profile: { model: string }): boolean {
+  return /\[[^\]]+\]$/u.test(profile.model);
+}
+
 function isRatifiedDirectorSeatRequirement(requirement: {
   roleRequirementId: string;
   executedProfile: unknown;
@@ -2648,15 +2671,6 @@ const roleRequirementSchema = z
       ctx.addIssue({ code: "custom", path: ["executedProfile", "visibility"], message: "active role holders must be visible" });
     }
     const isDirectorSeat = requirement.roleRequirementId === DIRECTOR_SEAT_ROLE_REQUIREMENT_ID;
-    const hasRoutingSuffix = (profile: unknown): boolean => profile !== undefined
-      && typeof profile === "object"
-      && profile !== null
-      && "model" in profile
-      && typeof profile.model === "string"
-      && /\[[^\]]+\]$/u.test(profile.model);
-    if (!isDirectorSeat && (hasRoutingSuffix(requirement.executedProfile) || hasRoutingSuffix(requirement.standbyProfile))) {
-      ctx.addIssue({ code: "custom", path: ["executedProfile", "model"], message: "routing-suffix SKU models are reserved for the ratified director-seat profiles" });
-    }
     if (requirement.roleId === "director" && !isDirectorSeat) {
       ctx.addIssue({ code: "custom", path: ["roleRequirementId"], message: "director role is reserved for director-seat" });
     }
@@ -3962,7 +3976,17 @@ export function canonicalJson(value: unknown): string {
   return JSON.stringify(stableValue(value));
 }
 
-function validateConfig(value: unknown): string {
+export function uiUxRoutingPolicyFromConfig(value: unknown): z.infer<typeof uiUxRoutingPolicySchema> | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const extensions = (value as Record<string, unknown>).extensions;
+  if (extensions === null || typeof extensions !== "object" || Array.isArray(extensions)) return null;
+  const bbCollab = (extensions as Record<string, unknown>).bbCollab;
+  if (bbCollab === null || typeof bbCollab !== "object" || Array.isArray(bbCollab)) return null;
+  const parsed = uiUxRoutingPolicySchema.safeParse((bbCollab as Record<string, unknown>).uiUxRoutingPolicy);
+  return parsed.success ? parsed.data : null;
+}
+
+function validateConfig(value: unknown, providerMatrix: readonly ProviderMatrixProfile[] = []): string {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw refusal("MALFORMED_JSON", "config must be a JSON object");
   }
@@ -4004,6 +4028,43 @@ function validateConfig(value: unknown): string {
       if (domains !== undefined) {
         const parsed = domainsSchema.safeParse(domains);
         if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
+      }
+      const uiUxRoutingPolicy = (bbCollab as Record<string, unknown>).uiUxRoutingPolicy;
+      const parsedPolicy = uiUxRoutingPolicy === undefined ? null : uiUxRoutingPolicySchema.safeParse(uiUxRoutingPolicy);
+      if (parsedPolicy && !parsedPolicy.success) throw refusal("INVALID_INPUT", parsedPolicy.error.message);
+      const requirements = roleRequirements !== undefined
+        ? roleRequirementsSchema.parse(roleRequirements)
+        : domains !== undefined
+          ? domainsSchema.parse(domains).flatMap((domain) => domain.roleRequirements)
+          : [];
+      const suffixRequirements = requirements.filter((requirement) =>
+        requirement.roleRequirementId !== DIRECTOR_SEAT_ROLE_REQUIREMENT_ID && hasRoutingSuffix(requirement.executedProfile));
+      if (suffixRequirements.length > 0) {
+        const requirement = suffixRequirements.length === 1 ? suffixRequirements[0] : null;
+        const policy = parsedPolicy?.success ? parsedPolicy.data : null;
+        const profile = requirement?.executedProfile;
+        const matrixProfile = requirement && profile ? {
+          repoTargetId: requirement.repoTargetId,
+          providerId: profile.providerId,
+          model: profile.model,
+          reasoningLevel: profile.reasoningLevel,
+          serviceTier: profile.serviceTier,
+        } : null;
+        if (
+          !requirement || requirement.roleId !== "worker" || requirement.repoTargetId === null ||
+          !policy || policy.repoTargetId !== requirement.repoTargetId ||
+          !matrixProfile || !profileIsOneOf(matrixProfile, providerMatrix)
+        ) {
+          throw refusal("INVALID_INPUT", "routing-suffix SKU models require one exact policy-bound worker profile and authoritative provider matrix match");
+        }
+      }
+      if (parsedPolicy?.success) {
+        const policyRequirements = requirements.filter((requirement) =>
+          requirement.roleId === "worker" && requirement.repoTargetId === parsedPolicy.data.repoTargetId &&
+          profileIsOneOf(requirement.executedProfile, parsedPolicy.data.allowedProfiles));
+        if (policyRequirements.length !== 1) {
+          throw refusal("INVALID_INPUT", "UI/UX routing policy must bind one exact worker profile");
+        }
       }
       const writingLaneCeiling = (bbCollab as Record<string, unknown>).writingLaneCeiling;
       if (writingLaneCeiling !== undefined && (!Number.isInteger(writingLaneCeiling) || Number(writingLaneCeiling) < 0 || Number(writingLaneCeiling) > MAX_WRITING_LANE_CEILING)) {
@@ -5112,7 +5173,7 @@ function deriveBootstrapActor(
   };
 }
 
-function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
+function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: string, providerMatrix: readonly ProviderMatrixProfile[]): FoundationResult {
   if (request.expectedConfigRevision !== null) {
     throw refusal("PROJECT_CONFIG_STALE", "bootstrap requires an empty config head");
   }
@@ -5124,7 +5185,7 @@ function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: strin
   if (request.expectedGovernanceEpoch !== null || request.expectedFenceToken !== null) {
     throw refusal("GOVERNOR_CAS_FAILED", "bootstrap requires an empty governorship head");
   }
-  const config = request.config === undefined ? undefined : validateConfig(request.config);
+  const config = request.config === undefined ? undefined : validateConfig(request.config, providerMatrix);
   if (!config) throw refusal("INVALID_INPUT", "bootstrap requires a config object");
   const targets = requireTargetCollection(request, "bootstrap");
   requireMappedTargets(config, targets);
@@ -5232,7 +5293,7 @@ function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: strin
   );
 }
 
-function applyConfigRevision(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
+function applyConfigRevision(db: SqliteDatabase, request: ApplyRequest, digest: string, providerMatrix: readonly ProviderMatrixProfile[]): FoundationResult {
   const currentRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
@@ -5240,7 +5301,7 @@ function applyConfigRevision(db: SqliteDatabase, request: ApplyRequest, digest: 
     requireTarget(db, request.projectId, currentRevision, request.repoTargetId);
     throw refusal("INVALID_INPUT", "config revision requires config and target collection");
   }
-  const configJson = validateConfig(request.config);
+  const configJson = validateConfig(request.config, providerMatrix);
   const targets = requireTargetCollection(request, "config revision");
   requireMappedTargets(configJson, targets);
   const nextRevision = currentRevision + 1;
@@ -11517,6 +11578,7 @@ export function applyAuthorizedMutation(
   executionAttemptEvidenceReader: ExecutionAttemptEvidenceReader | null = null,
   dryRun = false,
   authenticatedNativeCaller: AuthenticatedNativeCaller | null = null,
+  providerMatrix: readonly ProviderMatrixProfile[] = [],
 ): FoundationResult {
   let request: ApplyRequest;
   try {
@@ -11526,7 +11588,7 @@ export function applyAuthorizedMutation(
     return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error) });
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun, authenticatedNativeCaller);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun, authenticatedNativeCaller, providerMatrix);
 }
 
 export async function applyAuthorizedMutationAsync(
@@ -11539,6 +11601,7 @@ export async function applyAuthorizedMutationAsync(
   githubIssueReader: GitHubIssueReader | null = null,
   executionAttemptEvidenceReader: ExecutionAttemptEvidenceReader | null = null,
   dryRun = false,
+  providerMatrix: readonly ProviderMatrixProfile[] = [],
 ): Promise<FoundationResult> {
   let request: ApplyRequest;
   try {
@@ -11549,7 +11612,7 @@ export async function applyAuthorizedMutationAsync(
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
   if (request.operationClass !== "github_issue_projection" || !githubAdapter?.readAsync || !githubAdapter.mutateAsync) {
-    return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun);
+    return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun, null, providerMatrix);
   }
   try {
     return await applyGithubIssueProjectionAsync(db, request, mutationRequestDigest(request), githubAdapter);
@@ -11570,6 +11633,7 @@ export function applyFixtureMutation(
   executionAttemptEvidenceReader: ExecutionAttemptEvidenceReader | null = null,
   dryRun = false,
   authenticatedNativeCaller: AuthenticatedNativeCaller | null = null,
+  providerMatrix: readonly ProviderMatrixProfile[] = [],
 ): FoundationResult {
   let request: ApplyRequest;
   try {
@@ -11627,9 +11691,9 @@ export function applyFixtureMutation(
       if (replay) return replay;
       switch (request.operationClass) {
         case "bootstrap":
-          return applyBootstrap(db, request, digest);
+          return applyBootstrap(db, request, digest, providerMatrix);
         case "config_revision":
-          return applyConfigRevision(db, request, digest);
+          return applyConfigRevision(db, request, digest, providerMatrix);
         case "governor_claim":
           return applyGovernorClaim(db, request, digest);
         case "migration_prepare":
