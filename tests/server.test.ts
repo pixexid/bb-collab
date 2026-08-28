@@ -119,36 +119,6 @@ const CLAUDE_PROFILE = {
   serviceTier: "default",
   visibility: "visible" as const,
 };
-const UI_UX_ROUTING_PROFILE = {
-  providerId: "claude-code",
-  model: "claude-opus-5[1m]",
-  reasoningLevel: "medium",
-  permissionMode: "full",
-  serviceTier: "default",
-  visibility: "visible" as const,
-};
-const UI_UX_PROVIDER_MATRIX = [{
-  repoTargetId: TARGET_ID,
-  providerId: UI_UX_ROUTING_PROFILE.providerId,
-  model: UI_UX_ROUTING_PROFILE.model,
-  reasoningLevel: UI_UX_ROUTING_PROFILE.reasoningLevel,
-  serviceTier: UI_UX_ROUTING_PROFILE.serviceTier,
-}];
-const LUNA_PROFILE = {
-  providerId: "codex",
-  model: "gpt-5.6-luna",
-  reasoningLevel: "medium",
-  permissionMode: "full",
-  serviceTier: "default",
-  visibility: "visible" as const,
-};
-const LUNA_PROVIDER_MATRIX = [{
-  repoTargetId: TARGET_ID,
-  providerId: LUNA_PROFILE.providerId,
-  model: LUNA_PROFILE.model,
-  reasoningLevel: LUNA_PROFILE.reasoningLevel,
-  serviceTier: LUNA_PROFILE.serviceTier,
-}];
 const EXPLICIT_EXECUTION_INPUT_SOURCES = {
   providerId: "explicit",
   model: "explicit",
@@ -287,18 +257,6 @@ function roleConfig(connector: "required" | "optional" | "prohibited" = "optiona
   ];
   config.extensions.bbCollab.reviewPolicy = {
     connectors: [{ repoTargetId: TARGET_ID, connectorId: "connector-review", policy: connector }],
-  };
-  return config;
-}
-
-function uiUxRoutingConfig(profile = UI_UX_ROUTING_PROFILE) {
-  const config = roleConfig();
-  const worker = (config.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>)
-    .find((requirement) => requirement.roleId === "worker")!;
-  worker.executedProfile = { ...profile };
-  config.extensions.bbCollab.uiUxRoutingPolicy = {
-    repoTargetId: TARGET_ID,
-    allowedProfiles: [{ ...profile }],
   };
   return config;
 }
@@ -574,6 +532,34 @@ function hostFor(
           createdAt: 1,
           updatedAt: 1,
         }),
+      },
+      providers: {
+        list: async () => [{
+          id: ROLE_PROFILE.providerId,
+          displayName: "Codex",
+          available: true,
+          logoUrl: null,
+          composerActions: [],
+          capabilities: {
+            permissionModes: ["full"], supportsFork: true, supportsNativeUserQuestion: false,
+            supportsServiceTier: false, supportsSessionRewind: false, supportsThreadArchive: true, supportsThreadRename: true,
+          },
+        }] as never,
+        models: async () => ({
+          modelLoadError: null,
+          models: [{
+            id: ROLE_PROFILE.model,
+            model: ROLE_PROFILE.model,
+            displayName: "Luna",
+            description: "fixture",
+            isDefault: true,
+            defaultReasoningEffort: ROLE_PROFILE.reasoningLevel,
+            supportedReasoningEfforts: [{ reasoningEffort: ROLE_PROFILE.reasoningLevel, description: "fixture" }],
+          }],
+          selectedOnlyModels: [],
+          permissionCeiling: "full",
+          providers: [],
+        }) as never,
       },
       threads: {
         list: async () => [],
@@ -6810,6 +6796,218 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(fixture.db.prepare("SELECT lane_id, thread_id, state FROM execution_attempts WHERE origin = 'work_item' ORDER BY rowid DESC LIMIT 1").get()).toMatchObject({ lane_id: "lane-work-item-1", thread_id: "lane-1", state: "running" });
   });
 
+  it("accepts live worker routes independent of legacy profiles and replaces a terminalized route", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    const alternateProfile = { ...ROLE_PROFILE, reasoningLevel: "low" as const };
+    const provider = {
+      id: ROLE_PROFILE.providerId,
+      displayName: "Codex",
+      available: true,
+      logoUrl: null,
+      composerActions: [],
+      capabilities: {
+        permissionModes: ["full"], supportsFork: true, supportsNativeUserQuestion: false,
+        supportsServiceTier: false, supportsSessionRewind: false, supportsThreadArchive: true, supportsThreadRename: true,
+      },
+    };
+    fixture.host.harness.sdk.stub("providers.list", (async () => [provider]) as never);
+    fixture.host.harness.sdk.stub("providers.models", (async () => ({
+      modelLoadError: null,
+      models: [{
+        id: ROLE_PROFILE.model,
+        model: ROLE_PROFILE.model,
+        displayName: "Luna",
+        description: "fixture",
+        isDefault: true,
+        defaultReasoningEffort: ROLE_PROFILE.reasoningLevel,
+        supportedReasoningEfforts: [
+          { reasoningEffort: ROLE_PROFILE.reasoningLevel, description: "fixture" },
+          { reasoningEffort: alternateProfile.reasoningLevel, description: "fixture" },
+        ],
+      }],
+      selectedOnlyModels: [],
+      permissionCeiling: "full",
+      providers: [provider],
+    })) as never);
+    const dispatch = (profile: typeof ROLE_PROFILE | typeof alternateProfile, id: string, expectedResourceRevision: number, lifecycleState: "in_progress" | undefined) => fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, lifecycleState, expectedResourceRevision, {
+        idempotencyKey: id,
+        workAttempt: { laneId: id, threadId: undefined, assignmentKind: "write", requestedProfile: profile },
+      }),
+      spawn: dispatchSpawn(fixture.orchestratorThreadId, profile),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId });
+    expect(JSON.parse(await dispatch(ROLE_PROFILE, "live-route-first", 2, "in_progress") as string)).toMatchObject({ outcome: "OK" });
+    fixture.addNativeLane("lane-1", "idle");
+    expect(JSON.parse(await dispatch(alternateProfile, "live-route-replacement", 3, undefined) as string)).toMatchObject({ outcome: "OK" });
+    expect(fixture.db.prepare("SELECT requested_reasoning_level, state FROM execution_attempts WHERE origin = 'work_item' ORDER BY attempt_ordinal").all()).toEqual([
+      { requested_reasoning_level: "high", state: "superseded" },
+      { requested_reasoning_level: "low", state: "running" },
+    ]);
+  });
+
+  it("refuses an unavailable live worker route before durable preparation or native spawn", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    const before = exportFoundation(fixture.db, PROJECT_ID);
+    fixture.host.harness.sdk.stub("providers.list", (async () => []) as never);
+    let spawnCalls = 0;
+    fixture.host.harness.sdk.stub("threads.spawn", (async () => { spawnCalls += 1; throw new Error("route refusal must precede spawn"); }) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+      spawn: dispatchSpawn(fixture.orchestratorThreadId),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result).toMatchObject({ outcome: "INVALID_INPUT", attempted: 0, verified: 0 });
+    expect(spawnCalls).toBe(0);
+    expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("refuses a worker permission above the host-resolved provider ceiling before durable preparation or native spawn", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    const before = exportFoundation(fixture.db, PROJECT_ID);
+    const provider = {
+      id: ROLE_PROFILE.providerId,
+      displayName: "Codex",
+      available: true,
+      logoUrl: null,
+      composerActions: [],
+      capabilities: {
+        permissionModes: ["full", "auto"], supportsFork: true, supportsNativeUserQuestion: false,
+        supportsServiceTier: false, supportsSessionRewind: false, supportsThreadArchive: true, supportsThreadRename: true,
+      },
+    };
+    fixture.host.harness.sdk.stub("providers.list", (async () => [provider]) as never);
+    fixture.host.harness.sdk.stub("providers.models", (async () => ({
+      modelLoadError: null,
+      models: [{
+        id: ROLE_PROFILE.model,
+        model: ROLE_PROFILE.model,
+        displayName: "Luna",
+        description: "fixture",
+        isDefault: true,
+        defaultReasoningEffort: ROLE_PROFILE.reasoningLevel,
+        supportedReasoningEfforts: [{ reasoningEffort: ROLE_PROFILE.reasoningLevel, description: "fixture" }],
+      }],
+      selectedOnlyModels: [],
+      permissionCeiling: "auto",
+      providers: [provider],
+    })) as never);
+    let spawnCalls = 0;
+    fixture.host.harness.sdk.stub("threads.spawn", (async () => { spawnCalls += 1; throw new Error("permission ceiling refusal must precede spawn"); }) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2),
+      spawn: dispatchSpawn(fixture.orchestratorThreadId),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result).toMatchObject({
+      outcome: "INVALID_INPUT",
+      attempted: 0,
+      verified: 0,
+      message: "requested permission mode exceeds the host provider permission ceiling",
+    });
+    expect(spawnCalls).toBe(0);
+    expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("accepts a worker permission at the host-resolved provider ceiling", async () => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    const profile = { ...ROLE_PROFILE, permissionMode: "auto" as const };
+    const provider = {
+      id: ROLE_PROFILE.providerId,
+      displayName: "Codex",
+      available: true,
+      logoUrl: null,
+      composerActions: [],
+      capabilities: {
+        permissionModes: ["full", "auto"], supportsFork: true, supportsNativeUserQuestion: false,
+        supportsServiceTier: false, supportsSessionRewind: false, supportsThreadArchive: true, supportsThreadRename: true,
+      },
+    };
+    fixture.host.harness.sdk.stub("providers.list", (async () => [provider]) as never);
+    fixture.host.harness.sdk.stub("providers.models", (async () => ({
+      modelLoadError: null,
+      models: [{
+        id: ROLE_PROFILE.model,
+        model: ROLE_PROFILE.model,
+        displayName: "Luna",
+        description: "fixture",
+        isDefault: true,
+        defaultReasoningEffort: ROLE_PROFILE.reasoningLevel,
+        supportedReasoningEfforts: [{ reasoningEffort: ROLE_PROFILE.reasoningLevel, description: "fixture" }],
+      }],
+      selectedOnlyModels: [],
+      permissionCeiling: "auto",
+      providers: [provider],
+    })) as never);
+    const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: transitionRequest(fixture.fenceToken, "in_progress", 2, {
+        workAttempt: { laneId: "ceiling-equal", threadId: undefined, assignmentKind: "write", requestedProfile: profile },
+      }),
+      spawn: dispatchSpawn(fixture.orchestratorThreadId, profile),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(result).toMatchObject({ outcome: "OK" });
+    expect(fixture.db.prepare("SELECT state FROM execution_attempts WHERE origin = 'work_item' ORDER BY rowid DESC LIMIT 1").get()).toEqual({ state: "running" });
+  });
+
+  it.each([
+    ["hidden route", { visibility: "hidden" }, "INVALID_INPUT", "requested provider route must be visible"],
+    ["missing model", { model: "missing-model" }, "INVALID_INPUT", "requested model is unavailable on the exact target host"],
+    ["unsupported reasoning", { reasoningLevel: "low" }, "INVALID_INPUT", "requested reasoning level is unsupported by the model"],
+    ["unsupported permission", { permissionMode: "auto" }, "INVALID_INPUT", "requested permission mode is unsupported by the provider"],
+    ["unsupported service tier", { serviceTier: "fast" }, "INVALID_INPUT", "requested service tier is unsupported by the provider"],
+    ["incomplete route", { model: undefined }, "INVALID_INPUT", undefined],
+    ["unavailable model matrix", {}, "EXTERNAL_UNAVAILABLE", "authoritative provider model matrix is unavailable"],
+  ] as const)("refuses %s before durable preparation or native spawn", async (_name, changes, expectedOutcome, expectedMessage) => {
+    const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    const before = exportFoundation(fixture.db, PROJECT_ID);
+    const profile = { ...ROLE_PROFILE, ...changes } as typeof ROLE_PROFILE;
+    const provider = {
+      id: ROLE_PROFILE.providerId,
+      displayName: "Codex",
+      available: true,
+      logoUrl: null,
+      composerActions: [],
+      capabilities: {
+        permissionModes: ["full"], supportsFork: true, supportsNativeUserQuestion: false,
+        supportsServiceTier: false, supportsSessionRewind: false, supportsThreadArchive: true, supportsThreadRename: true,
+      },
+    };
+    fixture.host.harness.sdk.stub("providers.list", (async () => [provider]) as never);
+    fixture.host.harness.sdk.stub("providers.models", (async () => ({
+      modelLoadError: expectedOutcome === "EXTERNAL_UNAVAILABLE" ? "load failed" : null,
+      models: [{
+        id: ROLE_PROFILE.model,
+        model: ROLE_PROFILE.model,
+        displayName: "Luna",
+        description: "fixture",
+        isDefault: true,
+        defaultReasoningEffort: ROLE_PROFILE.reasoningLevel,
+        supportedReasoningEfforts: [{ reasoningEffort: ROLE_PROFILE.reasoningLevel, description: "fixture" }],
+      }],
+      selectedOnlyModels: [],
+      permissionCeiling: "full",
+      providers: [provider],
+    })) as never);
+    let spawnCalls = 0;
+    fixture.host.harness.sdk.stub("threads.spawn", (async () => { spawnCalls += 1; throw new Error("route refusal must precede spawn"); }) as never);
+    let result: Record<string, unknown> | undefined;
+    let error: unknown;
+    try {
+      result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+        request: transitionRequest(fixture.fenceToken, "in_progress", 2, {
+          workAttempt: { laneId: "route-refusal", threadId: undefined, assignmentKind: "write", requestedProfile: profile as never },
+        }),
+        spawn: dispatchSpawn(fixture.orchestratorThreadId, profile as never),
+      }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string) as Record<string, unknown>;
+    } catch (caught) {
+      error = caught;
+    }
+    if (expectedMessage) {
+      expect(result).toMatchObject({ outcome: expectedOutcome, attempted: expectedOutcome === "EXTERNAL_UNAVAILABLE" ? 1 : 0, verified: 0, message: expectedMessage });
+    } else {
+      expect(String(error)).toContain("request.workAttempt.requestedProfile.model");
+    }
+    expect(spawnCalls).toBe(0);
+    expect(exportFoundation(fixture.db, PROJECT_ID)).toEqual(before);
+  });
+
   it("refuses pull-request review dispatch through the local candidate lane before intent or spawn", async () => {
     const fixture = await assignmentFixture({ withoutGithubIssues: true });
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2)).outcome).toBe("OK");
@@ -12155,7 +12353,7 @@ else printf '%s\\n' '[]'; fi
 
   it("appends authority-root schema and bumps the runtime contract", () => {
     expect(SCHEMA_VERSION).toBe(35);
-    expect(RUNTIME_CONTRACT_VERSION).toBe(33);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(34);
     expect(MIGRATIONS).toHaveLength(48);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
@@ -12182,7 +12380,7 @@ else printf '%s\\n' '[]'; fi
       oldSchemaVersion: 32,
       newSchemaVersion: 35,
       oldContractVersion: 27,
-      newContractVersion: 33,
+      newContractVersion: 34,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -12192,7 +12390,7 @@ else printf '%s\\n' '[]'; fi
       oldSchemaVersion: 32,
       newSchemaVersion: 35,
       oldContractVersion: 27,
-      newContractVersion: 33,
+      newContractVersion: 34,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -12200,13 +12398,14 @@ else printf '%s\\n' '[]'; fi
     });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ action: "refused", verified: 0 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 31))).toMatchObject({ action: "refused", verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 33))).toMatchObject({ action: "reread", verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 33))).toMatchObject({ action: "refused", verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 34))).toMatchObject({ action: "reread", verified: 4 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 32,
       newSchemaVersion: 35,
       oldContractVersion: 27,
-      newContractVersion: 33,
+      newContractVersion: 34,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -12478,7 +12677,7 @@ else printf '%s\\n' '[]'; fi
   });
 
   it("assembles the production v22 cached-consumer rollout receipt with stale-v21 refusal semantics", async () => {
-    expect(RUNTIME_CONTRACT_VERSION).toBe(33);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(34);
     expect(SCHEMA_VERSION).toBe(35);
     expect(MIGRATIONS).toHaveLength(48);
     expect(contractDigest).not.toBe("d4e51b0b1fd68957120cea5febb7762d6c3b9eddab76f67916e556830b062b83");
@@ -12497,7 +12696,7 @@ else printf '%s\\n' '[]'; fi
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 35, observedContractVersion: 33 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 35, observedContractVersion: 34 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -13123,7 +13322,7 @@ else printf '%s\\n' '[]'; fi
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
       observedSchemaVersion: 35,
-      observedContractVersion: 33,
+      observedContractVersion: 34,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -13205,7 +13404,7 @@ else printf '%s\\n' '[]'; fi
       evidence: {
         cachedConsumers: {
           oldContractVersion: 27,
-          newContractVersion: 33,
+          newContractVersion: 34,
           action: "unknown",
           expected: 4,
           attempted: 0,
@@ -13347,7 +13546,7 @@ else printf '%s\\n' '[]'; fi
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 35, schemaDigest, contractVersion: 33, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 35, schemaDigest, contractVersion: 34, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -14745,7 +14944,7 @@ else printf '%s\\n' '[]'; fi
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
   });
 
-  it("selects exact worker and reviewer profiles and binds config continuation to that selector", async () => {
+  it("authorizes writing by exact worker scope while reviewers remain profile-bound", async () => {
     const host = await loadedHost();
     const config = multiProfileRoleConfig();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config });
@@ -14765,10 +14964,11 @@ else printf '%s\\n' '[]'; fi
     expect(prove({ requestedProfile: CLAUDE_PROFILE })).toMatchObject({ assignmentKind: "write", continued: false });
     expect(prove({ assignmentKind: "review" })).toMatchObject({ assignmentKind: "review", continued: false });
     expect(prove({ assignmentKind: "review", requestedProfile: CLAUDE_PROFILE })).toMatchObject({ assignmentKind: "review", continued: false });
+    expect(() => prove({ assignmentKind: "review", requestedProfile: { ...ROLE_PROFILE, model: "unconfigured-review-route" } })).toThrow(/independent-reviewer/u);
+    expect(prove({ requestedProfile: { ...ROLE_PROFILE, model: "unconfigured-route" } })).toMatchObject({ assignmentKind: "write", continued: false });
 
     const beforeRefusals = exportFoundation(db, PROJECT_ID);
     for (const overrides of [
-      { requestedProfile: { ...ROLE_PROFILE, model: "wrong-profile" } },
       { repoTargetId: SECOND_TARGET_ID },
       { domainId: "foreign-domain" },
       { taskClass: "foreign-task" },
@@ -14813,7 +15013,24 @@ else printf '%s\\n' '[]'; fi
       config: changedConfig,
       targets: [target],
     }).outcome).toBe("OK");
-    expect(() => prove({ expectedConfigRevision: 3 })).toThrow();
+    expect(prove({ expectedConfigRevision: 3 })).toMatchObject({ continued: true, currentConfigRevision: 3 });
+
+    const noWorkerConfig = structuredClone(changedConfig) as typeof changedConfig;
+    noWorkerConfig.extensions.bbCollab.roleRequirements =
+      (noWorkerConfig.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>)
+        .filter((requirement) => requirement.roleId !== "worker");
+    expect(applyWithFixtureReceipt(db, {
+      ...bootstrapRequest(),
+      operationClass: "config_revision",
+      idempotencyKey: "gh654-config-4-no-worker-scope",
+      expectedConfigRevision: 3,
+      configRevision: 4,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fenceToken,
+      config: noWorkerConfig,
+      targets: [target],
+    }).outcome).toBe("OK");
+    expect(() => prove({ expectedConfigRevision: 4 })).toThrow(/worker scope/u);
   });
 
   it("rejects duplicate requirement IDs and indistinguishable selectors before config commit", async () => {
@@ -14854,206 +15071,6 @@ else printf '%s\\n' '[]'; fi
       { repo_target_id: TARGET_ID },
       { repo_target_id: TARGET_ID },
     ]);
-  });
-
-  it("rejects routing-suffix SKUs outside director-seat and preserves the ratified standby", async () => {
-    for (const mutate of [
-      (config: ReturnType<typeof roleConfig>) => {
-        const worker = (config.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>).find((requirement) => requirement.roleId === "worker")!;
-        worker.executedProfile = { ...(worker.executedProfile as Record<string, unknown>), model: "gpt-5.6-luna[1m]" };
-      },
-      (config: ReturnType<typeof roleConfig>) => {
-        const worker = (config.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>).find((requirement) => requirement.roleId === "worker")!;
-        worker.standbyProfile = { ...DIRECTOR_PROFILE };
-      },
-    ]) {
-      const host = await loadedHost();
-      const db = host.bb.storage.database();
-      seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
-      const config = roleConfig();
-      mutate(config);
-      expect(applyFixtureMutation(db, bootstrapRequest(PROJECT_ID, { config })).outcome).toBe("INVALID_INPUT");
-      expect(db.prepare("SELECT COUNT(*) AS count FROM project_config_revisions").get()).toEqual({ count: 0 });
-    }
-
-    const directorHost = await loadedHost();
-    const directorDb = directorHost.bb.storage.database();
-    seedVerifiedFixtureReceipt(directorDb, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
-    expect(applyFixtureMutation(directorDb, bootstrapRequest(PROJECT_ID, {
-      config: directorSeatConfig(DIRECTOR_STANDBY_PROFILE, DIRECTOR_PROFILE),
-    })).outcome).toBe("OK");
-  });
-
-  it("applies the exact Artinspire r6 to r7 UI worker profile only with exact policy and live matrix bindings", async () => {
-    const host = await loadedHost();
-    const db = host.bb.storage.database();
-    seedVerifiedFixtureReceipt(db, { projectId: PROJECT_ID, receiptId: RECEIPT_ID });
-    const r6Config = roleConfig();
-    const bootstrap = applyWithFixtureReceipt(db, bootstrapRequest(PROJECT_ID, { config: r6Config }));
-    expect(bootstrap.outcome).toBe("OK");
-    const fenceToken = (bootstrap.evidence as { fenceToken: string }).fenceToken;
-    for (let revision = 2; revision <= 6; revision += 1) {
-      expect(applyWithFixtureReceipt(db, {
-        ...bootstrapRequest(),
-        operationClass: "config_revision",
-        idempotencyKey: `artinspire-config-${revision}`,
-        expectedConfigRevision: revision - 1,
-        configRevision: revision,
-        expectedGovernanceEpoch: 1,
-        expectedFenceToken: fenceToken,
-        config: r6Config,
-      }).outcome).toBe("OK");
-    }
-
-    const oldQualification = qualificationRequest(fenceToken, {
-      idempotencyKey: "artinspire-r6-worker-qualification",
-      expectedConfigRevision: 6,
-      repoTargetId: TARGET_ID,
-      roleId: "worker",
-      roleRequirementId: "worker-v1",
-      qualificationId: "artinspire-r6-worker-qualification",
-    });
-    expect(applyWithFixtureReceipt(db, oldQualification, null, roleReader()).outcome).toBe("OK");
-
-    const validConfig = uiUxRoutingConfig();
-    const r7Request = (config: unknown, idempotencyKey: string, expectedConfigRevision = 6): ApplyRequest => ({
-      ...bootstrapRequest(),
-      operationClass: "config_revision",
-      idempotencyKey,
-      expectedConfigRevision,
-      configRevision: expectedConfigRevision + 1,
-      expectedGovernanceEpoch: 1,
-      expectedFenceToken: fenceToken,
-      config,
-    });
-    const assertRefusalWithoutMutation = (request: ApplyRequest, expected: FoundationResult["outcome"], matrix: readonly (typeof UI_UX_PROVIDER_MATRIX)[number][] = UI_UX_PROVIDER_MATRIX) => {
-      const before = canonicalJson(exportFoundation(db, PROJECT_ID));
-      const refused = applyWithFixtureReceipt(db, request, null, null, null, null, null, matrix);
-      expect(refused.outcome).toBe(expected);
-      expect(canonicalJson(exportFoundation(db, PROJECT_ID))).toBe(before);
-    };
-
-    const profileFields = Object.keys(UI_UX_ROUTING_PROFILE) as Array<keyof typeof UI_UX_ROUTING_PROFILE>;
-    const replacements = {
-      providerId: "foreign-provider",
-      model: "claude-opus-5[2m]",
-      reasoningLevel: "high",
-      permissionMode: "auto",
-      serviceTier: "fast",
-      visibility: "hidden",
-    } as const;
-    for (const field of profileFields) {
-      const config = uiUxRoutingConfig();
-      const worker = (config.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>).find((requirement) => requirement.roleId === "worker")!;
-      worker.executedProfile = { ...UI_UX_ROUTING_PROFILE, [field]: replacements[field] };
-      assertRefusalWithoutMutation(r7Request(config, `artinspire-r7-profile-${field}`), "INVALID_INPUT");
-    }
-
-    for (const [name, mutate, matrix = UI_UX_PROVIDER_MATRIX] of [
-      ["role", (config: ReturnType<typeof uiUxRoutingConfig>) => {
-        const worker = (config.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>).find((requirement) => requirement.roleId === "worker")!;
-        worker.roleId = "independent-reviewer";
-      }],
-      ["target", (config: ReturnType<typeof uiUxRoutingConfig>) => {
-        const worker = (config.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>).find((requirement) => requirement.roleId === "worker")!;
-        worker.repoTargetId = SECOND_TARGET_ID;
-      }],
-      ["policy-absent", (config: ReturnType<typeof uiUxRoutingConfig>) => { delete config.extensions.bbCollab.uiUxRoutingPolicy; }],
-      ["policy-duplicate", (config: ReturnType<typeof uiUxRoutingConfig>) => {
-        const policy = config.extensions.bbCollab.uiUxRoutingPolicy as { allowedProfiles: unknown[] };
-        policy.allowedProfiles.push({ ...UI_UX_ROUTING_PROFILE });
-      }],
-      ["policy-binding", (config: ReturnType<typeof uiUxRoutingConfig>) => {
-        const policy = config.extensions.bbCollab.uiUxRoutingPolicy as { allowedProfiles: Array<Record<string, unknown>> };
-        policy.allowedProfiles[0] = { ...UI_UX_ROUTING_PROFILE, permissionMode: "auto" };
-      }],
-      ["luna", (config: ReturnType<typeof uiUxRoutingConfig>) => {
-        const worker = (config.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>).find((requirement) => requirement.roleId === "worker")!;
-        worker.executedProfile = { ...LUNA_PROFILE };
-        (config.extensions.bbCollab.uiUxRoutingPolicy as { allowedProfiles: unknown[] }).allowedProfiles = [{ ...LUNA_PROFILE }];
-      }, LUNA_PROVIDER_MATRIX],
-      ["matrix-absent", () => {}, []],
-      ["matrix-reasoning", () => {}, [{ ...UI_UX_PROVIDER_MATRIX[0]!, reasoningLevel: "high" }]],
-      ["matrix-binding", () => {}, [{ ...UI_UX_PROVIDER_MATRIX[0]!, repoTargetId: SECOND_TARGET_ID }]],
-    ] as const) {
-      const config = uiUxRoutingConfig();
-      mutate(config);
-      assertRefusalWithoutMutation(r7Request(config, `artinspire-r7-${name}`), "INVALID_INPUT", matrix);
-    }
-    assertRefusalWithoutMutation(r7Request(validConfig, "artinspire-r7-stale-config", 5), "PROJECT_CONFIG_STALE");
-
-    const provider = {
-      id: UI_UX_ROUTING_PROFILE.providerId,
-      displayName: "Claude Code",
-      available: true,
-      logoUrl: null,
-      composerActions: [],
-      capabilities: {
-        permissionModes: ["full"], supportsFork: true, supportsNativeUserQuestion: false,
-        supportsServiceTier: false, supportsSessionRewind: false, supportsThreadArchive: true, supportsThreadRename: true,
-      },
-    };
-    host.harness.sdk.stub("providers.list", (async () => [provider]) as never);
-    host.harness.sdk.stub("providers.models", (async () => ({
-      modelLoadError: null,
-      models: [{
-        id: UI_UX_ROUTING_PROFILE.model,
-        model: UI_UX_ROUTING_PROFILE.model,
-        displayName: "Opus routed",
-        description: "fixture",
-        isDefault: false,
-        defaultReasoningEffort: "medium",
-        supportedReasoningEfforts: [{ reasoningEffort: "medium", description: "fixture" }],
-      }],
-      selectedOnlyModels: [],
-      permissionCeiling: "full",
-      providers: [provider],
-    })) as never);
-    expect(await host.harness.callRpc("apply", r7Request(validConfig, "artinspire-r7-live-matrix"))).toMatchObject({ outcome: "OK", currentConfigRevision: 7 });
-
-    const uiReader = roleReader((facts) => {
-      facts.thread.providerId = UI_UX_ROUTING_PROFILE.providerId;
-      facts.events[0]!.data.execution = {
-        model: UI_UX_ROUTING_PROFILE.model,
-        reasoningLevel: UI_UX_ROUTING_PROFILE.reasoningLevel,
-        permissionMode: UI_UX_ROUTING_PROFILE.permissionMode,
-        serviceTier: UI_UX_ROUTING_PROFILE.serviceTier,
-        source: "client/turn/requested",
-      };
-    });
-    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, {
-      idempotencyKey: "artinspire-r7-stale-worker-succession",
-      expectedConfigRevision: 7,
-      repoTargetId: TARGET_ID,
-      roleId: "worker",
-      roleRequirementId: "worker-v1",
-      qualificationId: "artinspire-r6-worker-qualification",
-      profileDigest: requestedProfileDigest(UI_UX_ROUTING_PROFILE),
-    }), null, uiReader).outcome).toBe("CAPABILITY_UNKNOWN");
-    const freshQualification = qualificationRequest(fenceToken, {
-      idempotencyKey: "artinspire-r7-worker-qualification",
-      expectedConfigRevision: 7,
-      repoTargetId: TARGET_ID,
-      roleId: "worker",
-      roleRequirementId: "worker-v1",
-      qualificationId: "artinspire-r7-worker-qualification",
-      declaredProfile: UI_UX_ROUTING_PROFILE,
-    });
-    expect(applyWithFixtureReceipt(db, freshQualification, null, uiReader).outcome).toBe("OK");
-    expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, {
-      idempotencyKey: "artinspire-r7-worker-succession",
-      expectedConfigRevision: 7,
-      repoTargetId: TARGET_ID,
-      roleId: "worker",
-      roleRequirementId: "worker-v1",
-      qualificationId: "artinspire-r7-worker-qualification",
-      profileDigest: requestedProfileDigest(UI_UX_ROUTING_PROFILE),
-    }), null, uiReader).outcome).toBe("OK");
-
-    const fastProfile = { ...UI_UX_ROUTING_PROFILE, serviceTier: "fast" };
-    const fastProvider = { ...provider, capabilities: { ...provider.capabilities, supportsServiceTier: true } };
-    host.harness.sdk.stub("providers.list", (async () => [fastProvider]) as never);
-    expect(await host.harness.callRpc("apply", r7Request(uiUxRoutingConfig(fastProfile), "artinspire-r8-fast-service-tier", 7))).toMatchObject({ outcome: "OK", currentConfigRevision: 8 });
   });
 
   it("allows stale proposed -> ready -> in_progress -> review_pending -> in_progress transitions without rebinding", async () => {
@@ -18033,11 +18050,11 @@ printf '%s\\n' '${external}'
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 33, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 33, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 33, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 31))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 33, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 33))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 33, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 34, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 34, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 34, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 31))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 34, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 34))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 34, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 

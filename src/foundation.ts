@@ -11,7 +11,7 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
-export const RUNTIME_CONTRACT_VERSION = 33;
+export const RUNTIME_CONTRACT_VERSION = 34;
 export const SCHEMA_VERSION = 35;
 // v27 records correlated terminal evidence and first-class interrupted attempts.
 const PREVIOUS_RUNTIME_CONTRACT_VERSION = 27;
@@ -2478,25 +2478,6 @@ const executionProfileSchema = z
     visibility: z.enum(["visible", "hidden"]),
   })
   .strict();
-export type ProviderMatrixProfile = Readonly<{
-  repoTargetId: string;
-  providerId: string;
-  model: string;
-  reasoningLevel: string;
-  serviceTier: string;
-}>;
-const uiUxRoutingPolicySchema = z
-  .object({
-    repoTargetId: id,
-    allowedProfiles: z.array(executionProfileSchema).min(1).max(128),
-  })
-  .strict()
-  .superRefine((policy, ctx) => {
-    const profiles = policy.allowedProfiles.map(canonicalJson);
-    if (new Set(profiles).size !== profiles.length) {
-      ctx.addIssue({ code: "custom", path: ["allowedProfiles"], message: "UI/UX routing policy profiles must be unique" });
-    }
-  });
 const workAttemptSchema = z
   .object({
     laneId: id,
@@ -2630,10 +2611,6 @@ const reviewPolicySchema = z.object({ connectors: reviewConnectorsSchema }).stri
 function profileIsOneOf(profile: unknown, profiles: readonly unknown[]): boolean {
   const value = canonicalJson(profile);
   return profiles.some((candidate) => value === canonicalJson(candidate));
-}
-
-function hasRoutingSuffix(profile: { model: string }): boolean {
-  return /\[[^\]]+\]$/u.test(profile.model);
 }
 
 function isRatifiedDirectorSeatRequirement(requirement: {
@@ -3976,17 +3953,7 @@ export function canonicalJson(value: unknown): string {
   return JSON.stringify(stableValue(value));
 }
 
-export function uiUxRoutingPolicyFromConfig(value: unknown): z.infer<typeof uiUxRoutingPolicySchema> | null {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
-  const extensions = (value as Record<string, unknown>).extensions;
-  if (extensions === null || typeof extensions !== "object" || Array.isArray(extensions)) return null;
-  const bbCollab = (extensions as Record<string, unknown>).bbCollab;
-  if (bbCollab === null || typeof bbCollab !== "object" || Array.isArray(bbCollab)) return null;
-  const parsed = uiUxRoutingPolicySchema.safeParse((bbCollab as Record<string, unknown>).uiUxRoutingPolicy);
-  return parsed.success ? parsed.data : null;
-}
-
-function validateConfig(value: unknown, providerMatrix: readonly ProviderMatrixProfile[] = []): string {
+function validateConfig(value: unknown): string {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw refusal("MALFORMED_JSON", "config must be a JSON object");
   }
@@ -4028,43 +3995,6 @@ function validateConfig(value: unknown, providerMatrix: readonly ProviderMatrixP
       if (domains !== undefined) {
         const parsed = domainsSchema.safeParse(domains);
         if (!parsed.success) throw refusal("INVALID_INPUT", parsed.error.message);
-      }
-      const uiUxRoutingPolicy = (bbCollab as Record<string, unknown>).uiUxRoutingPolicy;
-      const parsedPolicy = uiUxRoutingPolicy === undefined ? null : uiUxRoutingPolicySchema.safeParse(uiUxRoutingPolicy);
-      if (parsedPolicy && !parsedPolicy.success) throw refusal("INVALID_INPUT", parsedPolicy.error.message);
-      const requirements = roleRequirements !== undefined
-        ? roleRequirementsSchema.parse(roleRequirements)
-        : domains !== undefined
-          ? domainsSchema.parse(domains).flatMap((domain) => domain.roleRequirements)
-          : [];
-      const suffixRequirements = requirements.filter((requirement) =>
-        requirement.roleRequirementId !== DIRECTOR_SEAT_ROLE_REQUIREMENT_ID && hasRoutingSuffix(requirement.executedProfile));
-      if (suffixRequirements.length > 0) {
-        const requirement = suffixRequirements.length === 1 ? suffixRequirements[0] : null;
-        const policy = parsedPolicy?.success ? parsedPolicy.data : null;
-        const profile = requirement?.executedProfile;
-        const matrixProfile = requirement && profile ? {
-          repoTargetId: requirement.repoTargetId,
-          providerId: profile.providerId,
-          model: profile.model,
-          reasoningLevel: profile.reasoningLevel,
-          serviceTier: profile.serviceTier,
-        } : null;
-        if (
-          !requirement || requirement.roleId !== "worker" || requirement.repoTargetId === null ||
-          !policy || policy.repoTargetId !== requirement.repoTargetId ||
-          !matrixProfile || !profileIsOneOf(matrixProfile, providerMatrix)
-        ) {
-          throw refusal("INVALID_INPUT", "routing-suffix SKU models require one exact policy-bound worker profile and authoritative provider matrix match");
-        }
-      }
-      if (parsedPolicy?.success) {
-        const policyRequirements = requirements.filter((requirement) =>
-          requirement.roleId === "worker" && requirement.repoTargetId === parsedPolicy.data.repoTargetId &&
-          profileIsOneOf(requirement.executedProfile, parsedPolicy.data.allowedProfiles));
-        if (policyRequirements.length !== 1 || !hasRoutingSuffix(policyRequirements[0]!.executedProfile)) {
-          throw refusal("INVALID_INPUT", "UI/UX routing policy must bind one exact routing-suffix worker profile");
-        }
       }
       const writingLaneCeiling = (bbCollab as Record<string, unknown>).writingLaneCeiling;
       if (writingLaneCeiling !== undefined && (!Number.isInteger(writingLaneCeiling) || Number(writingLaneCeiling) < 0 || Number(writingLaneCeiling) > MAX_WRITING_LANE_CEILING)) {
@@ -4316,11 +4246,17 @@ function dispatchTargetIdentity(row: Record<string, unknown>): Record<string, un
   };
 }
 
-function dispatchRoleRequirement(db: SqliteDatabase, projectId: string, configRevision: number, repoTargetId: string, domainId: string, taskClass: string, requestedProfile: ExecutionProfile, assignmentKind: "write" | "review" | "probe" = "write"): RoleRequirement & { domainId: string } {
+function dispatchWorkerScope(db: SqliteDatabase, projectId: string, configRevision: number, repoTargetId: string, domainId: string, taskClass: string): { roleId: "worker"; repoTargetId: string; domainId: string } {
   const domain = domainForTaskClass(configuredDomains(db, projectId, configRevision), taskClass, domainId);
-  const roleId = assignmentKind === "review" ? "independent-reviewer" : "worker";
-  const requirements = domain.roleRequirements.filter((requirement) => requirement.roleId === roleId && requirement.repoTargetId === repoTargetId && dispatchProfileMatches(requestedProfile, requirement.executedProfile));
-  if (requirements.length !== 1) throw refusal("PROJECT_CONFIG_STALE", "the exact worker role requirement is missing or ambiguous across the config revision");
+  const requirements = domain.roleRequirements.filter((requirement) => requirement.roleId === "worker" && requirement.repoTargetId === repoTargetId);
+  if (requirements.length === 0) throw refusal("PROJECT_CONFIG_STALE", "the exact worker scope is missing from the config revision");
+  return { roleId: "worker", repoTargetId, domainId };
+}
+
+function dispatchRoleRequirement(db: SqliteDatabase, projectId: string, configRevision: number, repoTargetId: string, domainId: string, taskClass: string, requestedProfile: ExecutionProfile): RoleRequirement & { domainId: string } {
+  const domain = domainForTaskClass(configuredDomains(db, projectId, configRevision), taskClass, domainId);
+  const requirements = domain.roleRequirements.filter((requirement) => requirement.roleId === "independent-reviewer" && requirement.repoTargetId === repoTargetId && dispatchProfileMatches(requestedProfile, requirement.executedProfile));
+  if (requirements.length !== 1) throw refusal("PROJECT_CONFIG_STALE", "the exact independent-reviewer role requirement is missing or ambiguous across the config revision");
   return { ...requirements[0]!, domainId };
 }
 
@@ -4394,13 +4330,26 @@ export function proveWorkItemDispatchConfig(
 
   const assignmentKind = request.assignmentKind ?? "write";
   if (assignmentKind === "probe") throw refusal("WORK_ITEM_STATE_INVALID", "probe cannot use WorkItem lane dispatch");
-  const historicalRole = dispatchRoleRequirement(db, request.projectId, workItem.config_revision, request.repoTargetId, workItem.domain_id, workItem.task_class, request.requestedProfile, assignmentKind);
-  const currentRole = dispatchRoleRequirement(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, workItem.task_class, request.requestedProfile, assignmentKind);
+  const historicalWorkerScope = assignmentKind === "write"
+    ? dispatchWorkerScope(db, request.projectId, workItem.config_revision, request.repoTargetId, workItem.domain_id, workItem.task_class)
+    : undefined;
+  const currentWorkerScope = assignmentKind === "write"
+    ? dispatchWorkerScope(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, workItem.task_class)
+    : undefined;
+  const historicalRole = assignmentKind === "review"
+    ? dispatchRoleRequirement(db, request.projectId, workItem.config_revision, request.repoTargetId, workItem.domain_id, workItem.task_class, request.requestedProfile)
+    : undefined;
+  const currentRole = assignmentKind === "review"
+    ? dispatchRoleRequirement(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, workItem.task_class, request.requestedProfile)
+    : undefined;
   const reviewerAuthority = assignmentKind === "review" && request.candidateKind === "local"
-    ? dispatchReviewerAuthority(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, currentRole)
+    ? dispatchReviewerAuthority(db, request.projectId, currentConfigRevision, request.repoTargetId, workItem.domain_id, currentRole!)
     : undefined;
   const requestedProfile = dispatchProfileIdentity(request.requestedProfile);
-  if (!dispatchProfileMatches(request.requestedProfile, historicalRole.executedProfile) || !dispatchProfileMatches(request.requestedProfile, currentRole.executedProfile)) {
+  if (assignmentKind === "write" && canonicalJson(historicalWorkerScope) !== canonicalJson(currentWorkerScope)) {
+    throw refusal("PROJECT_CONFIG_STALE", "dispatch worker scope is not equivalent across config revisions");
+  }
+  if (assignmentKind === "review" && (!historicalRole || !currentRole || !dispatchProfileMatches(request.requestedProfile, historicalRole.executedProfile) || !dispatchProfileMatches(request.requestedProfile, currentRole.executedProfile))) {
     throw refusal("PROJECT_CONFIG_STALE", "dispatch profile does not equal the exact historical and current worker requirement");
   }
   const historicalConfigJson = storedConfigJson(db, request.projectId, workItem.config_revision);
@@ -4412,7 +4361,7 @@ export function proveWorkItemDispatchConfig(
     domainId: workItem.domain_id,
     taskClass: workItem.task_class,
     assignmentKind,
-    roleRequirement: historicalRole,
+    roleRequirement: assignmentKind === "write" ? historicalWorkerScope : historicalRole,
     target: dispatchTargetIdentity(historicalTarget),
     ...(reviewerAuthority === undefined ? {} : { reviewerAuthority }),
   };
@@ -4423,7 +4372,7 @@ export function proveWorkItemDispatchConfig(
     domainId: workItem.domain_id,
     taskClass: workItem.task_class,
     assignmentKind,
-    roleRequirement: currentRole,
+    roleRequirement: assignmentKind === "write" ? currentWorkerScope : currentRole,
     target: dispatchTargetIdentity(currentTarget),
     ...(reviewerAuthority === undefined ? {} : { reviewerAuthority }),
   };
@@ -5173,7 +5122,7 @@ function deriveBootstrapActor(
   };
 }
 
-function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: string, providerMatrix: readonly ProviderMatrixProfile[]): FoundationResult {
+function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
   if (request.expectedConfigRevision !== null) {
     throw refusal("PROJECT_CONFIG_STALE", "bootstrap requires an empty config head");
   }
@@ -5185,7 +5134,7 @@ function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: strin
   if (request.expectedGovernanceEpoch !== null || request.expectedFenceToken !== null) {
     throw refusal("GOVERNOR_CAS_FAILED", "bootstrap requires an empty governorship head");
   }
-  const config = request.config === undefined ? undefined : validateConfig(request.config, providerMatrix);
+  const config = request.config === undefined ? undefined : validateConfig(request.config);
   if (!config) throw refusal("INVALID_INPUT", "bootstrap requires a config object");
   const targets = requireTargetCollection(request, "bootstrap");
   requireMappedTargets(config, targets);
@@ -5293,7 +5242,7 @@ function applyBootstrap(db: SqliteDatabase, request: ApplyRequest, digest: strin
   );
 }
 
-function applyConfigRevision(db: SqliteDatabase, request: ApplyRequest, digest: string, providerMatrix: readonly ProviderMatrixProfile[]): FoundationResult {
+function applyConfigRevision(db: SqliteDatabase, request: ApplyRequest, digest: string): FoundationResult {
   const currentRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
@@ -5301,7 +5250,7 @@ function applyConfigRevision(db: SqliteDatabase, request: ApplyRequest, digest: 
     requireTarget(db, request.projectId, currentRevision, request.repoTargetId);
     throw refusal("INVALID_INPUT", "config revision requires config and target collection");
   }
-  const configJson = validateConfig(request.config, providerMatrix);
+  const configJson = validateConfig(request.config);
   const targets = requireTargetCollection(request, "config revision");
   requireMappedTargets(configJson, targets);
   const nextRevision = currentRevision + 1;
@@ -9884,7 +9833,9 @@ function applyWorkItemTransition(
       expectedResourceRevision: request.expectedResourceRevision ?? undefined,
     });
     if (prior?.state === "interrupted") supersedeInterruptedAttempt(db, request.projectId, prior.execution_attempt_id);
-    else if (prior) terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "superseded");
+    else if (prior && WORK_ITEM_CAPACITY_ATTEMPT_STATES.includes(prior.state as typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES[number])) {
+      terminalizeWorkItemAttempt(db, request.projectId, workItem.work_item_id, "superseded");
+    }
     const createdAtMs = now();
     const executionAttemptId = insertWorkItemAttempt(db, {
       projectId: request.projectId,
@@ -11578,7 +11529,6 @@ export function applyAuthorizedMutation(
   executionAttemptEvidenceReader: ExecutionAttemptEvidenceReader | null = null,
   dryRun = false,
   authenticatedNativeCaller: AuthenticatedNativeCaller | null = null,
-  providerMatrix: readonly ProviderMatrixProfile[] = [],
 ): FoundationResult {
   let request: ApplyRequest;
   try {
@@ -11588,7 +11538,7 @@ export function applyAuthorizedMutation(
     return result("INVALID_INPUT", "apply", 1, 0, 0, { message: String(error) });
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun, authenticatedNativeCaller, providerMatrix);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun, authenticatedNativeCaller);
 }
 
 export async function applyAuthorizedMutationAsync(
@@ -11601,7 +11551,6 @@ export async function applyAuthorizedMutationAsync(
   githubIssueReader: GitHubIssueReader | null = null,
   executionAttemptEvidenceReader: ExecutionAttemptEvidenceReader | null = null,
   dryRun = false,
-  providerMatrix: readonly ProviderMatrixProfile[] = [],
 ): Promise<FoundationResult> {
   let request: ApplyRequest;
   try {
@@ -11612,7 +11561,7 @@ export async function applyAuthorizedMutationAsync(
   }
   if (!db) return unavailableResult(request.projectId, "canonical SQLite store is unavailable");
   if (request.operationClass !== "github_issue_projection" || !githubAdapter?.readAsync || !githubAdapter.mutateAsync) {
-    return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun, null, providerMatrix);
+    return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, githubIssueReader, executionAttemptEvidenceReader, dryRun);
   }
   try {
     return await applyGithubIssueProjectionAsync(db, request, mutationRequestDigest(request), githubAdapter);
@@ -11633,7 +11582,6 @@ export function applyFixtureMutation(
   executionAttemptEvidenceReader: ExecutionAttemptEvidenceReader | null = null,
   dryRun = false,
   authenticatedNativeCaller: AuthenticatedNativeCaller | null = null,
-  providerMatrix: readonly ProviderMatrixProfile[] = [],
 ): FoundationResult {
   let request: ApplyRequest;
   try {
@@ -11691,9 +11639,9 @@ export function applyFixtureMutation(
       if (replay) return replay;
       switch (request.operationClass) {
         case "bootstrap":
-          return applyBootstrap(db, request, digest, providerMatrix);
+          return applyBootstrap(db, request, digest);
         case "config_revision":
-          return applyConfigRevision(db, request, digest, providerMatrix);
+          return applyConfigRevision(db, request, digest);
         case "governor_claim":
           return applyGovernorClaim(db, request, digest);
         case "migration_prepare":
