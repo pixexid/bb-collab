@@ -39,6 +39,7 @@ jobs:
       - name: Reproduce release digest
         shell: bash
         run: |
+          node -e 'const m=require("./release/release-manifest.json"); if(m.version!==2||m.loadAuthority!=="inactive") process.exit(1)'
           cp release/release-manifest.json "$RUNNER_TEMP/release-manifest.json"
           npm run release
           cmp "$RUNNER_TEMP/release-manifest.json" release/release-manifest.json

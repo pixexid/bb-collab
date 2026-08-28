@@ -1,5 +1,4 @@
 node_modules/
 dist/
 release/
-.bb-collab-release.json
 npm-debug.log*

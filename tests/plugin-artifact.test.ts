@@ -73,9 +73,9 @@ describe("path-install server artifact", () => {
     }
   });
 
-  // The release manifest keeps the server and app in one consumed artifact;
-  // neither generated bundle is source-review authority.
-  it("releases the app bundle alongside the server artifact", () => {
+  // The inactive candidate keeps every generated bundle in one closed-world
+  // artifact without claiming that the host loads it.
+  it("includes the app bundle alongside the server artifact candidate", () => {
     const manifest = JSON.parse(readFileSync(join(PROJECT_ROOT, "release/release-manifest.json"), "utf8"));
     expect(manifest.files.map(({ path }: { path: string }) => path)).toEqual(expect.arrayContaining([
       "dist/server.js",

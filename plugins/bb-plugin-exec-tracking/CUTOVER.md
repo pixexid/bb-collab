@@ -56,9 +56,7 @@ test ! -e "$RETAINED_PATH" && test ! -L "$RETAINED_PATH"
 ## Bind the reviewed checkout and registration
 
 Fetch only to prove that the pinned clean checkout is the deployed `origin/main`.
-Install the exact successful push artifact through the repository's
-[canonical deploy sequence](../../README.md#deploy-sequence) before touching
-the registered path; do not rebuild release bytes in this cutover.
+Build and compare tracked dist before touching the registered path.
 
 ```zsh
 git -C "$DEPLOYED_CHECKOUT" fetch origin main
@@ -66,8 +64,9 @@ test "$(git -C "$DEPLOYED_CHECKOUT" rev-parse HEAD)" = "$EXPECTED_HEAD"
 test "$(git -C "$DEPLOYED_CHECKOUT" rev-parse origin/main)" = "$EXPECTED_HEAD"
 test -z "$(git -C "$DEPLOYED_CHECKOUT" status --porcelain=v1 --untracked-files=all)"
 test "$(realpath "$CANDIDATE_PATH")" = "$CANDIDATE_PATH"
-test -f "$DEPLOYED_CHECKOUT/.bb-collab-release.json"
-node "$DEPLOYED_CHECKOUT/scripts/check-dist.mjs" --deployed
+npm ci --prefix "$DEPLOYED_CHECKOUT"
+npm run build --prefix "$CANDIDATE_PATH"
+env -u BB_CLI node "$DEPLOYED_CHECKOUT/scripts/check-dist.mjs"
 git -C "$DEPLOYED_CHECKOUT" diff --exit-code
 test -z "$(git -C "$DEPLOYED_CHECKOUT" status --porcelain=v1 --untracked-files=all)"
 

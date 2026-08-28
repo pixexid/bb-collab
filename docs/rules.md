@@ -128,7 +128,7 @@ Inside the stated subject means inside what the ruling actually addressed, not a
 
 The check is per-change: name the deployed revision, establish containment and supervision — equality with `main` is not the test. "Merged, not deployed" is a complete and honest terminal status. Deploys run under the standing policy: orchestrator-run under standing authorization, zero-lane lull, store snapshot before, store-verified after, deployed SHA recorded in the handoff. Path plugins update via checkout-advance plus `bb plugin reload <id>`; `bb plugin update` refuses pinned sources.
 
-Generated bundles are release artifacts, not committed source-review authority. CI builds them with the pinned toolchain, publishes the exact-head manifest and digest, and deployment installs only that exact successful push artifact before reload. Source verification may generate ignored output but stays clean; a Git comparison of generated files is neither release provenance nor a deployment gate.
+Generated bundles are release artifacts, not committed source-review authority. CI builds an exact-head candidate with the pinned toolchain and publishes its manifest and digest; source verification may generate ignored output but stays clean. The candidate is explicitly inactive: do not install, rebind, reload, or deploy it until #423 supplies and proves loaded-authority activation. A Git comparison of generated files is neither release provenance nor a deployment gate.
 
 The deploy policy splits by surface. Canonical/store/fleet-state plugins retain
 the zero-lane lull, pre-deploy snapshot, and post-deploy store verification.

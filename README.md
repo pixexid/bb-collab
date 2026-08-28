@@ -2,15 +2,17 @@
 
 BB-native project governance, work lifecycle, and collaboration runtime.
 
-## Deployed artifact check
+## Inactive release candidate
 
-The recurring `fleet-watchdog` schedule runs the read-only
-`npm run --silent check:deployed-dist` every five minutes while the plugin is
-loaded. It requires the installed release manifest to name the checkout's exact
-commit and refuses any missing, extra, or digest-mismatched generated file. The
-scheduled check reports divergence; it never rebuilds or repairs the deployed
-checkout. Generated `dist/` is ignored source output, not committed review
-authority.
+CI builds generated bundles with the pinned toolchain and publishes one
+exact-head release manifest and digest. The v2 manifest is a closed-world
+candidate inventory with `loadAuthority: "inactive"`; generated `dist/` remains
+ignored output and is not committed source-review authority.
+
+`npm run --silent check:deployed-dist` intentionally refuses with `release
+candidate is inactive: loaded-authority activation is owned by #423`. Do not
+install, rebind, reload, or deploy this candidate. #423 owns the future
+loaded-authority activation and production procedure.
 
 ## Deploy sequence
 
@@ -20,34 +22,8 @@ burst. Immediately after a lane finishes, run its terminal WorkItem transition;
 otherwise a completed lane is indistinguishable from a silent one and coverage
 goes blind for the wrong reason.
 
-Resolve and download the unique successful push artifact before changing the
-deploy checkout, then install it only after the checkout reaches that commit:
-
-```sh
-git fetch origin main
-EXPECTED_HEAD="$(git rev-parse origin/main)"
-RUN_ID="$(gh run list --commit "$EXPECTED_HEAD" --workflow Verify --event push --status success --json databaseId --jq 'if length == 1 then .[0].databaseId else error("expected one successful push run") end')"
-RELEASE_DIR="$(mktemp -d)"
-gh run download "$RUN_ID" --name "bb-collab-release-$EXPECTED_HEAD" --dir "$RELEASE_DIR"
-git merge --ff-only origin/main
-node scripts/release-artifact.mjs install "$RELEASE_DIR"
-node scripts/check-dist.mjs --deployed
-bb plugin reload bb-collab
-bb plugin list
-bb collab doctor --project <id>
-# Wait more than 15 seconds.
-node scripts/check-dist.mjs --deployed
-# Run the change's live acceptance query against SQLite with ?mode=ro.
-```
-
-The successful exact-head workflow run is release provenance; its manifest
-records the reproducible digest and the install command consumes and rechecks
-those exact bytes. The fast-forward merge binds deployment to integrated main,
-and install refuses a manifest for any other commit before replacing `dist/`.
-Installing after the merge also makes generated files newer than source before
-the host can consider a fallback rebuild. Doctor checks live store conformance;
-the final query remains the change's own live proof rather than a green build
-standing in for it.
+The #716 release candidate is not a deploy input. Existing production handling
+continues unchanged until #423 activates a verified loaded-artifact contract.
 
 `reload-exit=0` is only the loader's verdict. `bb plugin list` is required
 because a reload once left the old lane-watcher resident with a closed database

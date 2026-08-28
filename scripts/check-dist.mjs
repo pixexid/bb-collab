@@ -6,7 +6,7 @@ const deployed = process.argv.includes("--deployed");
 const releaseIndex = process.argv.indexOf("--release");
 if (!deployed && releaseIndex < 0) throw new Error("usage: check-dist.mjs --deployed | --release <directory>");
 
-if (deployed) verifyRelease(root, join(root, ".bb-collab-release.json"), root);
+if (deployed) throw new Error("release candidate is inactive: loaded-authority activation is owned by #423");
 else {
   const directory = resolve(process.argv[releaseIndex + 1] ?? "");
   verifyRelease(directory, join(directory, "release-manifest.json"), root);
