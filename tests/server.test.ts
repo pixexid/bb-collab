@@ -14878,6 +14878,7 @@ else printf '%s\\n' '[]'; fi
     expect(prove({ requestedProfile: CLAUDE_PROFILE })).toMatchObject({ assignmentKind: "write", continued: false });
     expect(prove({ assignmentKind: "review" })).toMatchObject({ assignmentKind: "review", continued: false });
     expect(prove({ assignmentKind: "review", requestedProfile: CLAUDE_PROFILE })).toMatchObject({ assignmentKind: "review", continued: false });
+    expect(() => prove({ assignmentKind: "review", requestedProfile: { ...ROLE_PROFILE, model: "unconfigured-review-route" } })).toThrow(/independent-reviewer/u);
     expect(prove({ requestedProfile: { ...ROLE_PROFILE, model: "unconfigured-route" } })).toMatchObject({ assignmentKind: "write", continued: false });
 
     const beforeRefusals = exportFoundation(db, PROJECT_ID);
