@@ -8,7 +8,7 @@ import { createFakePluginHost } from "@bb/plugin-sdk/testing";
 import plugin from "../server.js";
 import { createLaneWatcher, type RoleHolderState } from "../src/awareness.js";
 import { PLUGIN_ID } from "../src/foundation.js";
-import { createStallGuardCycle, type StallGuardArtifact } from "../src/stall-guard.js";
+import { createStallGuardCycle, stallGuardTrustFromCanonical, type StallGuardArtifact } from "../src/stall-guard.js";
 
 const PROJECT_ID = "project-1";
 
@@ -51,6 +51,12 @@ function absentArtifact() {
 }
 
 describe("stall-guard artifact cycle", () => {
+  it("keeps source routine, tenant probation, and adopted graduation project-exact", () => {
+    expect(stallGuardTrustFromCanonical({ bootstrapDerived: false, adoptedGraduation: false })).toBe("graduated");
+    expect(stallGuardTrustFromCanonical({ bootstrapDerived: true, adoptedGraduation: false })).toBe("probationary");
+    expect(stallGuardTrustFromCanonical({ bootstrapDerived: true, adoptedGraduation: true })).toBe("graduated");
+  });
+
   it("retries a transient initial persistence read", async () => {
     let reads = 0;
     const cycle = createStallGuardCycle({
@@ -689,6 +695,53 @@ describe("stall-guard artifact cycle", () => {
     expect(await cycle.cycle(PROJECT_ID)).toMatchObject({ changed: 0, attempted: 0, verified: 0, steered: 0 });
 
     expect(declinedSteer).toHaveBeenCalledTimes(1);
+  });
+
+  it("emits a low-severity probationary tenant alert without silencing the wake", async () => {
+    let currentArtifact = absentArtifact();
+    const alerts: unknown[] = [];
+    const wakeRole = vi.fn().mockResolvedValue({ attempted: true, delivered: true });
+    const store = kvPersistence();
+    const cycle = createStallGuardCycle({
+      readProjectIds: () => [PROJECT_ID],
+      readRoleHolders: () => [holder(1, "current-holder")],
+      readArtifact: async () => currentArtifact,
+      wakeRole,
+      onAlert: (alert) => alerts.push(alert),
+      persistence: store.persistence,
+    });
+
+    await cycle.cycle(PROJECT_ID);
+    currentArtifact = artifact("changed");
+    await expect(cycle.cycle(PROJECT_ID)).resolves.toMatchObject({ attempted: 1, verified: 1, steered: 1 });
+
+    expect(alerts).toEqual([expect.objectContaining({
+      projectId: PROJECT_ID,
+      severity: "low",
+      probationary: true,
+    })]);
+    expect(wakeRole).toHaveBeenCalledOnce();
+  });
+
+  it("raises severity only when the tenant trust reader supplies graduation", async () => {
+    let currentArtifact = absentArtifact();
+    const alerts: unknown[] = [];
+    const store = kvPersistence();
+    const cycle = createStallGuardCycle({
+      readProjectIds: () => [PROJECT_ID],
+      readRoleHolders: () => [holder(1, "current-holder")],
+      readArtifact: async () => currentArtifact,
+      wakeRole: async () => ({ attempted: true, delivered: true }),
+      readTenantTrust: () => "graduated",
+      onAlert: (alert) => alerts.push(alert),
+      persistence: store.persistence,
+    });
+
+    await cycle.cycle(PROJECT_ID);
+    currentArtifact = artifact("graduated");
+    await cycle.cycle(PROJECT_ID);
+
+    expect(alerts).toEqual([expect.objectContaining({ severity: "routine", probationary: false })]);
   });
 
   it("retries a wake result without an explicit policy refusal", async () => {

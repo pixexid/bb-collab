@@ -916,8 +916,8 @@ async function loadedDistHost() {
   return host;
 }
 
-async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, writingLaneCeiling?: number, withoutGithubIssues = true, projectId = PROJECT_ID, connectorHost = CONNECTOR_HOST, githubIssueNumber?: number) {
-  const fixture = await assignmentFixture({ projectId, connectorHost, directorSeat: true, orchestratorSeat: true, withoutGithubIssues: false, targetRemoteUrl: includeGithubRemote ? "https://github.com/example/project.git" : undefined, writingLaneCeiling, githubIssueNumber });
+async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, writingLaneCeiling?: number, withoutGithubIssues = false, projectId = PROJECT_ID, connectorHost = CONNECTOR_HOST, githubIssueNumber?: number) {
+  const fixture = await assignmentFixture({ projectId, connectorHost, directorSeat: true, orchestratorSeat: true, withoutGithubIssues, targetRemoteUrl: includeGithubRemote ? "https://github.com/example/project.git" : undefined, writingLaneCeiling, githubIssueNumber });
   const pathHead = process.env.PATH?.split(":")[0];
   if (!includeGithubRemote && !(pathHead && pathHead.startsWith(tmpdir()))) pendingReviewQueueCleanups.push(installEmptyGithubQueue());
   const director = fixture.db.prepare(
@@ -970,8 +970,11 @@ async function fleetWatchdogFixture(updatedAt = 1, includeGithubRemote = false, 
   };
   // Mirrors the durable event log the watchdog now reads its cap state from, including the
   // type filter and descending order, so a stub that ignored either would not pass for one.
-  fixture.host.harness.sdk.stub("threads.events.list", (async ({ threadId, types, order, limit }: { threadId: string; types?: readonly string[]; order?: "asc" | "desc"; limit?: string }) => {
-    const events = (laneEvents.get(threadId) ?? []).filter((event) => types === undefined || types.includes(event.type)).sort((left, right) => left.seq - right.seq);
+  fixture.host.harness.sdk.stub("threads.events.list", (async ({ threadId, types, order, limit, afterSeq }: { threadId: string; types?: readonly string[]; order?: "asc" | "desc"; limit?: string; afterSeq?: string }) => {
+    const source = laneEvents.get(threadId) ?? (threadProjects.has(threadId)
+      ? [{ id: `idle-${threadId}-${nativeUpdatedAt}`, threadId, seq: 1, type: "thread/idle", scope: { kind: "thread" as const }, data: {}, createdAt: nativeUpdatedAt }]
+      : []);
+    const events = source.filter((event) => (afterSeq === undefined || event.seq > Number(afterSeq)) && (types === undefined || types.includes(event.type))).sort((left, right) => left.seq - right.seq);
     const ordered = order === "desc" ? events.reverse() : events;
     return limit === undefined ? ordered : ordered.slice(0, Number(limit));
   }) as never);
@@ -5401,6 +5404,16 @@ if [ "$1" = api ]; then printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue
     ]);
   });
 
+  it("does not display a canonical running attempt as live when its native lane is idle", async () => {
+    const fixture = await fleetWatchdogFixture(1);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+    fixture.addNativeLane("thread-work-item-1", "idle");
+
+    await expect(fixture.host.harness.callRpc("v1-lanes", {})).resolves.toEqual([
+      expect.objectContaining({ attemptState: "running", workerStatus: "idle", tone: "error", queueState: "ready" }),
+    ]);
+  });
+
   it.each(["terminal", "foreign", "historical", "archived", "unusable-holder"] as const)("excludes a %s WorkItem lane from the versioned read seam", async (kind) => {
     const fixture = await fleetWatchdogFixture(0);
     expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
@@ -5598,6 +5611,31 @@ exec /bin/cat '${inventory}'
       service?.controller.abort();
       await service?.done;
       clock.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("derives queue repository identity from canonical targets when optional mappings are absent", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-role-queue-canonical-target-"));
+    const gh = join(bin, "gh");
+    writeFileSync(gh, "#!/bin/sh\nif [ \"$1\" = api ]; then printf '%s\\n' '[[{\"number\":205,\"labels\":[{\"name\":\"queue:startable\"}]}]]'; else printf '%s\\n' '[{\"number\":205,\"labels\":[{\"name\":\"queue:startable\"}]}]'; fi\n");
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    let service: ReturnType<Awaited<ReturnType<typeof fleetWatchdogFixture>>["host"]["harness"]["runService"]> | undefined;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, undefined, true);
+      service = fixture.host.harness.runService("lane-watcher");
+      await vi.waitFor(() => expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: `role queue coverage=degraded project=${PROJECT_ID} reason=startable-queue-head-bindings:0`,
+      })));
+      expect(fixture.host.harness.inspection.logEntries.some((entry) => entry.message === `role queue coverage=degraded project=${PROJECT_ID} reason=startable-queue-unreadable`)).toBe(false);
+    } finally {
+      service?.controller.abort();
+      await service?.done;
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
       rmSync(bin, { recursive: true, force: true });
@@ -9131,6 +9169,17 @@ else printf '%s\n' '{"state":"OPEN","stateReason":"REOPENED","updatedAt":"fixtur
         message: "fleet-watchdog dispatched-lane coverage=blind project=proj_test reason=canonical-ownership-unreadable",
       }));
 
+      const unboundRunning = await fleetWatchdogFixture(0, true, 3, false);
+      bindFixtureGithubIssue(unboundRunning.db, 205);
+      expect(applyWithFixtureReceipt(unboundRunning.db, transitionRequest(unboundRunning.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+      unboundRunning.db.prepare("UPDATE execution_attempts SET state = 'running', thread_id = NULL WHERE origin = 'work_item'").run();
+      await unboundRunning.host.harness.runSchedule("fleet-watchdog");
+      expect(unboundRunning.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+      expect(unboundRunning.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
+        level: "warn",
+        message: "fleet-watchdog dispatched-lane coverage=blind project=proj_test reason=canonical-ownership-unreadable",
+      }));
+
       const nativeBlind = await fleetWatchdogFixture(0, true, 3, false);
       nativeBlind.host.harness.sdk.stub("threads.list", (async () => { throw new Error("lane inventory failed"); }) as never);
       await nativeBlind.host.harness.runSchedule("fleet-watchdog");
@@ -9298,6 +9347,37 @@ fi
       expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
         level: "info",
         message: `fleet-watchdog intake counts: project=${PROJECT_ID} startable=0 unlabelled=0 blocked=1 waiting-external=1`,
+      }));
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it("refreshes displayed intake counts when the live queue changes", async () => {
+    const bin = mkdtempSync(join(tmpdir(), "bb-collab-intake-count-refresh-"));
+    const gh = join(bin, "gh");
+    const queue = join(bin, "queue.json");
+    writeFileSync(queue, '[{"number":493,"labels":[{"name":"queue:startable"}]}]\n');
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = api ]; then printf '['; cat ${queue}; printf ']\n'; else cat ${queue}; fi
+`);
+    chmodSync(gh, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${originalPath ?? ""}`;
+    try {
+      const fixture = await fleetWatchdogFixture(0, true, 1, false);
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+      writeFileSync(queue, '[{"number":493,"labels":[{"name":"queue:startable"}]},{"number":494,"labels":[{"name":"queue:startable"}]}]\n');
+      await fixture.host.harness.runSchedule("fleet-watchdog");
+
+      const sends = fixture.host.harness.inspection.sdk.callsTo("threads.send").filter(([request]) =>
+        (request as { input: Array<{ text: string }> }).input[0]?.text.startsWith("startable queue has"),
+      );
+      expect(sends).toHaveLength(2);
+      expect(sends[1]?.[0]).toEqual(expect.objectContaining({
+        input: [expect.objectContaining({ text: expect.stringContaining("startable queue has 2 issues") })],
       }));
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
