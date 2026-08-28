@@ -19,6 +19,7 @@ const tierA = [
   /^docs\/(?:adr\/0001-founding-contract|import-manifest|issue-76-tiered-review-policy|operations-model|threat-model)\.md$/u,
   /^scripts\/build\.mjs$/u,
   /^scripts\/release-artifact\.(?:d\.mts|mjs)$/u,
+  /^scripts\/activate-release\.(?:d\.mts|mjs)$/u,
   /^scripts\/check-pr-lifecycle\.mjs$/u,
   /^scripts\/handle-merged-pr-lifecycle\.mjs$/u,
   /^scripts\/audit-issue-lifecycle\.mjs$/u,

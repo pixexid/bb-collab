@@ -25,6 +25,7 @@ import {
   MIGRATIONS,
   migrateCanonicalStore,
   ROLE_CONTEXT_EVENT_PAGE_SIZE,
+  schemaDigest,
   PLUGIN_ID,
   PLUGIN_SDK_VERSION,
   assembleV22CachedConsumerRolloutEvidence,
@@ -76,6 +77,8 @@ import {
   type SqliteDatabase,
   type WorkItemDispatchConfigProof,
 } from "./src/foundation.js";
+
+export { schemaDigest };
 import {
   GITHUB_ISSUE_COMMENT_TAIL_LIMIT,
   assertGithubIssueBriefAnchor,
