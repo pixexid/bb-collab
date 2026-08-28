@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { isAbsolute, join, relative } from "node:path";
 import { promisify } from "node:util";
 import type { BbPluginApi } from "@bb/plugin-sdk";
+import { registerDeploymentIdentityCli } from "../../src/deployment-identity.js";
 
 const exec = promisify(execFile);
 const ACTIVE = ["prepared", "armed", "content_delivered", "running", "dispatch_unknown"];
@@ -393,6 +394,7 @@ async function githubEvidence(remote: string | null): Promise<unknown> {
 const prompt = (projectId: string) => `Judge ONLY the verified candidates returned by ${TOOL}; do not discover or invent other work, and do not assert coverage because code computes it. Call the tool exactly once and do not mutate or message anything. If no candidate warrants a wake, output exactly SILENCE. Otherwise copy the selected candidate's id, anchors, and finding exactly into one line per candidate as FINDING: {"candidateId":"supplied id","anchors":supplied anchors,"finding":"supplied finding"}, followed by exactly ESCALATE: yes. Project: ${projectId}.`;
 
 export default function companionWatcher(bb: BbPluginApi, readExport: CanonicalReader = readCanonicalExport, readGithub: GithubReader = githubEvidence, listProjects: ProjectInventoryReader = async () => await bb.sdk.projects.list()) {
+  registerDeploymentIdentityCli(bb as unknown as import("@get-bb/plugin-sdk").BbPluginApi, "companion-watcher", "companion-watcher", import.meta.url);
   const snapshots = new Map<string, Snapshot>();
   const companions = new Map<string, string>();
   const pending = new Map<string, Pending>();

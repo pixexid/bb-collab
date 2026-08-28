@@ -25,6 +25,7 @@ import {
   MIGRATIONS,
   migrateCanonicalStore,
   ROLE_CONTEXT_EVENT_PAGE_SIZE,
+  schemaDigest,
   PLUGIN_ID,
   PLUGIN_SDK_VERSION,
   assembleV22CachedConsumerRolloutEvidence,
@@ -76,6 +77,9 @@ import {
   type SqliteDatabase,
   type WorkItemDispatchConfigProof,
 } from "./src/foundation.js";
+import { registerResidentService, residentServerIdentity } from "./src/deployment-identity.js";
+
+export { schemaDigest };
 import {
   GITHUB_ISSUE_COMMENT_TAIL_LIMIT,
   assertGithubIssueBriefAnchor,
@@ -5357,11 +5361,13 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   bb.onDispose(idleFleetDetector.stop);
   bb.background.service("idle-fleet-detector", {
     async start(signal) {
+      const unregister = registerResidentService(PLUGIN_ID, import.meta.url, "idle-fleet-detector");
       try {
         if (!signal.aborted) {
           await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
         }
       } finally {
+        unregister();
         idleFleetDetector.stop();
       }
     },
@@ -5484,24 +5490,29 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
   bb.onDispose(unsubscribe);
   bb.background.service("lane-watcher", {
     async start(signal) {
-      await loadRecoveryEpisodes().catch((error) => bb.log.warn(`error-recovery episode state unreadable: ${String(error)}`));
-      void idleFleetDetector.rearm();
-      void reconcileErrorRecovery().catch((error) => bb.log.warn(`error-recovery reconcile failed: ${String(error)}`));
-      while (!signal.aborted) {
-        await watcher.poll(signal).catch((error) => bb.log.warn(`lane poll failed: ${String(error)}`));
-        if (signal.aborted) break;
-        await escalationCycle.cycle().catch((error) => bb.log.warn(`wait escalation failed: ${String(error)}`));
-        if (signal.aborted) break;
-        await new Promise<void>((resolve) => {
-          let timer: ReturnType<typeof setTimeout>;
-          const done = () => {
-            clearTimeout(timer);
-            signal.removeEventListener("abort", done);
-            resolve();
-          };
-          timer = setTimeout(done, ROLE_QUEUE_OBSERVATION_MS);
-          signal.addEventListener("abort", done, { once: true });
-        });
+      const unregister = registerResidentService(PLUGIN_ID, import.meta.url, "lane-watcher");
+      try {
+        await loadRecoveryEpisodes().catch((error) => bb.log.warn(`error-recovery episode state unreadable: ${String(error)}`));
+        void idleFleetDetector.rearm();
+        void reconcileErrorRecovery().catch((error) => bb.log.warn(`error-recovery reconcile failed: ${String(error)}`));
+        while (!signal.aborted) {
+          await watcher.poll(signal).catch((error) => bb.log.warn(`lane poll failed: ${String(error)}`));
+          if (signal.aborted) break;
+          await escalationCycle.cycle().catch((error) => bb.log.warn(`wait escalation failed: ${String(error)}`));
+          if (signal.aborted) break;
+          await new Promise<void>((resolve) => {
+            let timer: ReturnType<typeof setTimeout>;
+            const done = () => {
+              clearTimeout(timer);
+              signal.removeEventListener("abort", done);
+              resolve();
+            };
+            timer = setTimeout(done, ROLE_QUEUE_OBSERVATION_MS);
+            signal.addEventListener("abort", done, { once: true });
+          });
+        }
+      } finally {
+        unregister();
       }
     },
   });
@@ -6992,6 +7003,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     name: "collab",
     summary: "Inspect the bb-collab foundation and guarded conformance boundary",
     commands: [
+      { name: "activation-identity", summary: "Return the resident server generation", usage: "bb collab activation-identity --json" },
       { name: "doctor", summary: "Read-only project/store conformance check", usage: "bb collab doctor --project PROJECT_ID [--json]" },
       { name: "export", summary: "Deterministic bounded foundation export", usage: "bb collab export --project PROJECT_ID" },
       {
@@ -7063,6 +7075,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       },
     ],
     run(argv, context) {
+      if (argv[0] === "activation-identity") return { exitCode: 0, stdout: `${JSON.stringify(residentServerIdentity(PLUGIN_ID, import.meta.url))}\n` };
       return runCli(db, bb, argv, context, cliDeps);
     },
   });

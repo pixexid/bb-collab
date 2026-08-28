@@ -5237,7 +5237,7 @@ else printf '%s\\n' '[[{"number":305,"labels":[{"name":"queue:startable"}]}]]'; 
     expect(source).toMatch(/execFile\(process\.execPath, \[join\(root, "scripts", "check-dist\.mjs"\)/u);
     expect(source).not.toMatch(/spawnSync\(process\.execPath, \[join\(root, "scripts", "check-dist\.mjs"\)/u);
     expect(source).toContain("cwd: root");
-    expect(script).toContain("release candidate is inactive: loaded-authority activation is owned by #423");
+    expect(script).toContain("verifyActiveReceipt");
   });
 
   it("keeps every composite key distinct for legal identifier content", () => {
@@ -18485,7 +18485,7 @@ exit 1
     const host = await loadedHost();
     const registrations = host.harness.inspection.registrations;
     expect(registrations.rpcMethods).not.toContain("seed-fixture-receipt");
-    expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["doctor", "export", "apply", "register-project", "dispatch-lane", "github-issue-backfill", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "archive-sweep", "worktree-cleanup", "send-to-operator", "inbox"]);
+    expect(registrations.cli?.commands.map((command) => command.name)).toEqual(["activation-identity", "doctor", "export", "apply", "register-project", "dispatch-lane", "github-issue-backfill", "cached-consumer-rollout", "role-list", "wait-register", "wait-list", "wait-validator", "stall-guard", "fleet-watchdog", "archive-sweep", "worktree-cleanup", "send-to-operator", "inbox"]);
     expect(registrations.httpRoutes).toEqual([]);
     expect(seedFixtureDecision).toBeTypeOf("function");
   });

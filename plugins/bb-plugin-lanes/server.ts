@@ -1,4 +1,5 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { registerDeploymentIdentityCli } from "../../src/deployment-identity.js";
 import { laneListSchema, rpcContract } from "./contract.js";
 
 const CORE_PLUGIN_ID = "bb-collab";
@@ -20,6 +21,7 @@ async function withTimeout<T>(promise: Promise<T>): Promise<T> {
 }
 
 export default function plugin(bb: BbPluginApi) {
+  registerDeploymentIdentityCli(bb, "lanes", "lanes", import.meta.url);
   let coreRead: Promise<unknown> | null = null;
   const readLanes = async () => {
     if (coreRead === null) {

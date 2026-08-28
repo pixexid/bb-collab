@@ -1,5 +1,37 @@
 # Same-id reviewed-byte cutover
 
+## V2 release activation
+
+For a verified v2 release candidate, this manual same-id procedure is
+superseded by the repository activation transaction:
+
+```sh
+: "${RELEASE_DIR:?set to the absolute verified release directory}"
+npm run --silent activate:release -- \
+  --release "$RELEASE_DIR" --project PROJECT_ID
+```
+
+The command derives its state root from BB, accepts only the exact current
+project and source commit, stages immutable digest-named package roots, moves
+path registrations with BB's settings-preserving local-path primitive, and
+uses the retained-root symlink adapter for managed Git/npm installs. It binds
+every candidate artifact root or changes none, waits through the rebuild
+window, then proves registered and resolved roots, `dist/server.js`, frontend
+hashes, running services, the canonical doctor, and the candidate schema
+fingerprint. Its active receipt is written only after those checks. Any error
+restores the prior roots, registration, receipt, and running plugins.
+
+An unchanged canonical schema fingerprint requires no backup, export, lane
+lull, or cross-project canary. When the fingerprint changes, first use the
+governed migration seam to freeze the exact project and record quiescence plus
+its canonical export. Pass that active migration id with
+`--schema-cutover MIGRATION_ID`. Activation reads the live doctor itself and
+requires the exact frozen governor/fence, exported migration, retained export,
+zero active or blind writers, and unchanged canonical facts before every bind.
+Caller JSON, files, flags, and filenames are not evidence. Keep the remainder
+of this document only for the pre-v2 legacy
+same-id cutover and its explicit rollback procedure.
+
 This deployment runbook is valid only after PR #576 merges. It converges the
 repository bytes and discipline without changing the installed id, settings,
 database, or registration. BB's registration metadata continues to name the

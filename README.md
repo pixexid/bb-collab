@@ -2,17 +2,34 @@
 
 BB-native project governance, work lifecycle, and collaboration runtime.
 
-## Inactive release candidate
+## Exact release activation
 
 CI builds generated bundles with the pinned toolchain and publishes one
 exact-head release manifest and digest. The v2 manifest is a closed-world
 candidate inventory with `loadAuthority: "inactive"`; generated `dist/` remains
 ignored output and is not committed source-review authority.
 
-`npm run --silent check:deployed-dist` intentionally refuses with `release
-candidate is inactive: loaded-authority activation is owned by #423`. Do not
-install, rebind, reload, or deploy this candidate. #423 owns the future
-loaded-authority activation and production procedure.
+The candidate remains inactive until the orchestrator runs the host-local
+activation transaction from the exact source commit:
+
+```sh
+npm run --silent activate:release -- \
+  --release /absolute/path/to/release --project PROJECT_ID
+```
+
+The transaction stages digest-named read-only roots, binds every installed
+target, settles for the host rebuild window, proves the loaded roots, entries,
+bytes, health, and canonical schema fingerprint, then writes the active receipt.
+Any failure restores every prior source/root and running plugin. The canonical
+receipt is host-local under BB's data directory; callers cannot select another
+state root. `npm run --silent check:deployed-dist` accepts only that receipt and
+the matching live deployment.
+
+Schema classification comes only from the current doctor and the candidate
+server's exported canonical schema digest. An unchanged digest needs no backup,
+export, queue lull, or cross-project canary. A changed digest refuses unless
+`--schema-cutover` names the governed canonical migration described
+in the cutover runbook.
 
 ## Deploy sequence
 
@@ -22,8 +39,8 @@ burst. Immediately after a lane finishes, run its terminal WorkItem transition;
 otherwise a completed lane is indistinguishable from a silent one and coverage
 goes blind for the wrong reason.
 
-The #716 release candidate is not a deploy input. Existing production handling
-continues unchanged until #423 activates a verified loaded-artifact contract.
+Do not copy, rebuild, or install candidate bytes manually. The activation
+transaction is the only v2 release-consumption path.
 
 `reload-exit=0` is only the loader's verdict. `bb plugin list` is required
 because a reload once left the old lane-watcher resident with a closed database
@@ -35,13 +52,9 @@ while leaving the orphaned service resident; `bb plugin disable bb-collab`
 followed by `bb plugin enable bb-collab` unloads the code entirely, then verify
 recovery from the store because the log lags.
 
-Wait before the second deployed-artifact check: the rebuild landed about 13
-seconds after reload returned, and an immediate check twice gave a confident
-false exculpation. The live acceptance query must use `?mode=ro`; `?immutable=1`
-ignores the WAL and produced stale coverage in the incident. Right after reload,
-`?mode=ro` may fail with “unable to open database file (14)” because clean WAL
-shutdown removes sidecars and a read-only connection cannot create `-shm`.
-Wait and retry; do not switch to the write-permitting plain path.
+The transaction owns the post-settle delay and byte check; do not replace them
+with an immediate manual check. Live database acceptance remains read-only;
+`?immutable=1` ignores the WAL and is not valid coverage.
 
 ## Incident logs
 
