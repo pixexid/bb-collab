@@ -5,7 +5,6 @@ export interface ActivationOptions {
   projectId: string;
   schemaCutoverId?: string;
   adapter?: unknown;
-  candidateSchemaFingerprint?: (artifactRoot: string) => Promise<string>;
 }
 
 export function activateRelease(options: ActivationOptions): Promise<{ outcome: "activated" | "already_active"; receipt: any }>;

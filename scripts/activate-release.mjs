@@ -6,7 +6,7 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
-import { canonicalJson, verifyRelease } from "./release-artifact.mjs";
+import { canonicalJson, verifyRelease, verifyRuntimeClosure } from "./release-artifact.mjs";
 
 const RECEIPT_VERSION = 1;
 const SETTLE_MS = 15_000;
@@ -94,6 +94,12 @@ function makeReadOnly(path) {
   chmodSync(path, 0o555);
 }
 
+function makeWritable(path) {
+  if (!existsSync(path)) return;
+  chmodSync(path, lstatSync(path).isDirectory() ? 0o700 : 0o600);
+  if (lstatSync(path).isDirectory()) for (const entry of readdirSync(path)) makeWritable(join(path, entry));
+}
+
 function verifyBindingFiles(binding) {
   for (const file of binding.expectedFiles) {
     const path = join(binding.resolvedRoot, file.path);
@@ -105,7 +111,10 @@ async function stageRelease({ releaseDirectory, sourceRoot, stateDirectory, mani
   const releases = join(stateDirectory, "releases");
   const artifactRoot = join(releases, manifest.releaseDigest);
   const temporary = `${artifactRoot}.tmp-${process.pid}`;
-  if (existsSync(artifactRoot)) return artifactRoot;
+  if (existsSync(artifactRoot)) {
+    verifyRuntimeClosure(artifactRoot, manifest, true);
+    return artifactRoot;
+  }
   mkdirSync(releases, { recursive: true, mode: 0o700 });
   mkdirSync(temporary, { recursive: false, mode: 0o700 });
   try {
@@ -120,9 +129,12 @@ async function stageRelease({ releaseDirectory, sourceRoot, stateDirectory, mani
       copyBrandingAssets(sourceRoot, packageRoot, wrapper, stagedManifest.bb.branding);
       writeFileSync(join(wrapper, "package.json"), `${canonicalJson(stagedManifest)}\n`);
     }
+    cpSync(join(releaseDirectory, "node_modules"), join(temporary, "node_modules"), { recursive: true });
     makeReadOnly(temporary);
+    verifyRuntimeClosure(temporary, manifest, true);
     renameSync(temporary, artifactRoot);
   } catch (error) {
+    makeWritable(temporary);
     rmSync(temporary, { recursive: true, force: true });
     throw error;
   }
@@ -293,13 +305,15 @@ async function activateRelease(options) {
   const priorReceipt = readReceipt(receiptPath);
   const transactionId = `${Date.now()}-${process.pid}`;
   const changed = [];
+  let ownsPending = false;
   try {
     const manifest = verifyRelease(releaseDirectory, join(releaseDirectory, "release-manifest.json"), sourceRoot);
     if (manifest.loadAuthority !== "inactive") throw new Error("activation requires an inactive v2 release candidate");
     const hostStatus = initialHostStatus;
     if (hostStatus.project?.id !== projectId && hostStatus.projectId !== projectId) throw new Error("activation project does not match the current BB project");
     const artifactRoot = await stageRelease({ releaseDirectory, sourceRoot, stateDirectory, manifest });
-    const candidateSchema = await (options.candidateSchemaFingerprint ? options.candidateSchemaFingerprint(artifactRoot) : candidateSchemaFingerprint(artifactRoot));
+    const candidateSchema = await candidateSchemaFingerprint(artifactRoot);
+    verifyRuntimeClosure(artifactRoot, manifest, true);
     const doctorBefore = adapter.doctor();
     if (doctorBefore.outcome !== "OK" || !/^[0-9a-f]{64}$/u.test(doctorBefore.evidence?.schema?.digest ?? "")) throw new Error("current canonical schema fingerprint is unavailable");
     const priorSchema = doctorBefore.evidence.schema.digest;
@@ -325,6 +339,7 @@ async function activateRelease(options) {
       bindings: bindings.map(({ priorStatus, ...binding }) => ({ ...binding, priorStatus: { rootDir: priorStatus.rootDir, status: priorStatus.status, services: priorStatus.services } })),
     };
     atomicWrite(pendingPath, pending);
+    ownsPending = true;
     for (const binding of bindings) {
       const currentSource = adapter.source(binding.pluginId);
       const current = adapter.list().find(({ id }) => id === binding.pluginId);
@@ -358,7 +373,7 @@ async function activateRelease(options) {
         proveRollback(changed, adapter.list(), new Map(ids.map((id) => [id, adapter.source(id)])));
       } catch (rollbackError) { rollbackErrors.push(rollbackError.message); }
     }
-    rmSync(pendingPath, { force: true });
+    if (ownsPending) rmSync(pendingPath, { force: true });
     if (rollbackErrors.length) throw new Error(`${error.message}; rollback failed: ${rollbackErrors.join("; ")}`);
     throw error;
   } finally {

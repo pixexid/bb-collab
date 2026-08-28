@@ -6,8 +6,9 @@ BB-native project governance, work lifecycle, and collaboration runtime.
 
 CI builds generated bundles with the pinned toolchain and publishes one
 exact-head release manifest and digest. The v2 manifest is a closed-world
-candidate inventory with `loadAuthority: "inactive"`; generated `dist/` remains
-ignored output and is not committed source-review authority.
+candidate inventory with `loadAuthority: "inactive"`; it binds every emitted
+server external to candidate-owned, manifest-hashed runtime files. Generated
+`dist/` remains ignored output and is not committed source-review authority.
 
 The candidate remains inactive until the orchestrator runs the host-local
 activation transaction from the exact source commit:
@@ -17,9 +18,11 @@ npm run --silent activate:release -- \
   --release /absolute/path/to/release --project PROJECT_ID
 ```
 
-The transaction stages digest-named read-only roots, binds every installed
-target, settles for the host rebuild window, proves the loaded roots, entries,
-bytes, health, and canonical schema fingerprint, then writes the active receipt.
+The transaction stages digest-named read-only roots, verifies the hermetic
+runtime closure, imports the schema fingerprint from that exact staged wrapper,
+binds every installed target, settles for the host rebuild window, proves the
+loaded roots, entries, bytes, health, and canonical schema fingerprint, then
+writes the active receipt.
 Any failure restores every prior source/root and running plugin. The canonical
 receipt is host-local under BB's data directory; callers cannot select another
 state root. `npm run --silent check:deployed-dist` accepts only that receipt and
