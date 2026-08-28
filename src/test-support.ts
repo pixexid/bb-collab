@@ -16,6 +16,7 @@ import {
   type NativeAssignmentEvidence,
   type NativeAssignmentInput,
   type NativeAssignmentInspection,
+  type ProviderMatrixProfile,
   type ReviewFactReader,
   type ReviewFacts,
   type RoleEnvironmentFact,
@@ -370,6 +371,7 @@ export function applyWithFixtureReceipt(
   nativeAssignmentAdapter: NativeAssignmentAdapter | null = null,
   reviewFactReader: ReviewFactReader | null = null,
   executionAttemptEvidenceReader: ExecutionAttemptEvidenceReader | null = null,
+  providerMatrix: readonly ProviderMatrixProfile[] = [],
 ): FoundationResult {
-  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, null, executionAttemptEvidenceReader);
+  return applyFixtureMutation(db, request, githubAdapter, roleFactReader, nativeAssignmentAdapter, reviewFactReader, null, executionAttemptEvidenceReader, false, null, providerMatrix);
 }
