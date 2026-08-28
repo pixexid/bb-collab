@@ -15711,6 +15711,70 @@ else printf '%s\\n' '[]'; fi
     expect(JSON.parse(event.event_json)).toMatchObject({ externalEvent: { kind: "github_issue_reopened", externalRevision: "open-y" } });
   });
 
+  it("downgrades an unreceipted success only for its fresh exact open GitHub binding", async () => {
+    const host = await loadedHost();
+    const { db, fenceToken } = seedAndBootstrap(host);
+    const github = new DeterministicGitHubIssueAdapter();
+    const issue = { owner: GITHUB_OWNER, repo: GITHUB_REPO, issueNumber: 351, title: "Unreceipted", body: "", state: "open" as const, stateReason: "REOPENED" as const, labels: [], externalRevision: "initial-open" };
+    github.put(issue);
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      workItem: { workItemId: WORK_ITEM_ID, title: issue.title, body: issue.body, githubIssue: { issueNumber: issue.issueNumber } },
+    }))).toMatchObject({ outcome: "OK" });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 1))).toMatchObject({ outcome: "OK" });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+    expect(applyWithFixtureReceipt(db, legacyReviewPendingRequest(db, fenceToken, 3))).toMatchObject({ outcome: "OK" });
+    expect(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "succeeded", 4))).toMatchObject({ outcome: "OK", currentResourceRevision: 5 });
+    expect(applyWithFixtureReceipt(db, projectionRequest(fenceToken, 5), github)).toMatchObject({ outcome: "OK" });
+    const projected = db.prepare(
+      "SELECT observed_external_revision FROM external_work_refs WHERE project_id = ? AND work_item_id = ?",
+    ).get(PROJECT_ID, WORK_ITEM_ID) as { observed_external_revision: string };
+    const succeededEvent = db.prepare(
+      "SELECT event_json FROM state_events WHERE project_id = ? AND aggregate_type = 'work_item' AND aggregate_id = ? AND aggregate_revision = 5",
+    ).get(PROJECT_ID, WORK_ITEM_ID) as { event_json: string };
+    expect(JSON.parse(succeededEvent.event_json)).not.toHaveProperty("externalEvent");
+
+    const event = { kind: "github_issue_reopened" as const, owner: issue.owner, repo: issue.repo, issueNumber: issue.issueNumber };
+    const reopen = (idempotencyKey: string, overrides: Partial<ApplyRequest> = {}) => applyFixtureMutation(db, transitionRequest(fenceToken, "ready", 5, {
+      idempotencyKey,
+      workItemExternalEvent: event,
+      ...overrides,
+    }), null, null, null, null, github.read.bind(github));
+    const assertUnchanged = (result: FoundationResult, before: FoundationResult) => {
+      expect(result).toMatchObject({ attempted: 0 });
+      expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
+    };
+
+    github.put({ ...issue, externalRevision: projected.observed_external_revision });
+    let before = exportFoundation(db, PROJECT_ID);
+    assertUnchanged(reopen("unreceipted-stale"), before);
+
+    github.put({ ...issue, state: "closed", stateReason: "COMPLETED", externalRevision: "closed-fresh" });
+    before = exportFoundation(db, PROJECT_ID);
+    assertUnchanged(reopen("unreceipted-closed"), before);
+
+    github.put({ ...issue, externalRevision: "open-fresh" });
+    before = exportFoundation(db, PROJECT_ID);
+    assertUnchanged(applyWithFixtureReceipt(db, transitionRequest(fenceToken, "ready", 5, { idempotencyKey: "unreceipted-missing-event" })), before);
+    github.readOutcomes.push("unavailable");
+    assertUnchanged(reopen("unreceipted-missing-observation"), before);
+    assertUnchanged(reopen("unreceipted-foreign-project", { projectId: FOREIGN_PROJECT_ID }), before);
+
+    github.put({ ...issue, issueNumber: 352, externalRevision: "foreign-open" });
+    assertUnchanged(reopen("unreceipted-foreign-binding", { workItemExternalEvent: { ...event, issueNumber: 352 } }), before);
+
+    expect(reopen("unreceipted-fresh")).toMatchObject({ outcome: "OK", currentResourceRevision: 6 });
+    expect(db.prepare(
+      "SELECT lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?",
+    ).get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "ready", resource_revision: 6 });
+    expect(db.prepare(
+      "SELECT observed_external_revision FROM external_work_refs WHERE project_id = ? AND work_item_id = ?",
+    ).get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ observed_external_revision: "open-fresh" });
+    const reopenedEvent = db.prepare(
+      "SELECT event_json FROM state_events WHERE project_id = ? AND aggregate_type = 'work_item' AND aggregate_id = ? AND aggregate_revision = 6",
+    ).get(PROJECT_ID, WORK_ITEM_ID) as { event_json: string };
+    expect(JSON.parse(reopenedEvent.event_json)).toMatchObject({ externalEvent: { ...event, externalRevision: "open-fresh" } });
+  });
+
   it("gates satisfied-by-another-route success edges and clears fired blockers", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host);

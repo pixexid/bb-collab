@@ -9254,20 +9254,26 @@ function recordedGithubCloseObservation(
   projectId: string,
   workItemId: string,
   resourceRevision: number,
-): { kind: "github_issue_closed"; owner: string; repo: string; issueNumber: number; externalRevision: string } {
+): { kind: "github_issue_closed"; owner: string; repo: string; issueNumber: number; externalRevision: string } | null {
   const row = asRow<{ event_json: string }>(db.prepare(
     `SELECT event_json FROM state_events
      WHERE project_id = ? AND aggregate_type = 'work_item' AND aggregate_id = ?
        AND aggregate_revision = ? AND event_type = 'work_item_transitioned'
      ORDER BY event_sequence DESC LIMIT 1`,
   ).get(projectId, workItemId, resourceRevision));
-  if (!row) throw refusal("WORK_ITEM_STATE_INVALID", "succeeded work item has no recorded close observation", { structurallyImpossibleAtRevision: true });
+  if (!row) return null;
   let event: unknown;
   try {
     event = JSON.parse(row.event_json);
   } catch {
     throw refusal("WORK_ITEM_STATE_INVALID", "succeeded work item close observation is malformed");
   }
+  const transition = z.object({
+    to: z.literal("succeeded"),
+    externalEvent: z.unknown().optional(),
+  }).passthrough().safeParse(event);
+  if (!transition.success) throw refusal("WORK_ITEM_STATE_INVALID", "succeeded work item has no exact recorded close observation");
+  if (transition.data.externalEvent === undefined) return null;
   const parsed = z.object({
     to: z.literal("succeeded"),
     externalEvent: z.object({
@@ -9898,6 +9904,7 @@ function applyWorkItemTransition(
     throw refusal("WORK_ITEM_STATE_INVALID", "satisfaction evidence does not name a closed GitHub issue");
   }
   let recordedExternalEvent: { kind: "github_issue_closed" | "github_issue_reopened"; owner: string; repo: string; issueNumber: number; externalRevision: string } | null = null;
+  let reopenedRef: ExternalWorkRefRow | null = null;
   if (githubObservation && !validGithubSnapshotStateReason(githubObservation.state, githubObservation.stateReason)) {
     throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub issue state and reason do not match");
   }
@@ -9925,7 +9932,7 @@ function applyWorkItemTransition(
   }
   if (externalEvent) {
     if (!githubObservation) throw refusal("EXTERNAL_RESPONSE_INVALID", "GitHub lifecycle observation is unavailable");
-    requireBoundGithubIssue(db, request.projectId, workItem.work_item_id, externalEvent);
+    const boundRef = requireBoundGithubIssue(db, request.projectId, workItem.work_item_id, externalEvent);
     if (externalEvent.kind === "github_issue_closed") {
       const absorbedBeforeStart = workItem.lifecycle_state === "proposed" && nextState === "cancelled";
       if ((!absorbedBeforeStart && nextState !== "succeeded") || githubObservation.state !== "closed") {
@@ -9939,14 +9946,16 @@ function applyWorkItemTransition(
         throw refusal("WORK_ITEM_STATE_INVALID", "reopen observation only permits succeeded to ready");
       }
       const prior = recordedGithubCloseObservation(db, request.projectId, workItem.work_item_id, workItem.resource_revision);
-      if (
+      if (prior && (
         prior.owner !== externalEvent.owner ||
         prior.repo !== externalEvent.repo ||
         prior.issueNumber !== externalEvent.issueNumber
-      ) throw refusal("WORK_ITEM_STATE_INVALID", "GitHub reopen does not match the recorded close identity", { structurallyImpossibleAtRevision: true });
-      if (prior.externalRevision === githubObservation.externalRevision) {
+      )) throw refusal("WORK_ITEM_STATE_INVALID", "GitHub reopen does not match the recorded close identity", { structurallyImpossibleAtRevision: true });
+      const previousRevision = prior?.externalRevision ?? boundRef.observed_external_revision;
+      if (previousRevision === null || previousRevision === githubObservation.externalRevision) {
         throw refusal("WORK_ITEM_STATE_INVALID", "GitHub reopen does not follow the exact recorded close observation");
       }
+      reopenedRef = boundRef;
     }
     recordedExternalEvent = { ...externalEvent, externalRevision: githubObservation.externalRevision };
   } else if (workItem.lifecycle_state === "succeeded" && nextState === "ready") {
@@ -9975,6 +9984,19 @@ function applyWorkItemTransition(
       currentResourceRevision: workItem.resource_revision,
       expectedResourceRevision: request.expectedResourceRevision ?? undefined,
     });
+  }
+  if (reopenedRef) {
+    const refUpdated = db.prepare(
+      `UPDATE external_work_refs SET observed_external_revision = ?, updated_at_ms = ?
+       WHERE project_id = ? AND work_item_id = ? AND provider = 'github' AND observed_external_revision IS ?`,
+    ).run(
+      githubObservation!.externalRevision,
+      now(),
+      request.projectId,
+      workItem.work_item_id,
+      reopenedRef.observed_external_revision,
+    );
+    if (refUpdated.changes !== 1) throw refusal("EXTERNAL_REF_CONFLICT", "external ref changed before GitHub reopen was recorded");
   }
   if (["succeeded", "failed", "cancelled"].includes(nextState)) {
     dischargeTerminalWorkItemWait(db, request.projectId, workItem.work_item_id);
