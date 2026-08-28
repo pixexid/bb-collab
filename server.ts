@@ -2952,10 +2952,8 @@ async function liveProviderMatrix(bb: BbPluginApi, request: ApplyRequest): Promi
       const model = response.modelLoadError === null
         ? response.models.find((candidate) => candidate.model === profile.model && candidate.supportedReasoningEfforts.some((effort) => effort.reasoningEffort === profile.reasoningLevel))
         : null;
-      const serviceTiers = (provider as typeof provider & { serviceTiers?: Array<{ id: string }> }).serviceTiers;
-      const serviceTierValid = provider.capabilities.supportsServiceTier
-        ? serviceTiers?.some((tier) => tier.id === profile.serviceTier) === true
-        : profile.serviceTier === "default";
+      const serviceTierValid = profile.serviceTier === "default" ||
+        (provider.capabilities.supportsServiceTier && profile.serviceTier === "fast");
       if (model && serviceTierValid) {
         matrix.push({
           repoTargetId: policy.repoTargetId,

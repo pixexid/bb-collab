@@ -4062,8 +4062,8 @@ function validateConfig(value: unknown, providerMatrix: readonly ProviderMatrixP
         const policyRequirements = requirements.filter((requirement) =>
           requirement.roleId === "worker" && requirement.repoTargetId === parsedPolicy.data.repoTargetId &&
           profileIsOneOf(requirement.executedProfile, parsedPolicy.data.allowedProfiles));
-        if (policyRequirements.length !== 1) {
-          throw refusal("INVALID_INPUT", "UI/UX routing policy must bind one exact worker profile");
+        if (policyRequirements.length !== 1 || !hasRoutingSuffix(policyRequirements[0]!.executedProfile)) {
+          throw refusal("INVALID_INPUT", "UI/UX routing policy must bind one exact routing-suffix worker profile");
         }
       }
       const writingLaneCeiling = (bbCollab as Record<string, unknown>).writingLaneCeiling;

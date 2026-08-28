@@ -18016,8 +18016,8 @@ function validateConfig(value, providerMatrix = []) {
       }
       if (parsedPolicy?.success) {
         const policyRequirements = requirements.filter((requirement) => requirement.roleId === "worker" && requirement.repoTargetId === parsedPolicy.data.repoTargetId && profileIsOneOf(requirement.executedProfile, parsedPolicy.data.allowedProfiles));
-        if (policyRequirements.length !== 1) {
-          throw refusal("INVALID_INPUT", "UI/UX routing policy must bind one exact worker profile");
+        if (policyRequirements.length !== 1 || !hasRoutingSuffix(policyRequirements[0].executedProfile)) {
+          throw refusal("INVALID_INPUT", "UI/UX routing policy must bind one exact routing-suffix worker profile");
         }
       }
       const writingLaneCeiling = bbCollab.writingLaneCeiling;
@@ -28709,8 +28709,7 @@ async function liveProviderMatrix(bb, request) {
       if (!provider || !provider.capabilities.permissionModes.includes(profile.permissionMode)) continue;
       const response = await bb.sdk.providers.models({ hostId: target.hostId, providerId: profile.providerId });
       const model = response.modelLoadError === null ? response.models.find((candidate) => candidate.model === profile.model && candidate.supportedReasoningEfforts.some((effort) => effort.reasoningEffort === profile.reasoningLevel)) : null;
-      const serviceTiers = provider.serviceTiers;
-      const serviceTierValid = provider.capabilities.supportsServiceTier ? serviceTiers?.some((tier) => tier.id === profile.serviceTier) === true : profile.serviceTier === "default";
+      const serviceTierValid = profile.serviceTier === "default" || provider.capabilities.supportsServiceTier && profile.serviceTier === "fast";
       if (model && serviceTierValid) {
         matrix.push({
           repoTargetId: policy.repoTargetId,

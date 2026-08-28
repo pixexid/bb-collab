@@ -134,6 +134,21 @@ const UI_UX_PROVIDER_MATRIX = [{
   reasoningLevel: UI_UX_ROUTING_PROFILE.reasoningLevel,
   serviceTier: UI_UX_ROUTING_PROFILE.serviceTier,
 }];
+const LUNA_PROFILE = {
+  providerId: "codex",
+  model: "gpt-5.6-luna",
+  reasoningLevel: "medium",
+  permissionMode: "full",
+  serviceTier: "default",
+  visibility: "visible" as const,
+};
+const LUNA_PROVIDER_MATRIX = [{
+  repoTargetId: TARGET_ID,
+  providerId: LUNA_PROFILE.providerId,
+  model: LUNA_PROFILE.model,
+  reasoningLevel: LUNA_PROFILE.reasoningLevel,
+  serviceTier: LUNA_PROFILE.serviceTier,
+}];
 const EXPLICIT_EXECUTION_INPUT_SOURCES = {
   providerId: "explicit",
   model: "explicit",
@@ -276,14 +291,14 @@ function roleConfig(connector: "required" | "optional" | "prohibited" = "optiona
   return config;
 }
 
-function uiUxRoutingConfig() {
+function uiUxRoutingConfig(profile = UI_UX_ROUTING_PROFILE) {
   const config = roleConfig();
   const worker = (config.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>)
     .find((requirement) => requirement.roleId === "worker")!;
-  worker.executedProfile = { ...UI_UX_ROUTING_PROFILE };
+  worker.executedProfile = { ...profile };
   config.extensions.bbCollab.uiUxRoutingPolicy = {
     repoTargetId: TARGET_ID,
-    allowedProfiles: [{ ...UI_UX_ROUTING_PROFILE }],
+    allowedProfiles: [{ ...profile }],
   };
   return config;
 }
@@ -14906,7 +14921,7 @@ else printf '%s\\n' '[]'; fi
       operationClass: "config_revision",
       idempotencyKey,
       expectedConfigRevision,
-      configRevision: 7,
+      configRevision: expectedConfigRevision + 1,
       expectedGovernanceEpoch: 1,
       expectedFenceToken: fenceToken,
       config,
@@ -14953,11 +14968,10 @@ else printf '%s\\n' '[]'; fi
         policy.allowedProfiles[0] = { ...UI_UX_ROUTING_PROFILE, permissionMode: "auto" };
       }],
       ["luna", (config: ReturnType<typeof uiUxRoutingConfig>) => {
-        const luna = { ...ROLE_PROFILE, model: "gpt-5.6-luna[1m]" };
         const worker = (config.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>).find((requirement) => requirement.roleId === "worker")!;
-        worker.executedProfile = luna;
-        (config.extensions.bbCollab.uiUxRoutingPolicy as { allowedProfiles: unknown[] }).allowedProfiles = [luna];
-      }],
+        worker.executedProfile = { ...LUNA_PROFILE };
+        (config.extensions.bbCollab.uiUxRoutingPolicy as { allowedProfiles: unknown[] }).allowedProfiles = [{ ...LUNA_PROFILE }];
+      }, LUNA_PROVIDER_MATRIX],
       ["matrix-absent", () => {}, []],
       ["matrix-reasoning", () => {}, [{ ...UI_UX_PROVIDER_MATRIX[0]!, reasoningLevel: "high" }]],
       ["matrix-binding", () => {}, [{ ...UI_UX_PROVIDER_MATRIX[0]!, repoTargetId: SECOND_TARGET_ID }]],
@@ -15035,6 +15049,11 @@ else printf '%s\\n' '[]'; fi
       qualificationId: "artinspire-r7-worker-qualification",
       profileDigest: requestedProfileDigest(UI_UX_ROUTING_PROFILE),
     }), null, uiReader).outcome).toBe("OK");
+
+    const fastProfile = { ...UI_UX_ROUTING_PROFILE, serviceTier: "fast" };
+    const fastProvider = { ...provider, capabilities: { ...provider.capabilities, supportsServiceTier: true } };
+    host.harness.sdk.stub("providers.list", (async () => [fastProvider]) as never);
+    expect(await host.harness.callRpc("apply", r7Request(uiUxRoutingConfig(fastProfile), "artinspire-r8-fast-service-tier", 7))).toMatchObject({ outcome: "OK", currentConfigRevision: 8 });
   });
 
   it("allows stale proposed -> ready -> in_progress -> review_pending -> in_progress transitions without rebinding", async () => {
