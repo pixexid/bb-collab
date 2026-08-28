@@ -1230,6 +1230,26 @@ const terminalReportBuilderInputSchema = z.object({
   nativeEventSeq: z.number().int().positive(),
   nativeTurnId: sidebarThreadIdSchema,
 }).strict();
+const delegatedTerminalCompletionRequestSchema = z.object({
+  projectId: projectIdSchema,
+  operationClass: z.literal("execution_attempt_terminal_report"),
+  idempotencyKey: sidebarThreadIdSchema,
+  actorReceiptId: sidebarThreadIdSchema,
+  expectedConfigRevision: z.number().int().positive(),
+  expectedGovernanceEpoch: z.number().int().positive(),
+  expectedFenceToken: sidebarThreadIdSchema,
+  expectedResourceRevision: z.number().int().positive(),
+  workItemId: sidebarThreadIdSchema,
+  executionAttemptId: sidebarThreadIdSchema,
+}).strict();
+const consumeExecutionAttemptCompletionInputSchema = z.object({
+  request: delegatedTerminalCompletionRequestSchema,
+  outcome: z.enum(["DONE", "BLOCKED"]),
+  reasonCode: sidebarThreadIdSchema,
+  nativeEventId: sidebarThreadIdSchema,
+  nativeEventSeq: z.number().int().positive(),
+  nativeTurnId: sidebarThreadIdSchema,
+}).strict();
 const dispatchEnvironmentSchema = z.union([
   z.object({ type: z.literal("project-default") }).strict(),
   z.object({ type: z.literal("reuse"), environmentId: z.string().trim().min(1) }).strict(),
@@ -1880,11 +1900,20 @@ async function closeThreadlessPreparedAttempt(
   bb: BbPluginApi,
   db: SqliteDatabase | null,
   input: unknown,
+  authenticatedNativeCaller: AuthenticatedNativeCaller | null = null,
 ): Promise<FoundationResult> {
   const parsed = threadlessPreparedClosureInputSchema.safeParse(input);
   if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "threadless-prepared-closure", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
   const { request, correctionId, dispatchIntentIdempotencyKey } = parsed.data;
+  if (!authenticatedNativeCaller) return { outcome: "ROLE_HOLDER_MISMATCH", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure caller is not an authenticated native seat" };
+  if (authenticatedNativeCaller.projectId !== request.projectId) return { outcome: "ROLE_CONTEXT_FOREIGN", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "authenticated native caller belongs to a different project" };
   if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
+  const projectCallerRefusal = recoveryCallerRefusal(db, request.projectId, authenticatedNativeCaller.threadId);
+  if (projectCallerRefusal) return projectCallerRefusal;
+  const domain = db.prepare("SELECT domain_id FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, request.workItemId) as { domain_id: string } | undefined;
+  if (!domain) return { outcome: "WORK_ITEM_UNKNOWN", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "thread-less closure WorkItem domain is unavailable" };
+  const domainCallerRefusal = recoveryCallerRefusal(db, request.projectId, authenticatedNativeCaller.threadId, domain.domain_id);
+  if (domainCallerRefusal) return domainCallerRefusal;
   const existing = db.prepare(
     "SELECT request_digest, outcome_json, committed_event_sequence, operation_class FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?",
   ).get(request.projectId, request.idempotencyKey) as { request_digest: string; outcome_json: string; committed_event_sequence: number; operation_class: string } | undefined;
@@ -2035,7 +2064,7 @@ async function closeThreadlessPreparedAttempt(
         ],
       },
     };
-    return applyLiveAuthorizedMutation(bb, db, closureRequest, false, "refuse-active", readGithubIssueForBackfill, null, preMutationGuard, true);
+    return applyLiveAuthorizedMutation(bb, db, closureRequest, false, "refuse-active", readGithubIssueForBackfill, null, preMutationGuard, true, false, authenticatedNativeCaller);
   });
 }
 
@@ -2094,11 +2123,15 @@ function recoveryCallerRefusal(
   db: SqliteDatabase,
   projectId: string,
   callerThreadId: string,
+  domainId?: string,
 ): FoundationResult | null {
-  const holder = readRoleHolderStates(db).find((candidate) =>
-    candidate.project_id === projectId && candidate.thread_id === callerThreadId && ["director", "project-orchestrator"].includes(candidate.role_id),
+  const holders = readRoleHolderStates(db).filter((candidate) =>
+    candidate.project_id === projectId &&
+    candidate.thread_id === callerThreadId &&
+    (domainId === undefined || (candidate.domain_id ?? "default") === domainId) &&
+    ["director", "project-orchestrator"].includes(candidate.role_id),
   );
-  if (!holder) return { outcome: "ROLE_HOLDER_MISMATCH", subject: projectId, expected: 1, attempted: 0, verified: 0, message: "recovery caller is not the current director or project-orchestrator holder" };
+  if (holders.length !== 1) return { outcome: "ROLE_HOLDER_MISMATCH", subject: projectId, expected: 1, attempted: holders.length, verified: 0, message: "recovery caller is not the unique current director or project-orchestrator holder" };
   return null;
 }
 
@@ -2160,7 +2193,8 @@ async function closeStrandedExecutionAttempt(
   if (!parsed.success) return { outcome: "INVALID_INPUT", subject: "stranded-execution-closure", expected: 1, attempted: 0, verified: 0, message: parsed.error.message };
   const { request } = parsed.data;
   if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
-  const callerRefusal = recoveryCallerRefusal(db, request.projectId, callerThreadId);
+  const domain = db.prepare("SELECT domain_id FROM work_items WHERE project_id = ? AND work_item_id = ?").get(request.projectId, request.workItemId) as { domain_id: string } | undefined;
+  const callerRefusal = recoveryCallerRefusal(db, request.projectId, callerThreadId, domain?.domain_id);
   if (callerRefusal) return callerRefusal;
   const evidence = await strandedExecutionEvidence(bb, db, parsed.data);
   if ("outcome" in evidence) return evidence;
@@ -2178,7 +2212,7 @@ async function closeStrandedExecutionAttempt(
     }
     return null;
   };
-  return applyLiveAuthorizedMutation(bb, db, closureRequest, false, "refuse-active", readGithubIssueForBackfill, null, preMutationGuard, false, true);
+  return applyLiveAuthorizedMutation(bb, db, closureRequest, false, "refuse-active", readGithubIssueForBackfill, null, preMutationGuard, false, true, { projectId: request.projectId, threadId: callerThreadId });
 }
 
 function dispatchRecoveryRefusal(projectId: string, message: string, evidence?: unknown): FoundationResult {
@@ -2613,6 +2647,144 @@ async function buildLiveTerminalReport(
     nativeEventSeq: input.nativeEventSeq,
     nativeTurnId: input.nativeTurnId,
   }), outcome: input.outcome, reasonCode: input.reasonCode });
+}
+
+type DelegatedCompletionCanonicalContext = {
+  repoTargetId: string;
+  domainId: string;
+  ownerThreadId: string;
+  state: string;
+  terminalizationClass: string | null;
+  terminalReportJson: string | null;
+};
+
+function delegatedCompletionContext(
+  db: SqliteDatabase,
+  input: z.infer<typeof consumeExecutionAttemptCompletionInputSchema>,
+): DelegatedCompletionCanonicalContext | FoundationResult {
+  const { request } = input;
+  const workItem = db.prepare(
+    "SELECT repo_target_id, domain_id FROM work_items WHERE project_id = ? AND work_item_id = ?",
+  ).get(request.projectId, request.workItemId) as { repo_target_id: string; domain_id: string } | undefined;
+  if (!workItem) {
+    const foreign = db.prepare("SELECT 1 FROM work_items WHERE work_item_id = ? LIMIT 1").get(request.workItemId);
+    return { outcome: foreign ? "WORK_ITEM_FOREIGN" : "WORK_ITEM_UNKNOWN", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: foreign ? "work item belongs to another project" : "work item is not known" };
+  }
+  const attempt = db.prepare(
+    `SELECT work_item_id, repo_target_id, thread_id, state, terminalization_class, terminal_report_json
+     FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?`,
+  ).get(request.projectId, request.executionAttemptId) as {
+    work_item_id: string | null;
+    repo_target_id: string | null;
+    thread_id: string | null;
+    state: string;
+    terminalization_class: string | null;
+    terminal_report_json: string | null;
+  } | undefined;
+  if (!attempt) {
+    const foreign = db.prepare("SELECT 1 FROM execution_attempts WHERE execution_attempt_id = ? LIMIT 1").get(request.executionAttemptId);
+    return { outcome: foreign ? "EXECUTION_CONTEXT_FOREIGN" : "TERMINAL_REPORT_AMBIGUOUS", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: foreign ? "execution attempt belongs to another project" : "execution attempt is not known" };
+  }
+  if (attempt.work_item_id !== request.workItemId || attempt.repo_target_id !== workItem.repo_target_id || attempt.thread_id === null) {
+    return { outcome: "TERMINAL_REPORT_AMBIGUOUS", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical WorkItem, attempt, target, or owner thread identity is inconsistent" };
+  }
+  return {
+    repoTargetId: workItem.repo_target_id,
+    domainId: workItem.domain_id,
+    ownerThreadId: attempt.thread_id,
+    state: attempt.state,
+    terminalizationClass: attempt.terminalization_class,
+    terminalReportJson: attempt.terminal_report_json,
+  };
+}
+
+function delegatedReplayOrConflict(
+  db: SqliteDatabase,
+  input: z.infer<typeof consumeExecutionAttemptCompletionInputSchema>,
+  canonical: DelegatedCompletionCanonicalContext,
+): FoundationResult | null {
+  const receipt = db.prepare(
+    "SELECT operation_class, committed_event_sequence FROM mutation_receipts WHERE project_id = ? AND idempotency_key = ?",
+  ).get(input.request.projectId, input.request.idempotencyKey) as { operation_class: string; committed_event_sequence: number } | undefined;
+  const baseRequest = { ...input.request, repoTargetId: canonical.repoTargetId, domainId: canonical.domainId };
+  let terminalReport: NonNullable<ApplyRequest["terminalReport"]> | null = null;
+  try {
+    if (canonical.terminalReportJson !== null) {
+      terminalReport = parseApplyRequest({ ...baseRequest, terminalReport: JSON.parse(canonical.terminalReportJson) }).terminalReport ?? null;
+    }
+  } catch {
+    terminalReport = null;
+  }
+  const exactTerminalInput = terminalReport !== null &&
+    terminalReport.projectId === input.request.projectId &&
+    terminalReport.workItemId === input.request.workItemId &&
+    terminalReport.executionAttemptId === input.request.executionAttemptId &&
+    terminalReport.outcome === input.outcome &&
+    terminalReport.reasonCode === input.reasonCode &&
+    terminalReport.nativeEventId === input.nativeEventId &&
+    terminalReport.nativeEventSeq === input.nativeEventSeq &&
+    terminalReport.nativeTurnId === input.nativeTurnId;
+  if (receipt) {
+    const event = db.prepare(
+      "SELECT aggregate_id, event_type, event_json FROM state_events WHERE project_id = ? AND event_sequence = ? AND idempotency_key = ?",
+    ).get(input.request.projectId, receipt.committed_event_sequence, input.request.idempotencyKey) as { aggregate_id: string; event_type: string; event_json: string } | undefined;
+    let delegated = false;
+    try {
+      const consumption = (JSON.parse(event?.event_json ?? "null") as { consumption?: { kind?: unknown; path?: unknown } } | null)?.consumption;
+      delegated = consumption?.kind === "delegated-current-holder" && consumption.path === "agent-tool:consume_execution_attempt_completion";
+    } catch {
+      delegated = false;
+    }
+    if (receipt.operation_class !== "execution_attempt_terminal_report" || event?.event_type !== "execution_attempt_terminal_report_accepted" || event.aggregate_id !== input.request.executionAttemptId || !delegated || !exactTerminalInput || terminalReport === null) {
+      return { outcome: "IDEMPOTENCY_KEY_CONFLICT", subject: input.request.projectId, expected: 1, attempted: 0, verified: 0, message: "idempotency key was already used for another request" };
+    }
+    return checkMutationIdempotency(db, parseApplyRequest({ ...baseRequest, terminalReport })) ??
+      { outcome: "IDEMPOTENCY_KEY_CONFLICT", subject: input.request.projectId, expected: 1, attempted: 0, verified: 0, message: "idempotency receipt is incomplete" };
+  }
+  if (canonical.terminalizationClass === null && WORK_ITEM_CAPACITY_ATTEMPT_STATES.includes(canonical.state as typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES[number])) return null;
+  return {
+    outcome: "TERMINAL_REPORT_AMBIGUOUS",
+    subject: input.request.projectId,
+    expected: 1,
+    attempted: 0,
+    verified: 0,
+    message: canonical.terminalizationClass === "accepted-terminal-report" && exactTerminalInput
+      ? "the same terminal report was already accepted under another idempotency key"
+      : "a conflicting terminal report was already accepted for this attempt",
+  };
+}
+
+async function consumeExecutionAttemptCompletion(
+  bb: BbPluginApi,
+  db: SqliteDatabase | null,
+  input: z.infer<typeof consumeExecutionAttemptCompletionInputSchema>,
+  caller: AuthenticatedNativeCaller,
+): Promise<FoundationResult> {
+  const { request } = input;
+  if (caller.projectId !== request.projectId) return { outcome: "ROLE_CONTEXT_FOREIGN", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "authenticated native caller belongs to a different project" };
+  if (!db) return { outcome: "CANONICAL_STORE_UNAVAILABLE", subject: request.projectId, expected: 1, attempted: 0, verified: 0, message: "canonical SQLite store is unavailable" };
+  const projectCallerRefusal = recoveryCallerRefusal(db, request.projectId, caller.threadId);
+  if (projectCallerRefusal) return projectCallerRefusal;
+  const canonical = delegatedCompletionContext(db, input);
+  if ("outcome" in canonical) return canonical;
+  const callerRefusal = recoveryCallerRefusal(db, request.projectId, caller.threadId, canonical.domainId);
+  if (callerRefusal) return callerRefusal;
+  const replay = delegatedReplayOrConflict(db, input, canonical);
+  if (replay) return replay;
+  const identity = { nativeEventId: input.nativeEventId, nativeEventSeq: input.nativeEventSeq, nativeTurnId: input.nativeTurnId };
+  const resolved = await liveTerminalEvidenceReader(bb.sdk, db, request, identity);
+  if ("outcome" in resolved) return resolved;
+  const terminalReport = buildTerminalReport({
+    evidence: resolved.terminal({ ...request, ...identity }),
+    outcome: input.outcome,
+    reasonCode: input.reasonCode,
+  });
+  return applyLiveAuthorizedMutation(bb, db, {
+    ...request,
+    repoTargetId: canonical.repoTargetId,
+    domainId: canonical.domainId,
+    terminalReport,
+  }, false, "refuse-active", readGithubIssueForBackfill, null, undefined, false, false, caller);
 }
 
 async function liveZeroRealWriterGuard(
@@ -6706,6 +6878,14 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     },
   });
   bb.agents.registerTool({
+    name: "consume_execution_attempt_completion",
+    description: "Consume one exact authoritative native completion for a foreign owner only from the current director or project-orchestrator. Use this fallback when the exact owner lacks build_terminal_report. The server derives the owner, executed profile, environment, candidate, evidence, report, digests, and consuming seat; callers supply only canonical guards, DONE/BLOCKED plus reasonCode, and exact native completion identity.",
+    parameters: consumeExecutionAttemptCompletionInputSchema,
+    async execute(input, context) {
+      return JSON.stringify(await consumeExecutionAttemptCompletion(bb, db, input, { projectId: context.projectId, threadId: context.threadId }));
+    },
+  });
+  bb.agents.registerTool({
     name: "dispatch_lane",
     description: "Dispatch one writing lane through the canonical registration seam.",
     instructions: "Use this instead of spawning a lane directly. The request projectId must match the current thread project.",
@@ -6721,8 +6901,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     instructions: "Use only for a prepared work-item writing attempt with no native thread or native evidence. This path never spawns or retries.",
     parameters: threadlessPreparedClosureInputSchema,
     async execute(input, context) {
-      if (input.request.projectId !== context.projectId) throw new Error("request projectId must exactly match the current thread project");
-      return JSON.stringify(await closeThreadlessPreparedAttempt(bb, db, input));
+      return JSON.stringify(await closeThreadlessPreparedAttempt(bb, db, input, { projectId: context.projectId, threadId: context.threadId }));
     },
   });
   bb.agents.registerTool({
@@ -6761,7 +6940,7 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
       return registration === "already_satisfied" ? "already_satisfied" : registration === "registered" ? "registered" : "refused";
     },
   });
-  bb.agents.configure(() => ({ tools: ["build_terminal_report", "dispatch_lane", "close_threadless_prepared_attempt", "close_stranded_execution_attempt", "send_to_operator", "register_external_wait"], skills: [] }));
+  bb.agents.configure(() => ({ tools: ["build_terminal_report", "consume_execution_attempt_completion", "dispatch_lane", "close_threadless_prepared_attempt", "close_stranded_execution_attempt", "send_to_operator", "register_external_wait"], skills: [] }));
 
   bb.cli.register({
     name: "collab",

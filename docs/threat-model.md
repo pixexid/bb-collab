@@ -170,6 +170,7 @@ The goals are:
 | Requested/executed confusion | Requested profile is reported as actual execution | Separate Assignment and ExecutionAttempt; EXECUTION_PROFILE_UNKNOWN or EXECUTION_PROFILE_MISMATCH. |
 | Dispatch ambiguity | Native spawn is acknowledged but start/terminal evidence is missing | DISPATCH_UNKNOWN; reconcile by native/idempotent identity and do not blind-retry. |
 | Quiet worker failure | Worker dies, hangs or quota-fails without a terminal tell | Native lifecycle and terminal receipt required; FAILED or unresolved dispatch, never success by silence. |
+| Completed owner lacks terminal builder | A foreign caller fabricates a report, or a healthy environment is destroyed to unlock failure disposal | Current-holder-only `consume_execution_attempt_completion`; server-derived exact owner/native/profile/environment/candidate evidence, transactional seat recheck, stored replay, and separate execution/actor/consumer provenance. Ordinary foreign callers and caller-built evidence refuse. |
 | Connector bypass | Required external review is relabeled unavailable or inferred healthy from another repository | Separate policy/capability and exact-target fixture; CONNECTOR_REQUIRED_UNSATISFIED. |
 | Review drift | Review or connector artifact covers an old candidate head | Exact-head terminal artifact and amendment invalidation; REVIEW_HEAD_STALE. |
 | False success | Zero rows, empty loop, reaction, HTTP success or process presence is treated as proof | Every result names subject, mechanism, expected/attempted/verified counts and a negative case. |

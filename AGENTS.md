@@ -8,7 +8,7 @@ The fleet is a director, an orchestrator, and workers using BB-native threads an
 
 ## Contract
 
-`INSTRUCTION_CONTRACT_VERSION: 46` — this is the instruction contract for agent sessions; apply the [instruction-contract version-bump test](docs/rules.md#version-bump-test) before changing it. The separate `RUNTIME_CONTRACT_VERSION: 29` lives in `src/foundation.ts` and feeds `contractDigest`.
+`INSTRUCTION_CONTRACT_VERSION: 47` — this is the instruction contract for agent sessions; apply the [instruction-contract version-bump test](docs/rules.md#version-bump-test) before changing it. The separate canonical `RUNTIME_CONTRACT_VERSION` lives in `src/foundation.ts` and feeds `contractDigest`.
 
 ## Reading order for a fresh seat
 
@@ -56,3 +56,4 @@ A fresh worktree may have no dependencies. `npm ci` is expected before verificat
 - [External-party content uses the inbox](docs/rules.md#external-party-content-uses-the-inbox) — actionable operator content outside the current conversation goes through the inbox once available.
 - [Project-agnostic by construction](docs/rules.md#project-agnostic-by-construction) — changed project-owned behavior requires an explicit exact `project_id`.
 - Interrupted attempts are first-class debt: native interruption without accepted correlated terminal evidence is never `done`, never fires dependents, and requires explicit resume or disposition.
+- When an exact owner completed naturally but lacks `build_terminal_report`, the current director or project-orchestrator uses `consume_execution_attempt_completion`; never re-wake the owner, hand-build evidence, or destroy a healthy environment to reach the stranded-failure seam.

@@ -11,7 +11,7 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
-export const RUNTIME_CONTRACT_VERSION = 31;
+export const RUNTIME_CONTRACT_VERSION = 32;
 export const SCHEMA_VERSION = 35;
 // v27 records correlated terminal evidence and first-class interrupted attempts.
 const PREVIOUS_RUNTIME_CONTRACT_VERSION = 27;
@@ -8045,11 +8045,12 @@ function applyExecutionAttemptTerminalReport(
   request: ApplyRequest,
   digest: string,
   evidenceReader: ExecutionAttemptEvidenceReader | null,
+  nativeSeat: AuthenticatedNativeSeat | null,
 ): FoundationResult {
   const configRevision = requireConfig(db, request);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
-  requireRoleActorBinding(db, request, false);
+  requireNativeSeatActorAgreement(requireRoleActorBinding(db, request, false), nativeSeat);
   const report = request.terminalReport;
   if (!report || !request.executionAttemptId || report.projectId !== request.projectId || report.executionAttemptId !== request.executionAttemptId) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report and request do not identify the exact project and attempt");
@@ -8128,6 +8129,13 @@ function applyExecutionAttemptTerminalReport(
   if (canonicalJson(authoritative.evidence) !== canonicalJson(report.evidence)) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", "terminal report evidence does not match the authoritative native evidence");
   }
+  const terminalReportJson = canonicalJson(report);
+  const terminalReportDigest = sha256(terminalReportJson);
+  if (attempt.terminalization_class === "accepted-terminal-report") {
+    throw refusal("TERMINAL_REPORT_AMBIGUOUS", attempt.terminal_report_digest === terminalReportDigest && attempt.terminal_report_json === terminalReportJson
+      ? "the same terminal report was already accepted under another idempotency key"
+      : "a conflicting terminal report was already accepted for this attempt");
+  }
   if (!WORK_ITEM_CAPACITY_ATTEMPT_STATES.includes(attempt.state as typeof WORK_ITEM_CAPACITY_ATTEMPT_STATES[number])) {
     throw refusal("TERMINAL_REPORT_AMBIGUOUS", `attempt is not reportable from state ${attempt.state}`);
   }
@@ -8144,8 +8152,8 @@ function applyExecutionAttemptTerminalReport(
     terminalState,
     report.outcome,
     report.outcome,
-    sha256(canonicalJson(report)),
-    canonicalJson(report),
+    terminalReportDigest,
+    terminalReportJson,
     report.actualProfileDigest,
     report.nativeReceiptDigest,
     report.nativeEventId,
@@ -8166,10 +8174,41 @@ function applyExecutionAttemptTerminalReport(
       aggregateId: report.executionAttemptId,
       aggregateRevision: nextAggregateRevision(db, request.projectId, "execution_attempt", report.executionAttemptId),
       eventType: "execution_attempt_terminal_report_accepted",
-      event: { projectId: request.projectId, workItemId: report.workItemId, executionAttemptId: report.executionAttemptId, outcome: report.outcome, nativeEventId: report.nativeEventId, nativeEventSeq: report.nativeEventSeq, terminalReportDigest: sha256(canonicalJson(report)) },
+      event: {
+        projectId: request.projectId,
+        workItemId: report.workItemId,
+        executionAttemptId: report.executionAttemptId,
+        outcome: report.outcome,
+        nativeEventId: report.nativeEventId,
+        nativeEventSeq: report.nativeEventSeq,
+        terminalReportDigest,
+        originalExecution: { ownerThreadId: report.threadId, nativeEventId: report.nativeEventId, nativeEventSeq: report.nativeEventSeq, nativeTurnId: report.nativeTurnId },
+        ...(nativeSeat === null ? {} : { consumption: {
+          kind: "delegated-current-holder",
+          path: "agent-tool:consume_execution_attempt_completion",
+          domainId: nativeSeat.domainId,
+          roleId: nativeSeat.roleId,
+          roleGeneration: nativeSeat.roleGeneration,
+          threadId: nativeSeat.threadId,
+          holderExecutionAttemptId: nativeSeat.holderExecutionAttemptId,
+        }}),
+      },
     },
     { expected: 1, attempted: 1, verified: 1 },
-    { currentConfigRevision: configRevision, currentGovernanceEpoch: governor.governance_epoch, evidence: { executionAttemptId: report.executionAttemptId, terminalReportDigest: sha256(canonicalJson(report)) } },
+    { currentConfigRevision: configRevision, currentGovernanceEpoch: governor.governance_epoch, evidence: {
+      executionAttemptId: report.executionAttemptId,
+      terminalReportDigest,
+      originalExecution: { ownerThreadId: report.threadId, nativeEventId: report.nativeEventId, nativeEventSeq: report.nativeEventSeq, nativeTurnId: report.nativeTurnId },
+      ...(nativeSeat === null ? {} : { consumption: {
+        kind: "delegated-current-holder",
+        path: "agent-tool:consume_execution_attempt_completion",
+        domainId: nativeSeat.domainId,
+        roleId: nativeSeat.roleId,
+        roleGeneration: nativeSeat.roleGeneration,
+        threadId: nativeSeat.threadId,
+        holderExecutionAttemptId: nativeSeat.holderExecutionAttemptId,
+      }}),
+    } },
   );
 }
 
@@ -8668,6 +8707,7 @@ function applyThreadlessPreparedClosure(
   db: SqliteDatabase,
   request: ApplyRequest,
   digest: string,
+  nativeSeat: AuthenticatedNativeSeat | null,
 ): FoundationResult {
   const closure = request.threadlessPreparedClosure;
   if (!closure || request.lifecycleState !== "failed" || !request.executionAttemptId || request.workAttempt !== undefined || request.workItemWait !== undefined || request.workItemUnblock !== undefined || request.workItemExternalEvent !== undefined) {
@@ -8681,7 +8721,7 @@ function applyThreadlessPreparedClosure(
   const configRevision = requireConfig(db, request, workItemConfigRevision);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
-  requireRoleActorBinding(db, request, false);
+  requireNativeSeatActorAgreement(requireRoleActorBinding(db, request, false), nativeSeat);
   const workItem = requireWorkItem(db, request, configRevision, undefined, true);
   if (workItem.lifecycle_state !== "in_progress") {
     throw refusal("WORK_ITEM_STATE_INVALID", "thread-less prepared closure requires an in-progress work item");
@@ -8877,6 +8917,7 @@ function applyStrandedExecutionAttemptClosure(
   db: SqliteDatabase,
   request: ApplyRequest,
   digest: string,
+  nativeSeat: AuthenticatedNativeSeat | null,
 ): FoundationResult {
   const closure = request.strandedExecutionAttemptClosure;
   if (!closure || request.lifecycleState !== "failed" || !request.executionAttemptId || request.workAttempt !== undefined || request.workItemWait !== undefined || request.workItemUnblock !== undefined || request.workItemExternalEvent !== undefined) {
@@ -8890,7 +8931,7 @@ function applyStrandedExecutionAttemptClosure(
   const configRevision = requireConfig(db, request, workItemConfigRevision);
   const governor = requireGovernor(db, request);
   const actorReceiptId = requireActor(db, request);
-  requireRoleActorBinding(db, request, false);
+  requireNativeSeatActorAgreement(requireRoleActorBinding(db, request, false), nativeSeat);
   const workItem = requireWorkItem(db, request, configRevision, undefined, true);
   if (workItem.lifecycle_state !== "in_progress") {
     throw refusal("WORK_ITEM_STATE_INVALID", "stranded execution closure requires an in-progress work item");
@@ -9343,25 +9384,52 @@ function applyGithubPrObservation(
   );
 }
 
-type AuthoritativeAttemptRole = { roleId: "director" | "project-orchestrator"; roleGeneration: number };
+type AuthenticatedNativeSeat = {
+  roleId: "director" | "project-orchestrator";
+  roleGeneration: number;
+  domainId: string;
+  threadId: string;
+  holderExecutionAttemptId: string;
+};
 
-function resolveAuthenticatedNativeAttemptRole(
+function requireNativeSeatActorAgreement(
+  roleActor: { roleId: (typeof ROLE_IDS)[number]; roleGeneration: number } | null,
+  nativeSeat: AuthenticatedNativeSeat | null,
+): void {
+  if (roleActor && nativeSeat && (roleActor.roleId !== nativeSeat.roleId || roleActor.roleGeneration !== nativeSeat.roleGeneration)) {
+    throw refusal("ROLE_HOLDER_MISMATCH", "verified actor receipt and authenticated native caller disagree");
+  }
+}
+
+function resolveAuthenticatedNativeSeat(
   db: SqliteDatabase,
   request: ApplyRequest,
   authenticatedNativeCaller: AuthenticatedNativeCaller | null,
-): AuthoritativeAttemptRole | null {
+): AuthenticatedNativeSeat | null {
   const committedDispatchIntent = request.reasonCode === "dispatch_intent_finalize" && request.lifecycleState === undefined && request.workAttempt?.threadId !== undefined;
-  if (!request.workAttempt || !authenticatedNativeCaller || committedDispatchIntent) return null;
+  const requiresSeat = request.operationClass === "execution_attempt_terminal_report" ||
+    (request.operationClass === "work_item_transition" && (request.workAttempt !== undefined || request.threadlessPreparedClosure !== undefined || request.strandedExecutionAttemptClosure !== undefined));
+  if (!requiresSeat || !authenticatedNativeCaller || committedDispatchIntent) return null;
   if (authenticatedNativeCaller.projectId !== request.projectId) {
     throw refusal("ROLE_CONTEXT_FOREIGN", "authenticated native caller belongs to a different project");
   }
+  const workItem = request.workItemId === undefined ? null : asRow<{ domain_id: string }>(db.prepare(
+    "SELECT domain_id FROM work_items WHERE project_id = ? AND work_item_id = ?",
+  ).get(request.projectId, request.workItemId));
+  const domainId = workItem?.domain_id ?? request.domainId ?? "default";
   const holders = readRoleHolderStates(db).filter((holder) =>
     holder.project_id === request.projectId &&
-    (holder.domain_id ?? "default") === (request.domainId ?? "default") &&
+    (holder.domain_id ?? "default") === domainId &&
     holder.thread_id === authenticatedNativeCaller.threadId &&
     (holder.role_id === "director" || holder.role_id === "project-orchestrator"));
   if (holders.length !== 1) throw refusal("ROLE_HOLDER_MISMATCH", "authenticated native caller is not the unique current director or project-orchestrator holder");
-  return { roleId: holders[0]!.role_id as AuthoritativeAttemptRole["roleId"], roleGeneration: holders[0]!.role_generation };
+  return {
+    roleId: holders[0]!.role_id as AuthenticatedNativeSeat["roleId"],
+    roleGeneration: holders[0]!.role_generation,
+    domainId,
+    threadId: holders[0]!.thread_id,
+    holderExecutionAttemptId: holders[0]!.execution_attempt_id,
+  };
 }
 
 function applyWorkItemTransition(
@@ -9370,10 +9438,10 @@ function applyWorkItemTransition(
   digest: string,
   githubObservation: GitHubIssueSnapshot | null,
   githubPrObservation: GithubPrObservation | undefined,
-  nativeRole: AuthoritativeAttemptRole | null,
+  nativeSeat: AuthenticatedNativeSeat | null,
 ): FoundationResult {
-  if (request.threadlessPreparedClosure !== undefined) return applyThreadlessPreparedClosure(db, request, digest);
-  if (request.strandedExecutionAttemptClosure !== undefined) return applyStrandedExecutionAttemptClosure(db, request, digest);
+  if (request.threadlessPreparedClosure !== undefined) return applyThreadlessPreparedClosure(db, request, digest, nativeSeat);
+  if (request.strandedExecutionAttemptClosure !== undefined) return applyStrandedExecutionAttemptClosure(db, request, digest, nativeSeat);
   const committedDispatchIntent = request.reasonCode === "dispatch_intent_finalize" && request.lifecycleState === undefined && request.workAttempt?.threadId !== undefined;
   let configRevision: number;
   if (committedDispatchIntent) {
@@ -9390,10 +9458,8 @@ function applyWorkItemTransition(
   // The watchdog uses a verified plugin actor rather than a role holder; role actors
   // must still prove current standing on every revalidation, including after stop.
   const roleActor = requireRoleActorBinding(db, request, false);
-  if (roleActor && nativeRole && (roleActor.roleId !== nativeRole.roleId || roleActor.roleGeneration !== nativeRole.roleGeneration)) {
-    throw refusal("ROLE_HOLDER_MISMATCH", "verified actor receipt and authenticated native caller disagree");
-  }
-  const attemptRole = nativeRole ?? roleActor;
+  requireNativeSeatActorAgreement(roleActor, nativeSeat);
+  const attemptRole = nativeSeat ?? roleActor;
   const writeAttemptRole = attemptRole;
   const reviewAttemptRole = attemptRole;
   if (request.workAttempt && attemptRole && request.roleId !== undefined && request.roleId !== attemptRole.roleId) {
@@ -11556,9 +11622,7 @@ export function applyFixtureMutation(
         : observations[0] ?? null;
     }
     const mutate = () => {
-      const nativeRole = request.operationClass === "work_item_transition"
-        ? resolveAuthenticatedNativeAttemptRole(db, request, authenticatedNativeCaller)
-        : null;
+      const nativeSeat = resolveAuthenticatedNativeSeat(db, request, authenticatedNativeCaller);
       const replay = checkIdempotency(db, request, digest);
       if (replay) return replay;
       switch (request.operationClass) {
@@ -11579,11 +11643,11 @@ export function applyFixtureMutation(
         case "work_item_create":
           return applyWorkItemCreate(db, request, digest);
         case "work_item_transition":
-          return applyWorkItemTransition(db, request, digest, githubObservation, request.githubPrObservation, nativeRole);
+          return applyWorkItemTransition(db, request, digest, githubObservation, request.githubPrObservation, nativeSeat);
         case "github_pr_observation_record":
           return applyGithubPrObservation(db, request, digest);
         case "execution_attempt_terminal_report":
-          return applyExecutionAttemptTerminalReport(db, request, digest, executionAttemptEvidenceReader);
+          return applyExecutionAttemptTerminalReport(db, request, digest, executionAttemptEvidenceReader, nativeSeat);
         case "execution_attempt_interruption":
           return applyExecutionAttemptInterruption(db, request, digest, executionAttemptEvidenceReader);
         case "github_issue_projection":
