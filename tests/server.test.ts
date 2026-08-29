@@ -12459,7 +12459,7 @@ else printf '%s\\n' '[]'; fi
 
   it("appends authority-root schema and bumps the runtime contract", () => {
     expect(SCHEMA_VERSION).toBe(35);
-    expect(RUNTIME_CONTRACT_VERSION).toBe(35);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(36);
     expect(MIGRATIONS).toHaveLength(48);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
@@ -12486,7 +12486,7 @@ else printf '%s\\n' '[]'; fi
       oldSchemaVersion: 32,
       newSchemaVersion: 35,
       oldContractVersion: 27,
-      newContractVersion: 35,
+      newContractVersion: 36,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -12496,7 +12496,7 @@ else printf '%s\\n' '[]'; fi
       oldSchemaVersion: 32,
       newSchemaVersion: 35,
       oldContractVersion: 27,
-      newContractVersion: 35,
+      newContractVersion: 36,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -12505,13 +12505,13 @@ else printf '%s\\n' '[]'; fi
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ action: "refused", verified: 0 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 31))).toMatchObject({ action: "refused", verified: 0 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 33))).toMatchObject({ action: "refused", verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 35))).toMatchObject({ action: "reread", verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 36))).toMatchObject({ action: "reread", verified: 4 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 32,
       newSchemaVersion: 35,
       oldContractVersion: 27,
-      newContractVersion: 35,
+      newContractVersion: 36,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -12783,7 +12783,7 @@ else printf '%s\\n' '[]'; fi
   });
 
   it("assembles the production v22 cached-consumer rollout receipt with stale-v21 refusal semantics", async () => {
-    expect(RUNTIME_CONTRACT_VERSION).toBe(35);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(36);
     expect(SCHEMA_VERSION).toBe(35);
     expect(MIGRATIONS).toHaveLength(48);
     expect(contractDigest).not.toBe("d4e51b0b1fd68957120cea5febb7762d6c3b9eddab76f67916e556830b062b83");
@@ -12802,7 +12802,7 @@ else printf '%s\\n' '[]'; fi
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 35, observedContractVersion: 35 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 35, observedContractVersion: 36 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -13428,7 +13428,7 @@ else printf '%s\\n' '[]'; fi
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
       observedSchemaVersion: 35,
-      observedContractVersion: 35,
+      observedContractVersion: 36,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -13510,7 +13510,7 @@ else printf '%s\\n' '[]'; fi
       evidence: {
         cachedConsumers: {
           oldContractVersion: 27,
-          newContractVersion: 35,
+          newContractVersion: 36,
           action: "unknown",
           expected: 4,
           attempted: 0,
@@ -13652,7 +13652,7 @@ else printf '%s\\n' '[]'; fi
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 35, schemaDigest, contractVersion: 35, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 35, schemaDigest, contractVersion: 36, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -16134,6 +16134,182 @@ else printf '%s\\n' '[]'; fi
     expect(db.prepare("SELECT 1 FROM work_item_waits WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, targetId)).toBeUndefined();
   });
 
+  it("lets only an exact independently observed Tier C remote-null fast-forward complete without review_pending", async () => {
+    const accepted = await acceptedDoneWorkItemFixture();
+    const evidence = {
+      kind: "local_merge" as const,
+      projectId: PROJECT_ID,
+      repoTargetId: TARGET_ID,
+      executionAttemptId: accepted.attempt.execution_attempt_id,
+      baseSha: BASE_SHA,
+      candidateSha: CANDIDATE_SHA,
+      mergedSha: CANDIDATE_SHA,
+      environment: {
+        bbServerId: "server-local",
+        environmentId: accepted.report.environmentId!,
+        sourceId: "source-main",
+        hostId: "host-main",
+        path: "/workspace/local-candidate",
+        mode: "managed-worktree" as const,
+      },
+      observation: { clean: true as const, reachable: true as const },
+    };
+    accepted.evidenceReader.localMergeEvidence = { evidence, reviewTier: "C" };
+    const request = acceptedReviewPendingRequest(accepted, 3, {
+      idempotencyKey: "tier-c-local-merge",
+      actorReceiptId: "role-actor-assignment",
+      lifecycleState: "succeeded",
+      satisfactionEvidence: evidence,
+      workAttempt: undefined,
+    });
+    const result = applyWithFixtureReceipt(accepted.fixture.db, request, null, null, null, null, accepted.evidenceReader, {
+      projectId: PROJECT_ID,
+      threadId: ROLE_THREAD_ID,
+    });
+    expect(result).toMatchObject({ outcome: "OK", currentResourceRevision: 4, evidence: { lifecycleState: "succeeded", reviewTier: "C", satisfactionEvidence: evidence } });
+    expect(accepted.fixture.db.prepare("SELECT lifecycle_state FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ lifecycle_state: "succeeded" });
+    const transitions = accepted.fixture.db.prepare(
+      "SELECT event_json FROM state_events WHERE project_id = ? AND aggregate_type = 'work_item' AND aggregate_id = ? AND event_type = 'work_item_transitioned' ORDER BY event_sequence",
+    ).all(PROJECT_ID, WORK_ITEM_ID) as Array<{ event_json: string }>;
+    expect(transitions.map(({ event_json }) => JSON.parse(event_json))).toContainEqual(expect.objectContaining({ from: "in_progress", to: "succeeded", reviewTier: "C" }));
+    expect(transitions.map(({ event_json }) => JSON.parse(event_json)).some((event) => event.to === "review_pending")).toBe(false);
+  });
+
+  it.each([
+    ["Tier C", "docs/candidate.md", true],
+    ["Tier B", "src/candidate.ts", false],
+    ["Tier A", "src/foundation.ts", false],
+  ] as const)("derives and enforces %s local completion through the shipped CLI", async (_tier, changedFile, succeeds) => {
+    const accepted = await acceptedDoneWorkItemFixture();
+    const root = mkdtempSync(join(tmpdir(), "bb-collab-tier-c-local-"));
+    const targetPath = join(root, "target");
+    const candidatePath = join(root, "candidate-worktree");
+    try {
+      mkdirSync(targetPath);
+      execFileSync("git", ["-C", targetPath, "init", "-b", "main"]);
+      execFileSync("git", ["-C", targetPath, "config", "user.name", "Fixture"]);
+      execFileSync("git", ["-C", targetPath, "config", "user.email", "fixture@example.test"]);
+      mkdirSync(join(targetPath, "docs"));
+      writeFileSync(join(targetPath, "docs", "base.md"), "base\n");
+      execFileSync("git", ["-C", targetPath, "add", "docs/base.md"]);
+      execFileSync("git", ["-C", targetPath, "commit", "-m", "base"]);
+      const baseSha = execFileSync("git", ["-C", targetPath, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      execFileSync("git", ["-C", targetPath, "worktree", "add", "-b", "candidate", candidatePath]);
+      mkdirSync(dirname(join(candidatePath, changedFile)), { recursive: true });
+      writeFileSync(join(candidatePath, changedFile), "candidate\n");
+      execFileSync("git", ["-C", candidatePath, "add", changedFile]);
+      execFileSync("git", ["-C", candidatePath, "commit", "-m", "candidate"]);
+      const candidateSha = execFileSync("git", ["-C", candidatePath, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      execFileSync("git", ["-C", targetPath, "merge", "--ff-only", "candidate"]);
+
+      accepted.fixture.db.prepare("UPDATE repository_targets SET path = ?, remote_url = NULL, default_branch = 'main' WHERE project_id = ? AND repo_target_id = ?").run(targetPath, PROJECT_ID, TARGET_ID);
+      accepted.fixture.host.harness.sdk.stub("projects.get", (async () => ({ id: PROJECT_ID, sources: [{ id: "source-main", projectId: PROJECT_ID, hostId: "host-main", path: targetPath }] })) as never);
+      accepted.fixture.host.harness.sdk.stub("environments.get", (async () => ({
+        id: accepted.report.environmentId, projectId: PROJECT_ID, hostId: "host-main", path: candidatePath,
+        managed: true, isGitRepo: true, isWorktree: true, workspaceProvisionType: "managed-worktree",
+      })) as never);
+      accepted.fixture.host.harness.sdk.stub("environments.diff", (async () => ({ outcome: "available" })) as never);
+      accepted.fixture.host.harness.sdk.stub("environments.status", (async () => ({
+        outcome: "available",
+        workspace: {
+          checkout: { kind: "branch", branchName: "candidate", headSha: candidateSha },
+          mergeBase: { aheadCount: 1, baseRef: baseSha, behindCount: 0, commits: [], deletions: 0, files: [changedFile], hasCommittedUnmergedChanges: true, insertions: 1, lineStatsComplete: true, mergeBaseBranch: baseSha },
+          workingTree: { deletions: 0, files: [], hasUncommittedChanges: false, insertions: 0, lineStatsComplete: true, state: "committed_unmerged" },
+        },
+      })) as never);
+      const evidence = {
+        kind: "local_merge" as const, projectId: PROJECT_ID, repoTargetId: TARGET_ID, executionAttemptId: accepted.attempt.execution_attempt_id,
+        baseSha, candidateSha, mergedSha: candidateSha,
+        environment: { bbServerId: accepted.fixture.host.bb.server.loopbackBaseUrl, environmentId: accepted.report.environmentId!, sourceId: "source-main", hostId: "host-main", path: candidatePath, mode: "managed-worktree" as const },
+        observation: { clean: true as const, reachable: true as const },
+      };
+      const request = acceptedReviewPendingRequest(accepted, 3, {
+        idempotencyKey: "tier-c-live-cli", actorReceiptId: "role-actor-assignment", lifecycleState: "succeeded", satisfactionEvidence: evidence, workAttempt: undefined,
+      });
+      const cli = await accepted.fixture.host.harness.runCli(["apply", "--project", PROJECT_ID, "--request", JSON.stringify(request)]);
+      expect(cli.exitCode, cli.stdout).toBe(succeeds ? 0 : 2);
+      expect(JSON.parse(cli.stdout)).toMatchObject(succeeds
+        ? { outcome: "OK", evidence: { lifecycleState: "succeeded", reviewTier: "C", satisfactionEvidence: evidence } }
+        : { outcome: "WORK_ITEM_STATE_INVALID" });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["Tier A", (request: ApplyRequest, reader: DeterministicExecutionAttemptEvidenceReader) => { reader.localMergeEvidence!.reviewTier = "A"; return request; }],
+    ["Tier B", (request: ApplyRequest, reader: DeterministicExecutionAttemptEvidenceReader) => { reader.localMergeEvidence!.reviewTier = "B"; return request; }],
+    ["unmerged candidate", (request: ApplyRequest) => ({ ...request, satisfactionEvidence: { ...(request.satisfactionEvidence as object), mergedSha: H1_CANDIDATE_SHA } } as ApplyRequest)],
+    ["wrong target", (request: ApplyRequest) => ({ ...request, satisfactionEvidence: { ...(request.satisfactionEvidence as object), repoTargetId: SECOND_TARGET_ID } } as ApplyRequest)],
+    ["wrong environment", (request: ApplyRequest) => ({ ...request, satisfactionEvidence: { ...(request.satisfactionEvidence as Extract<NonNullable<ApplyRequest["satisfactionEvidence"]>, { kind: "local_merge" }>), environment: { ...(request.satisfactionEvidence as Extract<NonNullable<ApplyRequest["satisfactionEvidence"]>, { kind: "local_merge" }>).environment, environmentId: "foreign-environment" } } } as ApplyRequest)],
+    ["dirty candidate", (request: ApplyRequest) => ({ ...request, satisfactionEvidence: { ...(request.satisfactionEvidence as object), observation: { clean: false, reachable: true } } } as never)],
+    ["unreachable candidate", (request: ApplyRequest) => ({ ...request, satisfactionEvidence: { ...(request.satisfactionEvidence as object), observation: { clean: true, reachable: false } } } as never)],
+    ["non-fast-forward head", (request: ApplyRequest) => ({ ...request, satisfactionEvidence: { ...(request.satisfactionEvidence as object), candidateSha: H1_CANDIDATE_SHA, mergedSha: H1_CANDIDATE_SHA } } as ApplyRequest)],
+    ["foreign project", (request: ApplyRequest) => ({ ...request, satisfactionEvidence: { ...(request.satisfactionEvidence as object), projectId: FOREIGN_PROJECT_ID } } as ApplyRequest)],
+  ] as const)("refuses Tier C local completion with %s evidence", async (_name, mutate) => {
+    const accepted = await acceptedDoneWorkItemFixture();
+    const evidence = {
+      kind: "local_merge" as const, projectId: PROJECT_ID, repoTargetId: TARGET_ID, executionAttemptId: accepted.attempt.execution_attempt_id,
+      baseSha: BASE_SHA, candidateSha: CANDIDATE_SHA, mergedSha: CANDIDATE_SHA,
+      environment: { bbServerId: "server-local", environmentId: accepted.report.environmentId!, sourceId: "source-main", hostId: "host-main", path: "/workspace/local-candidate", mode: "managed-worktree" as const },
+      observation: { clean: true as const, reachable: true as const },
+    };
+    accepted.evidenceReader.localMergeEvidence = { evidence: structuredClone(evidence), reviewTier: "C" };
+    const baseRequest = acceptedReviewPendingRequest(accepted, 3, { idempotencyKey: `tier-c-refuse-${_name}`, actorReceiptId: "role-actor-assignment", lifecycleState: "succeeded", satisfactionEvidence: evidence, workAttempt: undefined });
+    const request = mutate(baseRequest, accepted.evidenceReader);
+    const before = exportFoundation(accepted.fixture.db, PROJECT_ID);
+    const result = applyWithFixtureReceipt(accepted.fixture.db, request, null, null, null, null, accepted.evidenceReader, { projectId: PROJECT_ID, threadId: ROLE_THREAD_ID });
+    expect(result.outcome).not.toBe("OK");
+    expect(exportFoundation(accepted.fixture.db, PROJECT_ID)).toEqual(before);
+  });
+
+  it("refuses local completion without an accepted report or exact orchestrator actor", async () => {
+    const missingReport = await acceptedDoneWorkItemFixture(WORK_ITEM_ID, "DONE", false);
+    const evidence = {
+      kind: "local_merge" as const, projectId: PROJECT_ID, repoTargetId: TARGET_ID, executionAttemptId: missingReport.attempt.execution_attempt_id,
+      baseSha: BASE_SHA, candidateSha: CANDIDATE_SHA, mergedSha: CANDIDATE_SHA,
+      environment: { bbServerId: "server-local", environmentId: missingReport.report.environmentId!, sourceId: "source-main", hostId: "host-main", path: "/workspace/local-candidate", mode: "managed-worktree" as const },
+      observation: { clean: true as const, reachable: true as const },
+    };
+    missingReport.evidenceReader.localMergeEvidence = { evidence, reviewTier: "C" };
+    const request = acceptedReviewPendingRequest(missingReport, 3, { idempotencyKey: "tier-c-missing-report", actorReceiptId: "role-actor-assignment", lifecycleState: "succeeded", satisfactionEvidence: evidence, workAttempt: undefined });
+    expect(applyWithFixtureReceipt(missingReport.fixture.db, request, null, null, null, null, missingReport.evidenceReader, { projectId: PROJECT_ID, threadId: ROLE_THREAD_ID }).outcome).not.toBe("OK");
+
+    const accepted = await acceptedDoneWorkItemFixture();
+    const exactEvidence = { ...evidence, executionAttemptId: accepted.attempt.execution_attempt_id };
+    accepted.evidenceReader.localMergeEvidence = { evidence: exactEvidence, reviewTier: "C" };
+    const exact = acceptedReviewPendingRequest(accepted, 3, { idempotencyKey: "tier-c-wrong-actor", actorReceiptId: RECEIPT_ID, lifecycleState: "succeeded", satisfactionEvidence: exactEvidence, workAttempt: undefined });
+    expect(applyWithFixtureReceipt(accepted.fixture.db, exact, null, null, null, null, accepted.evidenceReader).outcome).not.toBe("OK");
+  });
+
+  it("kills the reason-code-only local completion mutant independently", async () => {
+    const accepted = await acceptedDoneWorkItemFixture();
+    const request = acceptedReviewPendingRequest(accepted, 3, {
+      idempotencyKey: "tier-c-reason-only-mutant",
+      actorReceiptId: "role-actor-assignment",
+      lifecycleState: "succeeded",
+      reasonCode: "orchestrator-local-merge-adjudication",
+      satisfactionEvidence: undefined,
+      reviewHandoff: undefined,
+      workAttempt: undefined,
+    });
+    expect(applyWithFixtureReceipt(accepted.fixture.db, request).outcome).toBe("WORK_ITEM_STATE_INVALID");
+  });
+
+  it("kills the caller-supplied merge-truth mutant independently", async () => {
+    const accepted = await acceptedDoneWorkItemFixture();
+    const evidence = {
+      kind: "local_merge" as const, projectId: PROJECT_ID, repoTargetId: TARGET_ID, executionAttemptId: accepted.attempt.execution_attempt_id,
+      baseSha: BASE_SHA, candidateSha: CANDIDATE_SHA, mergedSha: CANDIDATE_SHA,
+      environment: { bbServerId: "server-local", environmentId: accepted.report.environmentId!, sourceId: "source-main", hostId: "host-main", path: "/workspace/local-candidate", mode: "managed-worktree" as const },
+      observation: { clean: true as const, reachable: true as const },
+    };
+    const request = acceptedReviewPendingRequest(accepted, 3, {
+      idempotencyKey: "tier-c-caller-truth-mutant", actorReceiptId: "role-actor-assignment", lifecycleState: "succeeded", satisfactionEvidence: evidence, workAttempt: undefined,
+    });
+    expect(applyWithFixtureReceipt(accepted.fixture.db, request).outcome).toBe("WORK_ITEM_STATE_INVALID");
+  });
+
   it("requires review_pending between authorship and terminal success and supports review findings re-entry", async () => {
     const host = await loadedHost();
     const { db, fenceToken } = seedAndBootstrap(host);
@@ -18323,11 +18499,11 @@ printf '%s\\n' '${external}'
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 35, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 35, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 35, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 31))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 35, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 35))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 35, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 36, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 36, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 36, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 31))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 36, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 36))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 36, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 

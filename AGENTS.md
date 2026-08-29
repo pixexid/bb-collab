@@ -8,7 +8,7 @@ The fleet is a director, an orchestrator, and workers using BB-native threads an
 
 ## Contract
 
-`INSTRUCTION_CONTRACT_VERSION: 50` — this is the instruction contract for agent sessions; apply the [instruction-contract version-bump test](docs/rules.md#version-bump-test) before changing it. The separate canonical `RUNTIME_CONTRACT_VERSION` lives in `src/foundation.ts` and feeds `contractDigest`.
+`INSTRUCTION_CONTRACT_VERSION: 51` — this is the instruction contract for agent sessions; apply the [instruction-contract version-bump test](docs/rules.md#version-bump-test) before changing it. The separate canonical `RUNTIME_CONTRACT_VERSION` lives in `src/foundation.ts` and feeds `contractDigest`.
 
 ## Reading order for a fresh seat
 

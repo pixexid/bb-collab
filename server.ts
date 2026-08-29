@@ -73,11 +73,13 @@ import {
   type RoleEventFact,
   type RoleFactReader,
   type AuthoritativeHistoricalInterruption,
+  type AuthoritativeLocalMergeEvidence,
   type AuthoritativeTerminalEvidence,
   type ExecutionAttemptEvidenceReader,
   type SqliteDatabase,
   type WorkItemDispatchConfigProof,
 } from "./src/foundation.js";
+import { requiredReviewTier } from "./src/review-tier.mjs";
 import { registerResidentService, residentServerIdentity } from "./src/deployment-identity.js";
 
 export { schemaDigest };
@@ -2486,6 +2488,107 @@ function liveTerminalReader(
   }, report);
 }
 
+function gitEvidence(path: string, args: string[]): string {
+  const result = spawnSync("git", ["-C", path, ...args], { encoding: "utf8", timeout: 10_000, maxBuffer: 1024 * 1024 });
+  if (result.error || result.status !== 0) throw new Error(`git ${args[0] ?? "command"} evidence is unavailable`);
+  return result.stdout.replace(/\n$/u, "");
+}
+
+async function liveLocalMergeReader(
+  bb: BbPluginApi,
+  db: SqliteDatabase,
+  request: ApplyRequest,
+): Promise<ExecutionAttemptEvidenceReader | FoundationResult> {
+  const supplied = request.satisfactionEvidence;
+  if (supplied?.kind !== "local_merge" || !request.workItemId || !request.executionAttemptId || supplied.executionAttemptId !== request.executionAttemptId) {
+    return evidenceUnavailable(request.projectId, "local merge identity is unavailable");
+  }
+  const attempt = db.prepare(
+    "SELECT terminal_report_json FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ? AND work_item_id = ?",
+  ).get(request.projectId, request.executionAttemptId, request.workItemId) as { terminal_report_json: string | null } | undefined;
+  const target = db.prepare(
+    `SELECT targets.source_id, targets.host_id, targets.path, targets.remote_url, targets.default_branch
+       FROM repository_targets AS targets
+       JOIN project_config_heads AS heads ON heads.project_id = targets.project_id AND heads.config_revision = targets.config_revision
+      WHERE targets.project_id = ? AND targets.repo_target_id = ?`,
+  ).get(request.projectId, supplied.repoTargetId) as { source_id: string; host_id: string; path: string; remote_url: string | null; default_branch: string } | undefined;
+  if (!attempt?.terminal_report_json || !target || target.remote_url !== null) return evidenceUnavailable(request.projectId, "accepted terminal report or exact remote-less target is unavailable");
+  let terminalEnvironmentId: string;
+  try {
+    const report = JSON.parse(attempt.terminal_report_json) as { outcome?: unknown; projectId?: unknown; workItemId?: unknown; executionAttemptId?: unknown; repoTargetId?: unknown; environmentId?: unknown };
+    if (report.outcome !== "DONE" || report.projectId !== request.projectId || report.workItemId !== request.workItemId ||
+      report.executionAttemptId !== request.executionAttemptId || report.repoTargetId !== supplied.repoTargetId || typeof report.environmentId !== "string") throw new Error("invalid terminal identity");
+    terminalEnvironmentId = report.environmentId;
+  } catch {
+    return evidenceUnavailable(request.projectId, "accepted terminal report identity is malformed");
+  }
+  try {
+    if (terminalEnvironmentId !== supplied.environment.environmentId) throw new Error("terminal environment changed");
+    const [environment, project, baseCommit, candidateCommit, status] = await Promise.all([
+      bb.sdk.environments.get({ environmentId: supplied.environment.environmentId }),
+      bb.sdk.projects.get({ projectId: request.projectId }),
+      bb.sdk.environments.diff({ environmentId: supplied.environment.environmentId, target: "commit", sha: supplied.baseSha }),
+      bb.sdk.environments.diff({ environmentId: supplied.environment.environmentId, target: "commit", sha: supplied.candidateSha }),
+      bb.sdk.environments.status({ environmentId: supplied.environment.environmentId, mergeBaseBranch: supplied.baseSha }),
+    ]);
+    if (
+      environment.id !== supplied.environment.environmentId || environment.projectId !== request.projectId || environment.hostId !== target.host_id ||
+      environment.path !== supplied.environment.path || environment.managed !== true || environment.isWorktree !== true || environment.workspaceProvisionType !== "managed-worktree" ||
+      supplied.environment.bbServerId !== bb.server.loopbackBaseUrl || supplied.environment.sourceId !== target.source_id || supplied.environment.hostId !== target.host_id ||
+      project.sources.filter((source) => source.id === target.source_id && source.projectId === request.projectId && source.hostId === target.host_id && source.path === target.path).length !== 1
+    ) throw new Error("local merge environment or source identity is foreign");
+    if (baseCommit.outcome !== "available" || candidateCommit.outcome !== "available" || status.outcome !== "available") throw new Error("local merge candidate is unreachable");
+    const checkout = status.workspace.checkout;
+    const workingTree = status.workspace.workingTree as { state?: string; hasUncommittedChanges?: boolean; files?: unknown[]; insertions?: number; deletions?: number };
+    const mergeBase = status.workspace.mergeBase;
+    const clean = (workingTree.state === "clean" || workingTree.state === "committed_unmerged") && workingTree.hasUncommittedChanges === false &&
+      Array.isArray(workingTree.files) && workingTree.files.length === 0 && workingTree.insertions === 0 && workingTree.deletions === 0;
+    if (
+      (checkout.kind !== "branch" && checkout.kind !== "detached") || checkout.headSha !== supplied.candidateSha || !clean ||
+      !mergeBase || mergeBase.baseRef !== supplied.baseSha || mergeBase.mergeBaseBranch !== supplied.baseSha || mergeBase.behindCount !== 0 || mergeBase.aheadCount <= 0
+    ) throw new Error("local merge candidate is not the exact clean reachable fast-forward source");
+
+    const branchRef = `refs/heads/${target.default_branch}`;
+    const mergedSha = gitEvidence(target.path, ["rev-parse", "--verify", branchRef]);
+    const priorSha = gitEvidence(target.path, ["rev-parse", "--verify", `${branchRef}@{1}`]);
+    if (mergedSha !== supplied.candidateSha || priorSha !== supplied.baseSha || gitEvidence(target.path, ["symbolic-ref", "--short", "HEAD"]) !== target.default_branch) {
+      throw new Error("local default branch does not identify the exact observed fast-forward");
+    }
+    gitEvidence(target.path, ["merge-base", "--is-ancestor", supplied.baseSha, supplied.candidateSha]);
+    if (gitEvidence(target.path, ["status", "--porcelain=v1", "-z"]) !== "") throw new Error("local merged target is dirty");
+    const changedFiles = gitEvidence(target.path, ["diff", "--name-only", "-z", supplied.baseSha, supplied.candidateSha]).split("\0").filter(Boolean).sort();
+    if (changedFiles.length === 0 || new Set(changedFiles).size !== changedFiles.length) throw new Error("local merge changed-file evidence is empty or ambiguous");
+    const evidence: AuthoritativeLocalMergeEvidence = {
+      evidence: {
+        kind: "local_merge",
+        projectId: request.projectId,
+        repoTargetId: supplied.repoTargetId,
+        executionAttemptId: request.executionAttemptId,
+        baseSha: priorSha,
+        candidateSha: mergedSha,
+        mergedSha,
+        environment: {
+          bbServerId: bb.server.loopbackBaseUrl,
+          environmentId: environment.id,
+          sourceId: target.source_id,
+          hostId: environment.hostId,
+          path: environment.path,
+          mode: "managed-worktree",
+        },
+        observation: { clean: true, reachable: true },
+      },
+      reviewTier: requiredReviewTier(changedFiles),
+    };
+    return {
+      terminal: () => { throw new Error("terminal evidence is not available through the local merge reader"); },
+      historical: () => { throw new Error("historical evidence is not available through the local merge reader"); },
+      localMerge: () => evidence,
+    };
+  } catch (error) {
+    return evidenceUnavailable(request.projectId, `authoritative local merge evidence unavailable: ${String(error)}`);
+  }
+}
+
 function liveTerminalEvidenceReader(
   sdk: BbPluginApi["sdk"],
   db: SqliteDatabase,
@@ -3043,7 +3146,11 @@ async function applyLiveAuthorizedMutation(
   const preMutationRefusal = preMutationGuard === undefined ? null : await preMutationGuard();
   if (preMutationRefusal) return preMutationRefusal;
   let evidenceReader: ExecutionAttemptEvidenceReader | null = null;
-  if (parsed.success && db && parsed.data.operationClass === "execution_attempt_terminal_report") {
+  if (parsed.success && db && parsed.data.operationClass === "work_item_transition" && parsed.data.satisfactionEvidence?.kind === "local_merge") {
+    const resolved = await liveLocalMergeReader(bb, db, parsed.data);
+    if ("outcome" in resolved) return resolved;
+    evidenceReader = resolved;
+  } else if (parsed.success && db && parsed.data.operationClass === "execution_attempt_terminal_report") {
     const resolved = await liveTerminalReader(bb.sdk, db, parsed.data);
     if ("outcome" in resolved) return resolved;
     evidenceReader = resolved;
@@ -3079,7 +3186,11 @@ async function applyLiveAuthorizedMutationAsync(
   }
   const reader = parsed.success ? await readLiveRoleFactReader(bb.sdk, bb.server.loopbackBaseUrl, parsed.data) : null;
   let evidenceReader: ExecutionAttemptEvidenceReader | null = null;
-  if (parsed.success && db && parsed.data.operationClass === "execution_attempt_terminal_report") {
+  if (parsed.success && db && parsed.data.operationClass === "work_item_transition" && parsed.data.satisfactionEvidence?.kind === "local_merge") {
+    const resolved = await liveLocalMergeReader(bb, db, parsed.data);
+    if ("outcome" in resolved) return resolved;
+    evidenceReader = resolved;
+  } else if (parsed.success && db && parsed.data.operationClass === "execution_attempt_terminal_report") {
     const resolved = await liveTerminalReader(bb.sdk, db, parsed.data);
     if ("outcome" in resolved) return resolved;
     evidenceReader = resolved;

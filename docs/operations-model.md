@@ -87,6 +87,8 @@ movement retires the spawn opportunity while preserving the prepared intent.
 
 Enter it from `in_progress` with an exact accepted-DONE writing-attempt handoff; the completed attempt is retained as `done` and is never re-terminalized. An explicit legacy/recovery handoff is available only under its dedicated reason. Omitting a work attempt is legal for the orchestrator-verifies-the-fixed-head shape. If supplied, the attempt must be `review` with a lane, requested profile, and one explicit candidate kind; its initial thread ID is optional. These requirements and the registration are enforced by [`workAttemptSchema` and `applyWorkItemTransition`](../src/foundation.ts).
 
+Tier C work on an exact remote-less target does not enter `review_pending`. The current project-orchestrator may close it directly from `in_progress` only with the exact accepted-DONE writing report and `local_merge` satisfaction evidence. The live resolver independently re-observes the managed candidate environment, clean/reachable checkout, target default-branch reflog predecessor and merged head, fast-forward ancestry, and changed-file Tier C classification. Caller text, reason codes, supplied merge truth without that readback, remote-backed targets, and Tier A/B candidates refuse. The transition event records `reviewTier: "C"` and the exact local-merge evidence, so it means orchestrator-adjudicated local merge rather than review.
+
 The canonical exits are [`WORK_ITEM_TRANSITIONS`](../src/foundation.ts):
 
 - `in_progress` for request changes, with a supplied writing attempt and requested profile; the active review is superseded and a fresh writing attempt opens.
