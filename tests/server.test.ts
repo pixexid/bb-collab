@@ -7118,6 +7118,14 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
 
   it("proves equivalent config cutover before intent and records one governed continuation", async () => {
     const fixture = await fleetWatchdogFixture(0, true, 1, false);
+    const materialWorkItemId = "wi-gh779-material-control";
+    expect(applyWithFixtureReceipt(fixture.db, workItemCreateRequest(fixture.fenceToken, {
+      idempotencyKey: "work-item-create-gh779-material",
+      workItem: { workItemId: materialWorkItemId, title: "Material authority control", body: "Must remain fail closed." },
+    }))).toMatchObject({ outcome: "OK" });
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "ready", 1, {
+      idempotencyKey: "work-item-ready-gh779-material", workItemId: materialWorkItemId,
+    }))).toMatchObject({ outcome: "OK" });
     const stored = fixture.db.prepare(
       "SELECT canonical_config_json FROM project_config_revisions WHERE project_id = ? AND config_revision = 1",
     ).get(PROJECT_ID) as { canonical_config_json: string };
@@ -7138,7 +7146,7 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
       expectedGovernanceEpoch: 1,
       expectedFenceToken: fixture.fenceToken,
       config,
-      targets: [target],
+      targets: [{ ...target, remoteUrl: "https://example.test/target-only.git" }],
     })).toMatchObject({ outcome: "OK" });
 
     const result = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
@@ -7151,6 +7159,25 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(fixture.db.prepare("SELECT config_revision, lifecycle_state, resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ config_revision: 1, lifecycle_state: "in_progress", resource_revision: 3 });
     expect(fixture.db.prepare("SELECT state, thread_id FROM execution_attempts WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, WORK_ITEM_ID)).toEqual({ state: "running", thread_id: "lane-1" });
     expect(fixture.db.prepare("SELECT event_json FROM state_events WHERE project_id = ? AND event_type = 'work_item_attempt_armed'").get(PROJECT_ID)).toMatchObject({ event_json: expect.stringContaining("configContinuation") });
+
+    const changed = structuredClone(config) as Record<string, unknown>;
+    const requirements = (((changed.extensions as Record<string, unknown>).bbCollab as Record<string, unknown>).roleRequirements as Array<Record<string, unknown>>);
+    requirements.find((requirement) => requirement.roleId === "project-orchestrator")!.executedProfile = { ...ROLE_PROFILE, model: "changed-orchestrator-profile" };
+    expect(applyWithFixtureReceipt(fixture.db, {
+      ...bootstrapRequest(), operationClass: "config_revision", idempotencyKey: "dispatch-material-config-3",
+      expectedConfigRevision: 2, configRevision: 3, expectedGovernanceEpoch: 1, expectedFenceToken: fixture.fenceToken,
+      config: changed, targets: [{ ...target, remoteUrl: "https://example.test/target-only.git" }],
+    })).toMatchObject({ outcome: "OK" });
+    const materialRevision = (fixture.db.prepare("SELECT resource_revision FROM work_items WHERE project_id = ? AND work_item_id = ?").get(PROJECT_ID, materialWorkItemId) as { resource_revision: number }).resource_revision;
+    const refused = JSON.parse(await fixture.host.harness.callAgentTool("dispatch_lane", {
+      request: { ...transitionRequest(fixture.fenceToken, "in_progress", materialRevision, {
+        idempotencyKey: "dispatch-material-refusal", workItemId: materialWorkItemId,
+        workAttempt: { laneId: "lane-gh779-material", threadId: "thread-gh779-material", assignmentKind: "write", requestedProfile: ROLE_PROFILE },
+      }), expectedConfigRevision: 3 },
+      spawn: dispatchSpawn(fixture.orchestratorThreadId),
+    }, { projectId: PROJECT_ID, threadId: fixture.orchestratorThreadId }) as string);
+    expect(refused).toMatchObject({ outcome: "PROJECT_CONFIG_STALE", message: "seated role authority changed across config revisions" });
+    expect(fixture.host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
   });
 
   it("dispatches a local review only with exact native base, candidate, server, and ancestry proof", async () => {
@@ -12432,7 +12459,7 @@ else printf '%s\\n' '[]'; fi
 
   it("appends authority-root schema and bumps the runtime contract", () => {
     expect(SCHEMA_VERSION).toBe(35);
-    expect(RUNTIME_CONTRACT_VERSION).toBe(34);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(35);
     expect(MIGRATIONS).toHaveLength(48);
     // Historical migration entries predate the schema-version counter by 13.
     expect(SCHEMA_VERSION).toBe(MIGRATIONS.length - 13);
@@ -12459,7 +12486,7 @@ else printf '%s\\n' '[]'; fi
       oldSchemaVersion: 32,
       newSchemaVersion: 35,
       oldContractVersion: 27,
-      newContractVersion: 34,
+      newContractVersion: 35,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -12469,7 +12496,7 @@ else printf '%s\\n' '[]'; fi
       oldSchemaVersion: 32,
       newSchemaVersion: 35,
       oldContractVersion: 27,
-      newContractVersion: 34,
+      newContractVersion: 35,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -12478,13 +12505,13 @@ else printf '%s\\n' '[]'; fi
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ action: "refused", verified: 0 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 31))).toMatchObject({ action: "refused", verified: 0 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 33))).toMatchObject({ action: "refused", verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 34))).toMatchObject({ action: "reread", verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 35))).toMatchObject({ action: "reread", verified: 4 });
     expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({
       names: [...CACHED_CONSUMERS],
       oldSchemaVersion: 32,
       newSchemaVersion: 35,
       oldContractVersion: 27,
-      newContractVersion: 34,
+      newContractVersion: 35,
       action: "refused",
       expected: 4,
       attempted: 4,
@@ -12756,7 +12783,7 @@ else printf '%s\\n' '[]'; fi
   });
 
   it("assembles the production v22 cached-consumer rollout receipt with stale-v21 refusal semantics", async () => {
-    expect(RUNTIME_CONTRACT_VERSION).toBe(34);
+    expect(RUNTIME_CONTRACT_VERSION).toBe(35);
     expect(SCHEMA_VERSION).toBe(35);
     expect(MIGRATIONS).toHaveLength(48);
     expect(contractDigest).not.toBe("d4e51b0b1fd68957120cea5febb7762d6c3b9eddab76f67916e556830b062b83");
@@ -12775,7 +12802,7 @@ else printf '%s\\n' '[]'; fi
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(beforeRefusal);
     expect(JSON.parse(evidence.durableRefJson)).toMatchObject({
-      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 35, observedContractVersion: 34 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
+      reread: { observations: CACHED_CONSUMERS.map((name) => ({ name, observedSchemaVersion: 35, observedContractVersion: 35 })), action: "reread", expected: 4, attempted: 4, verified: 4 },
       consumedLegacyReplay: { outcome: "OK" },
       newApplyGuard: { nullProvenance: { outcome: "OPERATOR_RECEIPT_INVALID" } },
     });
@@ -13401,7 +13428,7 @@ else printf '%s\\n' '[]'; fi
     expect(() => probeV21ConsumedLegacyReplay(db, PROJECT_ID)).toThrow("requires an observed consumed legacy receipt");
     expect(probeV21NewLegacyApplyProvenanceRefusal()).toMatchObject({
       observedSchemaVersion: 35,
-      observedContractVersion: 34,
+      observedContractVersion: 35,
       newApplyRefusal: { outcome: "OPERATOR_RECEIPT_INVALID" },
     });
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
@@ -13483,7 +13510,7 @@ else printf '%s\\n' '[]'; fi
       evidence: {
         cachedConsumers: {
           oldContractVersion: 27,
-          newContractVersion: 34,
+          newContractVersion: 35,
           action: "unknown",
           expected: 4,
           attempted: 0,
@@ -13625,7 +13652,7 @@ else printf '%s\\n' '[]'; fi
       "manifest.json": sha256(canonicalJson(firstExport.manifest)),
       "records.ndjson": sha256(firstExport.recordsNdjson),
     });
-    expect(firstExport.manifest).toMatchObject({ schemaVersion: 35, schemaDigest, contractVersion: 34, contractDigest });
+    expect(firstExport.manifest).toMatchObject({ schemaVersion: 35, schemaDigest, contractVersion: 35, contractDigest });
     const artifactImportCeiling = (db.prepare("SELECT MAX(event_sequence) AS ceiling FROM state_events WHERE project_id = ?").get(PROJECT_ID) as { ceiling: number }).ceiling;
     const beforeArtifactImportGuards = exportFoundation(db, PROJECT_ID);
     const secretMetadata = resealArtifactExport(firstExport, (artifact) => {
@@ -15023,11 +15050,12 @@ else printf '%s\\n' '[]'; fi
     expect(exportFoundation(db, PROJECT_ID)).toEqual(before);
   });
 
-  it("authorizes writing by exact worker scope while reviewers remain profile-bound", async () => {
+  it("keeps writing and local review reachable across target-only revisions", async () => {
     const host = await loadedHost();
     const config = multiProfileRoleConfig();
     const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config });
     expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    activateReviewer(db, fenceToken);
     const prove = (overrides: Partial<WorkItemDispatchConfigRequest> = {}) => proveWorkItemDispatchConfig(db, {
       projectId: PROJECT_ID,
       workItemId: WORK_ITEM_ID,
@@ -15042,6 +15070,7 @@ else printf '%s\\n' '[]'; fi
     expect(prove()).toMatchObject({ assignmentKind: "write", continued: false });
     expect(prove({ requestedProfile: CLAUDE_PROFILE })).toMatchObject({ assignmentKind: "write", continued: false });
     expect(prove({ assignmentKind: "review" })).toMatchObject({ assignmentKind: "review", continued: false });
+    expect(prove({ assignmentKind: "review", candidateKind: "local" })).toMatchObject({ reviewerRoleGeneration: 2, continued: false });
     expect(prove({ assignmentKind: "review", requestedProfile: CLAUDE_PROFILE })).toMatchObject({ assignmentKind: "review", continued: false });
     expect(() => prove({ assignmentKind: "review", requestedProfile: { ...ROLE_PROFILE, model: "unconfigured-review-route" } })).toThrow(/independent-reviewer/u);
     expect(prove({ requestedProfile: { ...ROLE_PROFILE, model: "unconfigured-route" } })).toMatchObject({ assignmentKind: "write", continued: false });
@@ -15074,9 +15103,10 @@ else printf '%s\\n' '[]'; fi
       expectedGovernanceEpoch: 1,
       expectedFenceToken: fenceToken,
       config: continuationConfig,
-      targets: [target],
+      targets: [{ ...target, remoteUrl: "https://example.test/target-only.git" }],
     }).outcome).toBe("OK");
     expect(prove({ expectedConfigRevision: 2 })).toMatchObject({ continued: true, currentConfigRevision: 2 });
+    expect(prove({ expectedConfigRevision: 2, assignmentKind: "review", candidateKind: "local" })).toMatchObject({ reviewerRoleGeneration: 2, continued: true, currentConfigRevision: 2 });
 
     const changedConfig = structuredClone(continuationConfig) as typeof continuationConfig;
     const changedWorker = (changedConfig.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>).find((requirement) => requirement.roleRequirementId === "worker-v1")!;
@@ -18232,11 +18262,11 @@ printf '%s\\n' '${external}'
       actorReceiptId: "legacy-role-actor",
       qualificationId: "legacy-holder-refusal",
     }), null, roleReader()).outcome).toBe("ROLE_HOLDER_MISMATCH");
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 34, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 34, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 34, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 31))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 34, action: "refused", expected: 4, attempted: 4, verified: 0 });
-    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 34))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 34, action: "reread", expected: 4, attempted: 4, verified: 4 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(11, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 35, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(12, 19))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 35, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(22, 22))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 35, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 31))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 35, action: "refused", expected: 4, attempted: 4, verified: 0 });
+    expect(cachedConsumerRolloutEvidence(cachedConsumerObservations(35, 35))).toMatchObject({ oldSchemaVersion: 32, newSchemaVersion: 35, oldContractVersion: 27, newContractVersion: 35, action: "reread", expected: 4, attempted: 4, verified: 4 });
   });
 
 

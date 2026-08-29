@@ -11,7 +11,7 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
-export const RUNTIME_CONTRACT_VERSION = 34;
+export const RUNTIME_CONTRACT_VERSION = 35;
 export const SCHEMA_VERSION = 35;
 // v27 records correlated terminal evidence and first-class interrupted attempts.
 const PREVIOUS_RUNTIME_CONTRACT_VERSION = 27;
@@ -1831,6 +1831,7 @@ export const contractDigest = sha256(canonicalJson({
     authority: "none",
     traffic: "none",
   },
+  roleConfigContinuationPolicy: "dispatch authority continues across revisions only when exact role inputs and target source identity are unchanged",
   writingLanePolicy: {
     configPath: "extensions.bbCollab.writingLaneCeiling",
     default: DEFAULT_WRITING_LANE_CEILING,
@@ -4273,9 +4274,7 @@ function dispatchTargetIdentity(row: Record<string, unknown>): Record<string, un
     sourceId: row.source_id,
     hostId: row.host_id,
     path: row.path,
-    remoteUrl: row.remote_url,
     defaultBranch: row.default_branch,
-    targetDigest: row.target_digest,
   };
 }
 
@@ -4309,9 +4308,9 @@ function dispatchReviewerAuthority(
     `SELECT role_id, generation
        FROM role_generations
       WHERE project_id = ? AND role_id = 'independent-reviewer' AND domain_id = ?
-        AND generation = ? AND role_requirement_id = ? AND config_revision = ?
+        AND generation = ? AND role_requirement_id = ?
         AND repo_target_id = ? AND status = 'active'`,
-  ).all(projectId, domainId, head.current_generation, requirement.roleRequirementId, configRevision, repoTargetId) as Array<{ role_id: string; generation: number }>;
+  ).all(projectId, domainId, head.current_generation, requirement.roleRequirementId, repoTargetId) as Array<{ role_id: string; generation: number }>;
   if (rows.length !== 1 || rows[0]!.role_id !== "independent-reviewer") throw refusal("ROLE_NOT_ACTIVE", "local review requires one exact active independent-reviewer generation");
   return { roleRequirementId: requirement.roleRequirementId, roleId: "independent-reviewer", roleGeneration: rows[0]!.generation };
 }
@@ -6889,7 +6888,7 @@ function requireRoleActorBinding(
   db: SqliteDatabase,
   request: ApplyRequest,
   required = false,
-): { roleId: (typeof ROLE_IDS)[number]; roleGeneration: number } | null {
+): { roleId: (typeof ROLE_IDS)[number]; roleGeneration: number; domainId: string } | null {
   if (!request.actorReceiptId) return null;
   const actor = asRow<{ actor_kind: string; subject_id: string; role_id: string | null; role_generation: number | null; domain_id: string | null }>(
     db.prepare("SELECT actor_kind, subject_id, role_id, role_generation, domain_id FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(
@@ -6965,7 +6964,38 @@ function requireRoleActorBinding(
   ) {
     throw refusal("ROLE_UNQUALIFIED", "role actor no longer has current eligible qualification evidence");
   }
-  return { roleId: actor.role_id as (typeof ROLE_IDS)[number], roleGeneration: actor.role_generation };
+  return { roleId: actor.role_id as (typeof ROLE_IDS)[number], roleGeneration: actor.role_generation, domainId };
+}
+
+function requireRoleGenerationConfigContinuation(
+  db: SqliteDatabase,
+  projectId: string,
+  roleId: (typeof ROLE_IDS)[number],
+  roleGeneration: number,
+  domainId: string,
+  currentConfigRevision: number,
+): void {
+  const generation = asRow<{ config_revision: number; role_requirement_id: string; repo_target_id: string | null }>(db.prepare(
+    "SELECT config_revision, role_requirement_id, repo_target_id FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ? AND domain_id = ? AND status = 'active'",
+  ).get(projectId, roleId, roleGeneration, domainId));
+  if (!generation) throw refusal("ROLE_NOT_ACTIVE", "work dispatch requires the exact active role generation");
+  if (generation.config_revision === currentConfigRevision) return;
+  const identity = (revision: number) => {
+    const requirement = configuredDomains(db, projectId, revision)
+      .find((domain) => domain.domainId === domainId)?.roleRequirements
+      .find((candidate) => candidate.roleRequirementId === generation.role_requirement_id);
+    if (!requirement || requirement.roleId !== roleId || requirement.repoTargetId !== generation.repo_target_id) {
+      throw refusal("PROJECT_CONFIG_STALE", "seated role authority changed across config revisions");
+    }
+    const target = generation.repo_target_id === null ? null : asRow<{ source_id: string; host_id: string; path: string }>(db.prepare(
+      "SELECT source_id, host_id, path FROM repository_targets WHERE project_id = ? AND repo_target_id = ? AND config_revision = ?",
+    ).get(projectId, generation.repo_target_id, revision));
+    if (generation.repo_target_id !== null && !target) throw refusal("PROJECT_CONFIG_STALE", "seated role target is missing from a config revision");
+    return { requirement, target };
+  };
+  if (canonicalJson(identity(generation.config_revision)) !== canonicalJson(identity(currentConfigRevision))) {
+    throw refusal("PROJECT_CONFIG_STALE", "seated role authority changed across config revisions");
+  }
 }
 
 function profileEquals(left: ExecutionProfile, right: ExecutionProfile): boolean {
@@ -9509,6 +9539,9 @@ function applyWorkItemTransition(
   const roleActor = requireRoleActorBinding(db, request, false);
   requireNativeSeatActorAgreement(roleActor, nativeSeat);
   const attemptRole = nativeSeat ?? roleActor;
+  if (request.workAttempt && attemptRole && !committedDispatchIntent) {
+    requireRoleGenerationConfigContinuation(db, request.projectId, attemptRole.roleId, attemptRole.roleGeneration, attemptRole.domainId, configRevision);
+  }
   const writeAttemptRole = attemptRole;
   const reviewAttemptRole = attemptRole;
   if (request.workAttempt && attemptRole && request.roleId !== undefined && request.roleId !== attemptRole.roleId) {
