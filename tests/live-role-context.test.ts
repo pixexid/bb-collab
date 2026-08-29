@@ -79,21 +79,27 @@ it.runIf(process.env.BB_LIVE_ROLE_CONTEXT === "1")(
         index > requestIndex && event.type === "turn/input/accepted" && event.data.clientRequestId === requestId,
       );
       const accepted = events[acceptedIndex];
-      const turnId = accepted?.scope?.turnId;
-      if (!accepted || !turnId) return [];
+      const providerThreadId = accepted?.data.providerThreadId;
+      if (!accepted || typeof providerThreadId !== "string") return [];
       const completionIndex = events.findIndex((event, index) =>
-        index > acceptedIndex && event.type === "turn/completed" && event.scope?.turnId === turnId,
+        index > acceptedIndex && event.type === "turn/completed" && typeof event.scope?.turnId === "string" &&
+        event.data.providerThreadId === providerThreadId &&
+        events.slice(acceptedIndex + 1, index).filter((candidate) =>
+          candidate.type === "turn/started" && candidate.scope?.turnId === event.scope?.turnId &&
+          candidate.data.providerThreadId === providerThreadId
+        ).length === 1,
       );
       if (completionIndex < 0) return [];
       const completion = events[completionIndex]!;
       const returned = events.slice(requestIndex + 1, completionIndex + 1);
-      const providerThreadId = accepted.data.providerThreadId;
+      const turnId = completion.scope?.turnId;
       if (
-        completion.data.status !== "completed" || typeof providerThreadId !== "string" ||
+        completion.data.status !== "completed" || !turnId ||
         returned.filter((event) => event.type === "turn/input/accepted" && event.data.clientRequestId === requestId).length !== 1 ||
-        returned.filter((event) => event.type === "turn/started" && event.data.providerThreadId === providerThreadId).length !== 1 ||
-        returned.filter((event) => event.type === "turn/completed" && event.data.providerThreadId === providerThreadId).length !== 1 ||
-        returned.some((event) => event.type === "provider/modelFallback" && event.data.providerThreadId === providerThreadId)
+        returned.filter((event) => event.type === "turn/started" && event.scope?.turnId === turnId).length !== 1 ||
+        returned.filter((event) => event.type === "turn/completed" && event.scope?.turnId === turnId).length !== 1 ||
+        returned.some((event) => event.type === "provider/modelFallback" && event.data.providerThreadId === providerThreadId &&
+          (event.scope?.turnId === turnId || event.scope?.kind === "thread"))
       ) return [];
       return [{ request, completion, interiorCount: returned.length - 1, profile }];
     });
