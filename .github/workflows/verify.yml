@@ -45,7 +45,7 @@ jobs:
           cmp "$RUNNER_TEMP/release-manifest.json" release/release-manifest.json
           node scripts/check-dist.mjs --release release
       - name: Check BB plugin types
-        run: npm exec --yes --package=bb-app@0.39.0 -- bb plugin types --check
+        run: npm exec --yes --package=bb-app@0.40.0 -- bb plugin types --check
       - name: Upload exact-head release artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

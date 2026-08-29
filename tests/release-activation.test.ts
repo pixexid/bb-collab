@@ -10,7 +10,7 @@ import { canonicalJson, manifestFor, verifyRuntimeClosure } from "../scripts/rel
 const PROJECT_ID = "proj_activationfixture";
 const PRIOR_SCHEMA = "1".repeat(64);
 const CANDIDATE_SCHEMA = "2".repeat(64);
-const TOOLCHAIN = { bbVersion: "0.39.0", pluginSdkVersion: "0.4.8" };
+const TOOLCHAIN = { bbVersion: "0.40.0", pluginSdkVersion: "0.4.21" };
 const appMeta = (sdkVersion = TOOLCHAIN.pluginSdkVersion, bbVersion = TOOLCHAIN.bbVersion) => JSON.stringify({ sdkMajor: 0, sdkVersion, artifactFormatVersion: 1, pluginId: "bb-collab", pluginVersion: "0.1.0", builtWith: { bbVersion, pluginSdkVersion: sdkVersion } });
 
 function makeBuildFree(root: string) {
@@ -54,7 +54,7 @@ function fixture(schemaImportMarker?: string, failSchemaImport = false, frontend
   }
   const sdkRoot = join(releaseDirectory, "node_modules/@bb/plugin-sdk");
   mkdirSync(join(sdkRoot, "dist"), { recursive: true });
-  writeFileSync(join(sdkRoot, "package.json"), JSON.stringify({ name: "@bb/plugin-sdk", version: "0.4.1", type: "module", exports: { ".": "./dist/index.js" } }));
+  writeFileSync(join(sdkRoot, "package.json"), JSON.stringify({ name: "@bb/plugin-sdk", version: TOOLCHAIN.pluginSdkVersion, type: "module", exports: { ".": "./dist/index.js" } }));
   writeFileSync(join(sdkRoot, "dist/index.js"), "export const defineRpcContract = {};\n");
   execFileSync("git", ["init", "--quiet"], { cwd: sourceRoot });
   execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: sourceRoot });
@@ -533,7 +533,7 @@ describe("inactive release activation", () => {
 
   it("refuses candidate SDK mismatch before pending or mutation", async () => {
     const created = fixture();
-    rewriteCandidateMeta(created, "0.4.21");
+    rewriteCandidateMeta(created, "0.4.8");
     const { adapter, state } = fakeAdapter(created.priorRoot);
     try {
       await expect(runFixture(created, adapter)).rejects.toThrow("candidate SDK does not match");
@@ -542,9 +542,9 @@ describe("inactive release activation", () => {
     } finally { cleanup(created.root); }
   });
 
-  it("refuses prior SDK mismatch before pending or mutation", async () => {
+  it("refuses a candidate-only pin update while the prior frontend remains old", async () => {
     const created = fixture();
-    writeFileSync(join(created.priorRoot, "dist/app.meta.json"), `${appMeta("0.4.21")}\n`);
+    writeFileSync(join(created.priorRoot, "dist/app.meta.json"), `${appMeta("0.4.8")}\n`);
     makeBuildFree(created.priorRoot);
     const { adapter, state } = fakeAdapter(created.priorRoot);
     try {
@@ -553,9 +553,44 @@ describe("inactive release activation", () => {
     } finally { cleanup(created.root); }
   });
 
+  it("refuses an omitted installed target before pending or mutation", async () => {
+    const created = fixture();
+    const { adapter, state } = fakeAdapter(created.priorRoot);
+    const missing = { ...adapter, list: () => [] };
+    try {
+      await expect(runFixture(created, missing)).rejects.toThrow("release target is not installed: bb-collab");
+      expect(state.commands).toEqual([]);
+      expect(existsSync(join(created.stateDirectory, "deployment.pending.json"))).toBe(false);
+    } finally { cleanup(created.root); }
+  });
+
+  it("refuses metadata rewritten without matching resident bytes", async () => {
+    const created = fixture();
+    writeFileSync(join(created.priorRoot, "dist/app.meta.json"), `${appMeta("0.4.8", "0.39.0")}\n`);
+    makeBuildFree(created.priorRoot);
+    const { adapter, state } = fakeAdapter(created.priorRoot);
+    const priorList = adapter.list();
+    writeFileSync(join(created.priorRoot, "dist/app.meta.json"), `${appMeta()}\n`);
+    makeBuildFree(created.priorRoot);
+    try {
+      await expect(runFixture(created, { ...adapter, list: () => priorList })).rejects.toThrow("prior frontend resident does not match prior bytes");
+      expect(state.commands).toEqual([]);
+    } finally { cleanup(created.root); }
+  });
+
+  it("refuses a stale prior service set before mutation", async () => {
+    const created = fixture();
+    const { adapter, state } = fakeAdapter(created.priorRoot);
+    state.services.push({ name: "stale-service", state: "running" });
+    try {
+      await expect(runFixture(created, adapter)).rejects.toThrow("prior services do not match prior resident");
+      expect(state.commands).toEqual([]);
+    } finally { cleanup(created.root); }
+  });
+
   it("refuses candidate BB metadata mismatch before pending or mutation", async () => {
     const created = fixture();
-    rewriteCandidateMeta(created, TOOLCHAIN.pluginSdkVersion, "0.40.0");
+    rewriteCandidateMeta(created, TOOLCHAIN.pluginSdkVersion, "0.39.0");
     const { adapter, state } = fakeAdapter(created.priorRoot);
     try {
       await expect(runFixture(created, adapter)).rejects.toThrow("candidate BB version does not match");
@@ -578,9 +613,9 @@ describe("inactive release activation", () => {
 
   it("refuses an exact BB version mismatch before staging authority", async () => {
     const created = fixture();
-    const { adapter, state } = fakeAdapter(created.priorRoot, { hostVersion: "0.40.0" });
+    const { adapter, state } = fakeAdapter(created.priorRoot, { hostVersion: "0.39.0" });
     try {
-      await expect(runFixture(created, adapter)).rejects.toThrow("activation BB version 0.40.0 does not match pinned 0.39.0");
+      await expect(runFixture(created, adapter)).rejects.toThrow("activation BB version 0.39.0 does not match pinned 0.40.0");
       expect(state.commands).toEqual([]);
     } finally { cleanup(created.root); }
   });

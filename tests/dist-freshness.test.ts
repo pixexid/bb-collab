@@ -19,7 +19,7 @@ function fixture(nested = false) {
   const writeSdk = (name: string) => {
     const sdkRoot = join(root, "node_modules", ...name.split("/"));
     mkdirSync(join(sdkRoot, "dist"), { recursive: true });
-    writeFileSync(join(sdkRoot, "package.json"), JSON.stringify({ name, version: "0.4.8", type: "module", exports: { ".": "./dist/index.js" } }));
+    writeFileSync(join(sdkRoot, "package.json"), JSON.stringify({ name, version: "0.4.21", type: "module", exports: { ".": "./dist/index.js" } }));
     writeFileSync(join(sdkRoot, "dist/index.js"), "export const defineRpcContract = {};\n");
   };
   writeSdk("@bb/plugin-sdk");
@@ -52,7 +52,7 @@ describe("release artifact gate", () => {
     const bin = mkdtempSync(join(tmpdir(), "bb-collab-ambient-bb-"));
     try {
       const bb = join(bin, "bb");
-      writeFileSync(bb, "#!/bin/sh\necho 0.40.0\n");
+      writeFileSync(bb, "#!/bin/sh\necho 0.39.0\n");
       chmodSync(bb, 0o755);
       const result = spawnSync(process.execPath, [script, "build"], {
         cwd: process.cwd(),
@@ -60,7 +60,7 @@ describe("release artifact gate", () => {
         env: { ...process.env, BB_COLLAB_RELEASE_PINNED: "1", PATH: `${bin}:${process.env.PATH ?? ""}` },
       });
       expect(result.status).toBe(1);
-      expect(result.stderr).toContain("release build requires Node v22.23.1 and bb 0.39.0");
+      expect(result.stderr).toContain("release build requires Node v22.23.1 and bb 0.40.0");
     } finally {
       rmSync(bin, { recursive: true, force: true });
     }
@@ -76,6 +76,33 @@ describe("release artifact gate", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("refuses a dirty exact-source checkout", () => {
+    const { root, manifestPath } = fixture();
+    try {
+      const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+      packageJson.description = "dirty tracked source";
+      writeFileSync(join(root, "package.json"), JSON.stringify(packageJson));
+      expect(() => verifyRelease(root, manifestPath, root)).toThrow("release source checkout has tracked changes");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  for (const name of ["@bb/plugin-sdk", "@get-bb/plugin-sdk"] as const) {
+    it(`refuses old SDK bytes behind ${name}`, () => {
+      const { root } = fixture(true);
+      try {
+        const path = join(root, "node_modules", ...name.split("/"), "package.json");
+        const dependency = JSON.parse(readFileSync(path, "utf8"));
+        dependency.version = "0.4.8";
+        writeFileSync(path, JSON.stringify(dependency));
+        expect(() => manifestFor(root, undefined, root)).toThrow(`release runtime closure ${name} does not match the pinned plugin SDK`);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
 
   it("binds schema v2 to an inactive sorted closed-world artifact inventory", () => {
     const { root, manifestPath } = fixture(true);
