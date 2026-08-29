@@ -14,6 +14,12 @@ Every rule below is enforceable law; the origin stories live in git history and 
 
 A filtered run that matched nothing exits zero and prints a passing summary: take the exact test name from the diff and read the executed count, not the exit code. A negative result needs proof the mechanism was live during the window — "nothing was delivered" and "nothing ran" are indistinguishable without receipts. Never verify from absence without a positive control: a quiet plugin and a broken logger look identical; close deploys and watcher changes with one self-emitted line. Provenance, delivery, and truth are three separate claims. Quote what is there, not what it means — a paraphrase inside quotation marks is a fabricated citation even when the semantics are right.
 
+## Canonical operations prove shipped reachability
+
+> A Tier-A change that adds or modifies a canonical operation carries at least one discriminating control that reaches it through a shipped CLI, plugin tool, or documented caller, not only through direct function injection. The control must fail when no shipped caller exists. A behavior-only change to an already-reachable operation does not require this control.
+
+Defects B and C in [#664](https://github.com/pixexid/bb-collab/issues/664) and defect G in [#670](https://github.com/pixexid/bb-collab/issues/670) are the motivating cases. Use the documented [canonical WorkItem registration and projection-recovery callers](workitem-registration.md); do not restate them here. The separate no-action doctrine from [#674](https://github.com/pixexid/bb-collab/issues/674) is the [classification-expiry rule](#a-classification-expires-when-its-precondition-fires).
+
 ## Canonical source, no restated copies
 
 > Docs point at the one canonical definition; a restated command or value is a cache that goes stale silently. State the rule and the check, never a current runtime value.
