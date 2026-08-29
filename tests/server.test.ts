@@ -2221,10 +2221,11 @@ describe("checkout divergence detection", () => {
       const expected = { checkoutHead: null, originMainRef: null, behindCount: null, verdict: "unavailable" };
       const rpc = await host.harness.callRpc("doctor", { projectId: PROJECT_ID }) as FoundationResult;
       expect(rpc.outcome).toBe("PLUGIN_SOURCE_UNAVAILABLE");
-      expect(rpc.message).toContain("plugin source checkout is unavailable");
-      expect(rpc.evidence).toMatchObject({ checkoutDivergence: expected });
+      expect(rpc.message).toContain("bb-collab plugin-source checkout is unavailable");
+      expect(rpc.evidence).toMatchObject({ bbCollabPluginSourceCheckout: { sourceIdentity: { kind: "plugin-source", pluginId: PLUGIN_ID }, ...expected } });
+      expect(rpc.evidence).not.toHaveProperty("checkoutDivergence");
       const cli = await host.harness.runCli(["doctor", "--project", PROJECT_ID]);
-      expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "PLUGIN_SOURCE_UNAVAILABLE", message: expect.stringContaining("plugin source checkout is unavailable"), evidence: { checkoutDivergence: expected } });
+      expect(JSON.parse(cli.stdout)).toMatchObject({ outcome: "PLUGIN_SOURCE_UNAVAILABLE", message: expect.stringContaining("bb-collab plugin-source checkout is unavailable"), evidence: { bbCollabPluginSourceCheckout: { sourceIdentity: { kind: "plugin-source", pluginId: PLUGIN_ID }, ...expected } } });
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -2444,10 +2445,43 @@ exit 0
       seedAndBootstrap(host);
       const result = await doctor(host.bb.storage.database(), host.bb.sdk, PROJECT_ID, divergence);
       expect(result.outcome).toBe("OK");
-      expect(result.evidence).toMatchObject({ checkoutDivergence: { checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 1, verdict: "diverged" } });
+      expect(result.evidence).toMatchObject({ bbCollabPluginSourceCheckout: { sourceIdentity: { kind: "plugin-source", pluginId: PLUGIN_ID }, checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 1, verdict: "diverged" } });
+      expect(result.evidence).not.toHaveProperty("checkoutDivergence");
       const cli = await host.harness.runCli(["doctor", "--project", PROJECT_ID]);
       const currentCheckout = readCheckoutDivergence(findCheckoutRoot(process.cwd()));
-      expect(JSON.parse(cli.stdout).evidence).toMatchObject({ checkoutDivergence: currentCheckout });
+      expect(JSON.parse(cli.stdout).evidence).toMatchObject({ bbCollabPluginSourceCheckout: { sourceIdentity: { kind: "plugin-source", pluginId: PLUGIN_ID }, ...currentCheckout } });
+    } finally {
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps deliberately different tenant and bb-collab plugin-source identities separate", async () => {
+    const fixture = checkoutFixture(true);
+    try {
+      const host = hostFor();
+      await plugin(host.bb, { checkoutRoot: fixture.directory });
+      seedAndBootstrap(host);
+      const tenantRemote = "https://github.com/example/tenant.git";
+      host.bb.storage.database().prepare(
+        "UPDATE repository_targets SET remote_url = ? WHERE project_id = ? AND repo_target_id = ?",
+      ).run(tenantRemote, PROJECT_ID, TARGET_ID);
+      host.harness.sdk.stub("projects.get", (async () => ({ ...projectFacts(), gitRemoteUrl: tenantRemote })) as never);
+
+      const result = await host.harness.callRpc("doctor", { projectId: PROJECT_ID }) as FoundationResult;
+
+      expect(result.outcome).toBe("OK");
+      expect(result.evidence).toMatchObject({
+        targets: [{ repoTargetId: TARGET_ID, remoteUrl: tenantRemote }],
+        bbCollabPluginSourceCheckout: {
+          sourceIdentity: { kind: "plugin-source", pluginId: PLUGIN_ID },
+          checkoutHead: fixture.base,
+          originMainRef: fixture.origin,
+          behindCount: 1,
+          verdict: "diverged",
+        },
+      });
+      expect(result.evidence).not.toHaveProperty("checkoutDivergence");
+      expect((result.evidence as { targets: Array<Record<string, unknown>> }).targets[0]).not.toHaveProperty("checkoutHead");
     } finally {
       rmSync(fixture.directory, { recursive: true, force: true });
     }
@@ -2461,7 +2495,7 @@ exit 0
       const host = await loadedHost();
       seedAndBootstrap(host);
       const result = await doctor(host.bb.storage.database(), host.bb.sdk, PROJECT_ID, divergence);
-      expect(result.evidence).toMatchObject({ checkoutDivergence: { checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 0, verdict: "clean" } });
+      expect(result.evidence).toMatchObject({ bbCollabPluginSourceCheckout: { sourceIdentity: { kind: "plugin-source", pluginId: PLUGIN_ID }, checkoutHead: fixture.base, originMainRef: fixture.origin, behindCount: 0, verdict: "clean" } });
     } finally {
       rmSync(fixture.directory, { recursive: true, force: true });
     }
@@ -5921,8 +5955,37 @@ printf '[[{"number":%s,"labels":[{"name":"queue:startable"}]}]]\n' "$issue"
     expect(fixture.host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
     expect(fixture.host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
       level: "warn",
-      message: "role queue coverage=degraded project=proj_test reason=configured-repositories-unreadable",
+      message: "role queue coverage=degraded project=proj_test reason=configured-repositories-remoteless",
     }));
+  });
+
+  it("keeps remote-null queue capacity unknown while doctor proves the target source readable", async () => {
+    const fixture = await fleetWatchdogFixture(1, false, 1);
+    expect(applyWithFixtureReceipt(fixture.db, transitionRequest(fixture.fenceToken, "in_progress", 2))).toMatchObject({ outcome: "OK" });
+    fixture.addNativeLane("thread-work-item-1");
+
+    await fixture.host.harness.emitThreadEvent("thread.active", {
+      thread: makeThreadResponse({ id: "thread-work-item-1", projectId: PROJECT_ID, parentThreadId: fixture.orchestratorThreadId, status: "active", updatedAt: 1 }),
+    });
+    await vi.waitFor(() => expect(fixture.db.prepare("SELECT * FROM lane_capacity_intervals").all()).toHaveLength(1));
+
+    expect(fixture.db.prepare(
+      "SELECT coverage_state, active_lane_count, writing_lane_ceiling, startable_work, reason FROM lane_capacity_intervals",
+    ).get()).toEqual({
+      coverage_state: "blind",
+      active_lane_count: 1,
+      writing_lane_ceiling: 1,
+      startable_work: null,
+      reason: "configured-repositories-remoteless",
+    });
+    const doctorResult = await fixture.host.harness.callRpc("doctor", { projectId: PROJECT_ID }) as FoundationResult;
+    expect(doctorResult.outcome).toBe("OK");
+    expect(doctorResult.evidence).toMatchObject({
+      targets: [{ repoTargetId: TARGET_ID, source: { id: "source-main", projectId: PROJECT_ID }, remoteUrl: null }],
+      bbCollabPluginSourceCheckout: { sourceIdentity: { kind: "plugin-source", pluginId: PLUGIN_ID } },
+    });
+    expect((doctorResult.evidence as { targets: Array<Record<string, unknown>> }).targets[0]).not.toHaveProperty("checkoutHead");
+    expect(doctorResult.evidence).not.toHaveProperty("checkoutDivergence");
   });
 
   it("records a wrongful-idle timeout and retries its unchanged artifact later", async () => {
