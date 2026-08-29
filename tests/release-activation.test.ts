@@ -1,8 +1,8 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { activateRelease, assertNonOverlappingRoots, systemAdapter } from "../scripts/activate-release.mjs";
 import { canonicalJson, manifestFor, verifyRuntimeClosure } from "../scripts/release-artifact.mjs";
@@ -82,12 +82,13 @@ function fakeAdapter(priorRoot: string, options: {
   sourceKind?: "path" | "git" | "npm";
   dataDir?: string;
 } = {}) {
+  const priorResolvedRoot = realpathSync(priorRoot);
   const kind = options.sourceKind ?? "path";
   const priorSource = { requested: `${kind}:${kind === "path" ? priorRoot : "fixture"}`, resolved: `${kind}:${kind === "path" ? priorRoot : "fixture"}`, engines: {}, installedAt: 1, history: [] };
   const priorServer = createHash("sha256").update(readFileSync(join(priorRoot, "dist/server.js"))).digest("hex");
   const state: AdapterState = { root: priorRoot, source: priorSource, status: "running", services: [], bound: false, rollbackCalls: 0, binding: null, plan: null, generation: "prior", commands: [] };
   const appHash = () => {
-    const root = state.generation === "prior" ? (existsSync(priorRoot) ? priorRoot : state.plan.retainedRoot) : state.binding.resolvedRoot;
+    const root = state.generation === "prior" ? (existsSync(priorRoot) ? priorRoot : state.plan?.priorSlotKind === "directory" ? state.plan.retainedRoot : priorResolvedRoot) : state.binding.resolvedRoot;
     if (!existsSync(join(root, "dist/app.js"))) return null;
     const hash = createHash("sha256").update(readFileSync(join(root, "dist/app.js")));
     if (existsSync(join(root, "dist/app.css"))) hash.update(readFileSync(join(root, "dist/app.css")));
@@ -194,6 +195,37 @@ function rewriteCandidateMeta(created: ReturnType<typeof fixture>, sdkVersion: s
   execFileSync("git", ["commit", "--quiet", "-m", "candidate metadata"], { cwd: created.sourceRoot });
   const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: created.sourceRoot, encoding: "utf8" }).trim();
   writeFileSync(join(created.releaseDirectory, "release-manifest.json"), `${canonicalJson(manifestFor(created.releaseDirectory, commit, created.sourceRoot))}\n`);
+}
+
+function rewriteCandidateServer(created: ReturnType<typeof fixture>) {
+  const server = `import { defineRpcContract } from "@bb/plugin-sdk";\nexport const schemaDigest = '${CANDIDATE_SCHEMA}';\nexport const correction = true;\nexport default () => defineRpcContract;\n`;
+  writeFileSync(join(created.sourceRoot, "dist/server.js"), server);
+  writeFileSync(join(created.releaseDirectory, "dist/server.js"), server);
+  execFileSync("git", ["add", "."], { cwd: created.sourceRoot });
+  execFileSync("git", ["commit", "--quiet", "-m", "second candidate"], { cwd: created.sourceRoot });
+  const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: created.sourceRoot, encoding: "utf8" }).trim();
+  writeFileSync(join(created.releaseDirectory, "release-manifest.json"), `${canonicalJson(manifestFor(created.releaseDirectory, commit, created.sourceRoot))}\n`);
+}
+
+function addPathBranding(created: ReturnType<typeof fixture>) {
+  const path = "assets/logo.svg";
+  const svg = readFileSync(join(process.cwd(), path), "utf8");
+  for (const root of [created.sourceRoot, created.priorRoot]) {
+    mkdirSync(join(root, "assets"), { recursive: true });
+    writeFileSync(join(root, path), svg);
+    const manifestPath = join(root, "package.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    manifest.bb.branding = { logo: { light: `./${path}` } };
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+  }
+  const sourceEpoch = Date.UTC(2000, 0, 1) / 1000;
+  for (const path of [join(created.priorRoot, "assets"), join(created.priorRoot, "assets/logo.svg")]) utimesSync(path, sourceEpoch, sourceEpoch);
+  makeBuildFree(created.priorRoot);
+  execFileSync("git", ["add", "."], { cwd: created.sourceRoot });
+  execFileSync("git", ["commit", "--quiet", "-m", "path branding"], { cwd: created.sourceRoot });
+  const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: created.sourceRoot, encoding: "utf8" }).trim();
+  writeFileSync(join(created.releaseDirectory, "release-manifest.json"), `${canonicalJson(manifestFor(created.releaseDirectory, commit, created.sourceRoot))}\n`);
+  return { path, svg };
 }
 
 describe("inactive release activation", () => {
@@ -448,6 +480,27 @@ describe("inactive release activation", () => {
     } finally { cleanup(created.root); }
   });
 
+  it("restores a second-generation owned symlink gap to its exact receipted target", async () => {
+    const created = fixture();
+    try {
+      await runFixture(created, fakeAdapter(created.priorRoot).adapter);
+      const priorTarget = readlinkSync(created.priorRoot);
+      const receipt = readFileSync(join(created.stateDirectory, "deployment.json"));
+      rewriteCandidateServer(created);
+      const { adapter, state } = fakeAdapter(created.priorRoot, { afterRename: (_current, plan) => {
+        expect(plan.priorSlotKind).toBe("owned-symlink");
+        expect(readlinkSync(plan.registeredRoot)).toBe(priorTarget);
+        unlinkSync(plan.registeredRoot);
+        throw new Error("owned symlink candidate creation failed");
+      } });
+      await expect(runFixture(created, adapter)).rejects.toThrow("owned symlink candidate creation failed");
+      expect(readlinkSync(created.priorRoot)).toBe(priorTarget);
+      expect(state.commands).toEqual([]);
+      expect(readFileSync(join(created.stateDirectory, "deployment.json"))).toEqual(receipt);
+      expect(existsSync(join(created.stateDirectory, "deployment.pending.json"))).toBe(false);
+    } finally { cleanup(created.root); }
+  });
+
   it("reload failure before resident swap restores filesystem without a second reload", async () => {
     const created = fixture();
     const { adapter, state } = fakeAdapter(created.priorRoot, { reloadFailure: "before-resident" });
@@ -537,6 +590,35 @@ describe("inactive release activation", () => {
     const { adapter } = fakeAdapter(created.priorRoot, { afterSymlink: (_state, plan) => { writeFileSync(join(plan.retainedRoot, "dist/app.js"), "ambient rebuild\n"); throw new Error("after rebuild"); } });
     try {
       await expect(runFixture(created, adapter)).rejects.toThrow("prior authoritative bytes changed");
+      expect(JSON.parse(readFileSync(join(created.stateDirectory, "deployment.pending.json"), "utf8"))).toMatchObject({ state: "rollback_failed" });
+    } finally { cleanup(created.root); }
+  });
+
+  it("binds a real path-shaped SVG to candidate byte verification", async () => {
+    const created = fixture();
+    const branding = addPathBranding(created);
+    const { adapter, state } = fakeAdapter(created.priorRoot, { settle: (current) => {
+      const path = join(current.binding.resolvedRoot, branding.path);
+      chmodSync(dirname(path), 0o755);
+      chmodSync(path, 0o644);
+      writeFileSync(path, `${branding.svg}\n<!-- drift -->\n`);
+    } });
+    try {
+      await expect(runFixture(created, adapter)).rejects.toThrow(`deployed artifact digest mismatch: bb-collab/${branding.path}`);
+      expect(state.binding.expectedFiles).toContainEqual({ path: branding.path, sha256: createHash("sha256").update(branding.svg).digest("hex") });
+      expect(state.commands).toEqual(["reload", "reload"]);
+    } finally { cleanup(created.root); }
+  });
+
+  it("binds a real path-shaped SVG to exact-prior rollback bytes", async () => {
+    const created = fixture();
+    const branding = addPathBranding(created);
+    const { adapter } = fakeAdapter(created.priorRoot, { afterSymlink: (_current, plan) => {
+      writeFileSync(join(plan.retainedRoot, branding.path), `${branding.svg}\n<!-- drift -->\n`);
+      throw new Error("prior branding drift");
+    } });
+    try {
+      await expect(runFixture(created, adapter)).rejects.toThrow("prior authoritative bytes changed during activation");
       expect(JSON.parse(readFileSync(join(created.stateDirectory, "deployment.pending.json"), "utf8"))).toMatchObject({ state: "rollback_failed" });
     } finally { cleanup(created.root); }
   });

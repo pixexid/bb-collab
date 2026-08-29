@@ -61,6 +61,25 @@ function expectedFiles(manifest, packageRoot) {
     .map(({ path, sha256: digest }) => ({ path: path.slice(prefix.length), sha256: digest }));
 }
 
+function brandingPaths(value) {
+  if (typeof value === "string") return value.startsWith("./") ? [value.slice(2)] : [];
+  if (!value || typeof value !== "object") return [];
+  return Object.values(value).flatMap(brandingPaths);
+}
+
+function committedBrandingFiles(sourceRoot, packageRoot, branding, sourceCommit) {
+  const root = resolve(sourceRoot, packageRoot);
+  return [...new Set(brandingPaths(branding))].sort().map((path) => {
+    const absolute = resolve(root, path);
+    if (!absolute.startsWith(`${root}${sep}`)) throw new Error("branding asset escapes its package root");
+    const repositoryPath = slash(relative(sourceRoot, absolute));
+    const tree = execFileSync("git", ["ls-tree", sourceCommit, "--", repositoryPath], { cwd: sourceRoot, encoding: "utf8" });
+    if (!/^100(?:644|755) blob [0-9a-f]{40}\t/um.test(tree)) throw new Error(`branding asset is not a committed regular file: ${repositoryPath}`);
+    const bytes = execFileSync("git", ["show", `${sourceCommit}:${repositoryPath}`], { cwd: sourceRoot });
+    return { path: slash(relative(root, absolute)), sha256: sha256(bytes), bytes };
+  });
+}
+
 function wrapperManifest(manifest, files) {
   const bb = { ...manifest.bb, skills: [] };
   if (files.some(({ path }) => path === "dist/server.js")) bb.server = "./dist/server.js";
@@ -79,15 +98,11 @@ function wrapperManifest(manifest, files) {
   };
 }
 
-function copyBrandingAssets(sourceRoot, packageRoot, wrapperRoot, branding) {
-  for (const value of Object.values(branding ?? {}).flatMap((value) => typeof value === "object" && value !== null ? Object.values(value) : [value])) {
-    if (typeof value !== "string" || !value.startsWith("./")) continue;
-    const source = resolve(sourceRoot, packageRoot, value);
-    const relativeAsset = value.slice(2);
-    const target = resolve(wrapperRoot, relativeAsset);
-    if (!source.startsWith(`${resolve(sourceRoot, packageRoot)}${sep}`) || !target.startsWith(`${resolve(wrapperRoot)}${sep}`)) throw new Error("branding asset escapes its package root");
+function copyBrandingAssets(sourceRoot, packageRoot, wrapperRoot, branding, sourceCommit) {
+  for (const { path, bytes } of committedBrandingFiles(sourceRoot, packageRoot, branding, sourceCommit)) {
+    const target = resolve(wrapperRoot, path);
     mkdirSync(dirname(target), { recursive: true });
-    cpSync(source, target);
+    writeFileSync(target, bytes);
   }
 }
 
@@ -183,7 +198,7 @@ async function stageRelease({ releaseDirectory, sourceRoot, stateDirectory, mani
       mkdirSync(wrapper, { recursive: true });
       cpSync(join(releaseDirectory, distRoot), join(wrapper, "dist"), { recursive: true });
       const stagedManifest = wrapperManifest(source, files);
-      copyBrandingAssets(sourceRoot, packageRoot, wrapper, stagedManifest.bb.branding);
+      copyBrandingAssets(sourceRoot, packageRoot, wrapper, stagedManifest.bb.branding, manifest.sourceCommit);
       writeFileSync(join(wrapper, "package.json"), `${canonicalJson(stagedManifest)}\n`);
     }
     cpSync(join(releaseDirectory, "node_modules"), join(temporary, "node_modules"), { recursive: true });
@@ -238,10 +253,15 @@ function appHash(root) {
 }
 
 function authoritativeFiles(root) {
-  const paths = [join(root, "package.json")];
+  const manifestPath = join(root, "package.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  const paths = [manifestPath, ...brandingPaths(manifest.bb?.branding).map((path) => resolve(root, path))];
   const dist = join(root, "dist");
   if (existsSync(dist)) paths.push(...treeEntries(dist).filter((path) => lstatSync(path).isFile()));
-  return paths.map((path) => ({ path: slash(relative(root, path)), sha256: sha256(readFileSync(path)) })).sort((a, b) => a.path.localeCompare(b.path));
+  return [...new Set(paths)].map((path) => {
+    if (!path.startsWith(`${resolve(root)}${sep}`) || !existsSync(path) || lstatSync(path).isSymbolicLink() || !lstatSync(path).isFile()) throw new Error("prior branding authority is missing or unsafe");
+    return { path: slash(relative(root, path)), sha256: sha256(readFileSync(path)) };
+  }).sort((a, b) => a.path.localeCompare(b.path));
 }
 
 function hashObservedFiles(root, files) {
@@ -284,22 +304,24 @@ function createPlan(binding, transactionId, stateDirectory, dataDir, priorReceip
   if (binding.sourceKind !== "path" && !pathWithin(resolve(dataDir), registeredRoot)) throw new Error(`${binding.pluginId} managed root is outside the BB data directory`);
   if (pathWithin(registeredRoot, binding.resolvedRoot) || pathWithin(binding.resolvedRoot, registeredRoot)) throw new Error(`${binding.pluginId} candidate and registered roots overlap`);
   const retainedRoot = join(stateDirectory, "rollback", transactionId, binding.pluginId, "prior-root");
+  const replacementRoot = `${registeredRoot}.bb-activation-${transactionId}`;
   if (existsSync(retainedRoot)) throw new Error(`${binding.pluginId} rollback root already exists`);
+  if (existsSync(replacementRoot)) throw new Error(`${binding.pluginId} replacement root already exists`);
   const slot = lstatSync(registeredRoot);
   if (slot.isDirectory() && !slot.isSymbolicLink()) return {
     adapter: "root-overlay-v2", pluginId: binding.pluginId, registeredRoot, candidateRoot: binding.resolvedRoot,
-    retainedRoot, priorSlotKind: "directory", priorSymlinkTarget: null,
+    retainedRoot, replacementRoot, priorSlotKind: "directory", priorSymlinkTarget: null,
   };
   if (!slot.isSymbolicLink()) throw new Error(`${binding.pluginId} registered root is not safely bindable`);
   const priorBinding = priorReceipt.value?.state === "active" ? priorReceipt.value.bindings?.find(({ pluginId: id }) => id === binding.pluginId) : null;
   const priorTarget = readlinkSync(registeredRoot);
   if (priorBinding?.plan?.adapter !== "root-overlay-v2" || resolve(priorBinding.plan.registeredRoot) !== registeredRoot
-    || realpathSync(registeredRoot) !== binding.priorRoot || resolve(priorBinding.resolvedRoot) !== binding.priorRoot) {
+    || realpathSync(registeredRoot) !== binding.priorRoot || realpathSync(priorBinding.resolvedRoot) !== binding.priorRoot) {
     throw new Error(`${binding.pluginId} registered root is an arbitrary or unreceipted symlink`);
   }
   return {
     adapter: "root-overlay-v2", pluginId: binding.pluginId, registeredRoot, candidateRoot: binding.resolvedRoot,
-    retainedRoot, priorSlotKind: "owned-symlink", priorSymlinkTarget: priorTarget,
+    retainedRoot, replacementRoot, priorSlotKind: "owned-symlink", priorSymlinkTarget: priorTarget,
   };
 }
 
@@ -333,13 +355,27 @@ function prepareBindings({ bindings, adapter, manifest, priorReceipt, stateDirec
   });
 }
 
+function replaceSymlink(plan, target) {
+  try {
+    symlinkSync(target, plan.replacementRoot);
+    renameSync(plan.replacementRoot, plan.registeredRoot);
+  } catch (error) {
+    rmSync(plan.replacementRoot, { force: true });
+    throw error;
+  }
+}
+
 function applyOverlay(plan, adapter) {
   adapter.beforeOverlay?.(plan);
   mkdirSync(dirname(plan.retainedRoot), { recursive: true, mode: 0o700 });
-  if (plan.priorSlotKind === "directory") renameSync(plan.registeredRoot, plan.retainedRoot);
-  else unlinkSync(plan.registeredRoot);
-  adapter.afterRename?.(plan);
-  symlinkSync(plan.candidateRoot, plan.registeredRoot);
+  if (plan.priorSlotKind === "directory") {
+    renameSync(plan.registeredRoot, plan.retainedRoot);
+    adapter.afterRename?.(plan);
+    symlinkSync(plan.candidateRoot, plan.registeredRoot);
+  } else {
+    adapter.afterRename?.(plan);
+    replaceSymlink(plan, plan.candidateRoot);
+  }
   adapter.afterSymlink?.(plan);
 }
 
@@ -389,17 +425,21 @@ function assertExactPrior(observation, binding, priorReceiptBytes) {
 
 function restorePriorSlot(plan, observation) {
   if (observation.slot.kind === "prior") return;
+  if (plan.priorSlotKind === "owned-symlink") {
+    if (observation.slot.kind !== "candidate" && observation.slot.kind !== "missing") throw new Error("rollback filesystem topology is unowned or ambiguous");
+    replaceSymlink(plan, plan.priorSymlinkTarget);
+    return;
+  }
   if (observation.slot.kind === "candidate") unlinkSync(plan.registeredRoot);
   else if (observation.slot.kind !== "rename-only") throw new Error("rollback filesystem topology is unowned or ambiguous");
-  if (plan.priorSlotKind === "directory") renameSync(plan.retainedRoot, plan.registeredRoot);
-  else symlinkSync(plan.priorSymlinkTarget, plan.registeredRoot);
+  renameSync(plan.retainedRoot, plan.registeredRoot);
 }
 
 function recoverChange(binding, adapter, receiptPath, priorReceiptBytes) {
   let observation = observeChange(binding, adapter, receiptPath);
   try { assertExactPrior(observation, binding, priorReceiptBytes); return { action: "no-op" }; } catch {}
   if (canonicalJson(observation.source) !== canonicalJson(binding.priorSnapshot.source)) {
-    if (new Set(["candidate", "rename-only"]).has(observation.slot.kind)) restorePriorSlot(binding.plan, observation);
+    if (new Set(["candidate", "rename-only"]).has(observation.slot.kind) || (observation.slot.kind === "missing" && binding.plan.priorSlotKind === "owned-symlink")) restorePriorSlot(binding.plan, observation);
     throw new Error("registration drift is not exactly recoverable without path install");
   }
   if (!exactBuffer(observation.receipt, priorReceiptBytes)) throw new Error("deployment receipt changed during activation");
@@ -453,7 +493,10 @@ function classifyBindings({ manifest, sourceRoot, artifactRoot, installed, sourc
     if (!new Set(["path", "git", "npm"]).has(kind)) throw new Error(`unclassified plugin source: ${id}`);
     const priorRoot = realpathSync(current.rootDir);
     const resolvedRoot = resolve(artifactRoot, packageRoot);
-    const files = expectedFiles(manifest, packageRoot);
+    const files = [
+      ...expectedFiles(manifest, packageRoot),
+      ...committedBrandingFiles(sourceRoot, packageRoot, packageManifest.bb?.branding, manifest.sourceCommit).map(({ bytes: _bytes, ...file }) => file),
+    ].sort((a, b) => a.path.localeCompare(b.path));
     const stagedManifest = JSON.parse(readFileSync(join(resolvedRoot, "package.json"), "utf8"));
     if (canonicalJson(stagedManifest) !== canonicalJson(wrapperManifest(packageManifest, files))) throw new Error(`staged binding manifest mismatch: ${id}`);
     const serverEntry = files.some(({ path }) => path === "dist/server.js") ? realpathSync(join(resolvedRoot, "dist/server.js")) : null;
