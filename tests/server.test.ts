@@ -17116,38 +17116,40 @@ printf '%s\\n' '${external}'
     });
   });
 
-  it("briefs newly created canonical director and orchestrator seats with their own role content", async () => {
-    const scenarios = [
-      {
-        name: "orchestrator",
-        config: roleConfig(),
-        qualification: {},
-        succession: {},
-        facts: roleReader(),
-        heading: "# Orchestrator",
-      },
-      {
-        name: "director",
-        config: directorSeatConfig(),
-        qualification: { roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID, qualificationId: "director-brief-qualification", declaredProfile: DIRECTOR_PROFILE },
-        succession: { roleRequirementId: DIRECTOR_SEAT_ROLE_REQUIREMENT_ID, qualificationId: "director-brief-qualification", profileDigest: DIRECTOR_PROFILE_DIGEST, standbyProfile: DIRECTOR_STANDBY_PROFILE },
-        facts: directorRoleReader(),
-        heading: "# Director",
-      },
-    ];
-    for (const scenario of scenarios) {
-      const host = await loadedHost();
-      host.harness.sdk.stub("threads.wait", (async () => ({ matched: true })) as never);
-      host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
-      const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: scenario.config });
-      expect(applyWithFixtureReceipt(db, qualificationRequest(fenceToken, scenario.qualification), null, scenario.facts).outcome).toBe("OK");
-      expect(applyWithFixtureReceipt(db, successionRequest(fenceToken, scenario.succession), null, scenario.facts).outcome).toBe("OK");
+  it("delays reviewer briefing until exact canonical seating and preserves its role and target", async () => {
+    const host = await loadedHost();
+    host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
+    const { fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    const reviewer = {
+      repoTargetId: TARGET_ID,
+      roleId: "independent-reviewer" as const,
+      roleRequirementId: "reviewer-v1",
+      qualificationId: "reviewer-brief-qualification",
+    };
 
-      await expect(host.harness.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id: ROLE_THREAD_ID, projectId: PROJECT_ID }) })).resolves.toEqual({ errors: [] });
-      const send = host.harness.inspection.sdk.callsTo("threads.send")[0]?.[0] as { input: Array<{ text: string }> };
-      expect(send.input[0]?.text).toContain(scenario.heading);
-      expect(send.input[0]?.text).not.toContain("# Worker");
-    }
+    await expect(host.harness.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id: ROLE_THREAD_ID, projectId: PROJECT_ID }) })).resolves.toEqual({ errors: [] });
+    expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+    expect(await host.harness.callRpc("apply", qualificationRequest(fenceToken, reviewer))).toMatchObject({ outcome: "OK" });
+
+    expect(await host.harness.callRpc("apply", successionRequest(fenceToken, {
+      ...reviewer,
+      idempotencyKey: "reviewer-brief-wrong-role",
+      roleId: "worker",
+    }))).toMatchObject({ outcome: "ROLE_REQUIREMENT_UNKNOWN", attempted: 0, verified: 0 });
+    expect(await host.harness.callRpc("apply", successionRequest(fenceToken, {
+      ...reviewer,
+      idempotencyKey: "reviewer-brief-wrong-target",
+      repoTargetId: SECOND_TARGET_ID,
+    }))).toMatchObject({ outcome: "REPO_TARGET_FOREIGN", attempted: 0, verified: 0 });
+    expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+
+    expect(await host.harness.callRpc("apply", successionRequest(fenceToken, reviewer))).toMatchObject({ outcome: "OK", eventType: "role_generation_created" });
+    const sends = host.harness.inspection.sdk.callsTo("threads.send").map(([input]) => input as { threadId: string; input: Array<{ text: string }> });
+    expect(sends).toHaveLength(1);
+    expect(sends[0]?.threadId).toBe(ROLE_THREAD_ID);
+    expect(sends[0]?.input[0]?.text).toContain("Canonical role-generation event: first-generation creation.");
+    expect(sends[0]?.input[0]?.text).toContain("# Reviewer");
+    expect(sends[0]?.input[0]?.text).not.toMatch(/# (Director|Orchestrator|Worker)/u);
   });
 
   it("uses the bootstrap exemption without making its non-role actor the holder", async () => {

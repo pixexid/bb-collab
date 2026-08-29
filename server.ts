@@ -1139,11 +1139,11 @@ const registeredWaitSchema = registeredWaitInputSchema.extend({
 const registerExternalWaitInputSchema = z.object({
   request: applyRequestSchema,
 }).strict();
-const roleBriefRoleSchema = z.enum(["director", "orchestrator", "worker"]);
+const roleBriefRoleSchema = z.enum(["director", "orchestrator", "reviewer", "worker"]);
 const roleBriefBundleSchema = z.object({
   ponytail: z.string().min(1),
   rules: z.string().min(1),
-  roles: z.object({ director: z.string().min(1), orchestrator: z.string().min(1), worker: z.string().min(1) }).strict(),
+  roles: z.object({ director: z.string().min(1), orchestrator: z.string().min(1), reviewer: z.string().min(1), worker: z.string().min(1) }).strict(),
 }).strict();
 const roleBriefSchema = z.object({
   role: roleBriefRoleSchema,
@@ -3140,13 +3140,8 @@ function roleBriefBundlePath(): string {
   return existsSync(bundled) ? bundled : fileURLToPath(new URL("./dist/role-briefs.json", import.meta.url));
 }
 
-function roleForThread(db: SqliteDatabase | null, projectId: string, threadId: string): z.infer<typeof roleBriefRoleSchema> {
-  const roleId = db ? readRoleHolderStates(db).find((holder) => holder.project_id === projectId && holder.thread_id === threadId)?.role_id : null;
-  return roleId === "director" ? "director" : roleId === "project-orchestrator" ? "orchestrator" : "worker";
-}
-
 function roleBriefRole(roleId: string): z.infer<typeof roleBriefRoleSchema> {
-  return roleId === "director" ? "director" : roleId === "project-orchestrator" ? "orchestrator" : "worker";
+  return roleId === "director" ? "director" : roleId === "project-orchestrator" ? "orchestrator" : roleId === "independent-reviewer" ? "reviewer" : "worker";
 }
 
 function canonicalSeatBriefInjection(rules: string): string {
@@ -6831,17 +6826,6 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
     }
     return views;
   };
-
-  // Lifecycle callbacks observe a completed creation; they cannot intercept a
-  // spawn. An unseated thread receives its worker brief here at seating;
-  // Every successful canonical role-generation event separately delivers the exact seat brief.
-  bb.events.on("thread.created", async ({ thread }) => {
-    try {
-      await sendRoleBrief(bb, db, thread.projectId, thread.id, roleForThread(db, thread.projectId, thread.id));
-    } catch (error) {
-      bb.log.error(`role brief seating failed for thread=${thread.id}: ${String(error)}`);
-    }
-  });
 
   // Counts only. A sidebar glyph needs how many are waiting and on which
   // thread; it has no use for the project, candidate head, digest or
