@@ -11,7 +11,7 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
-export const RUNTIME_CONTRACT_VERSION = 34;
+export const RUNTIME_CONTRACT_VERSION = 35;
 export const SCHEMA_VERSION = 35;
 // v27 records correlated terminal evidence and first-class interrupted attempts.
 const PREVIOUS_RUNTIME_CONTRACT_VERSION = 27;
@@ -1831,6 +1831,7 @@ export const contractDigest = sha256(canonicalJson({
     authority: "none",
     traffic: "none",
   },
+  roleConfigContinuationPolicy: "dispatch authority continues across revisions only when exact role inputs and target source identity are unchanged",
   writingLanePolicy: {
     configPath: "extensions.bbCollab.writingLaneCeiling",
     default: DEFAULT_WRITING_LANE_CEILING,
@@ -4273,9 +4274,7 @@ function dispatchTargetIdentity(row: Record<string, unknown>): Record<string, un
     sourceId: row.source_id,
     hostId: row.host_id,
     path: row.path,
-    remoteUrl: row.remote_url,
     defaultBranch: row.default_branch,
-    targetDigest: row.target_digest,
   };
 }
 
@@ -4309,10 +4308,12 @@ function dispatchReviewerAuthority(
     `SELECT role_id, generation
        FROM role_generations
       WHERE project_id = ? AND role_id = 'independent-reviewer' AND domain_id = ?
-        AND generation = ? AND role_requirement_id = ? AND config_revision = ?
+        AND generation = ? AND role_requirement_id = ?
         AND repo_target_id = ? AND status = 'active'`,
-  ).all(projectId, domainId, head.current_generation, requirement.roleRequirementId, configRevision, repoTargetId) as Array<{ role_id: string; generation: number }>;
+  ).all(projectId, domainId, head.current_generation, requirement.roleRequirementId, repoTargetId) as Array<{ role_id: string; generation: number }>;
   if (rows.length !== 1 || rows[0]!.role_id !== "independent-reviewer") throw refusal("ROLE_NOT_ACTIVE", "local review requires one exact active independent-reviewer generation");
+  requireRoleGenerationBinding(db, projectId, "independent-reviewer", rows[0]!.generation, domainId);
+  requireRoleGenerationConfigContinuation(db, projectId, "independent-reviewer", rows[0]!.generation, domainId, configRevision);
   return { roleRequirementId: requirement.roleRequirementId, roleId: "independent-reviewer", roleGeneration: rows[0]!.generation };
 }
 
@@ -6885,11 +6886,65 @@ function requireRoleTargetContext(
 
 // Role standing is an optional stronger check for role-aware paths. Canonical
 // mutation authority is the verified actor receipt, not an unmintable role kind.
+function requireRoleGenerationBinding(
+  db: SqliteDatabase,
+  projectId: string,
+  roleId: (typeof ROLE_IDS)[number],
+  roleGeneration: number,
+  domainId: string,
+  expectedHolderExecutionAttemptId?: string,
+): void {
+  const head = asRow<{ current_generation: number }>(
+    db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ? AND domain_id = ?").get(projectId, roleId, domainId),
+  );
+  const generation = asRow<{
+    status: string;
+    role_requirement_id: string;
+    config_revision: number;
+    holder_execution_attempt_id: string;
+    holder_context_digest: string;
+    holder_requested_profile_digest: string;
+    qualification_id: string;
+    eligibility_derivation_digest: string;
+  }>(db.prepare(`SELECT status, role_requirement_id, config_revision, holder_execution_attempt_id,
+                        holder_context_digest, holder_requested_profile_digest, qualification_id,
+                        eligibility_derivation_digest
+                   FROM role_generations
+                  WHERE project_id = ? AND role_id = ? AND generation = ? AND domain_id = ?`).get(projectId, roleId, roleGeneration, domainId));
+  if (!head || head.current_generation !== roleGeneration) throw refusal("ROLE_GENERATION_STALE", "role generation is not current");
+  if (!generation || generation.status !== "active") throw refusal("ROLE_NOT_ACTIVE", "role generation is not active");
+  if (expectedHolderExecutionAttemptId !== undefined && generation.holder_execution_attempt_id !== expectedHolderExecutionAttemptId) {
+    throw refusal("ROLE_HOLDER_MISMATCH", "role binding does not match the current holder context");
+  }
+  const attempt = asRow<{ origin: string; state: string; native_receipt_digest: string | null; requested_profile_digest: string | null }>(
+    db.prepare("SELECT origin, state, native_receipt_digest, requested_profile_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(projectId, generation.holder_execution_attempt_id),
+  );
+  if (!attempt || attempt.origin !== "role_holder" || attempt.state !== "done" || attempt.native_receipt_digest !== generation.holder_context_digest || attempt.requested_profile_digest !== generation.holder_requested_profile_digest) {
+    throw refusal("ROLE_HOLDER_MISMATCH", "role holder has no complete canonical execution attempt");
+  }
+  const qualification = asRow<{ role_requirement_id: string; config_revision: number; requested_profile_digest: string; outcome: string; expires_at_ms: number | null }>(db.prepare(
+    `SELECT role_requirement_id, config_revision, requested_profile_digest, outcome, expires_at_ms
+       FROM qualification_observations
+      WHERE project_id = ? AND qualification_id = ? AND domain_id = ?`,
+  ).get(projectId, generation.qualification_id, domainId));
+  if (!qualification || qualification.role_requirement_id !== generation.role_requirement_id || qualification.config_revision !== generation.config_revision || qualification.requested_profile_digest !== generation.holder_requested_profile_digest || qualification.outcome !== "qualified" || (qualification.expires_at_ms !== null && qualification.expires_at_ms <= now())) {
+    throw refusal("ROLE_UNQUALIFIED", "role generation has no exact qualified observation");
+  }
+  const eligibility = asRow<{ current_qualification_id: string; effective_status: string; config_revision: number; expires_at_ms: number | null; derivation_digest: string }>(db.prepare(
+    `SELECT current_qualification_id, effective_status, config_revision, expires_at_ms, derivation_digest
+       FROM eligibility_projections
+      WHERE project_id = ? AND role_requirement_id = ? AND requested_profile_digest = ? AND domain_id = ?`,
+  ).get(projectId, generation.role_requirement_id, generation.holder_requested_profile_digest, domainId));
+  if (!eligibility || eligibility.current_qualification_id !== generation.qualification_id || eligibility.effective_status !== "eligible" || eligibility.config_revision !== generation.config_revision || eligibility.derivation_digest !== generation.eligibility_derivation_digest || (eligibility.expires_at_ms !== null && eligibility.expires_at_ms <= now())) {
+    throw refusal("ROLE_UNQUALIFIED", "role generation no longer has current eligible qualification evidence");
+  }
+}
+
 function requireRoleActorBinding(
   db: SqliteDatabase,
   request: ApplyRequest,
   required = false,
-): { roleId: (typeof ROLE_IDS)[number]; roleGeneration: number } | null {
+): { roleId: (typeof ROLE_IDS)[number]; roleGeneration: number; domainId: string } | null {
   if (!request.actorReceiptId) return null;
   const actor = asRow<{ actor_kind: string; subject_id: string; role_id: string | null; role_generation: number | null; domain_id: string | null }>(
     db.prepare("SELECT actor_kind, subject_id, role_id, role_generation, domain_id FROM actor_receipts WHERE project_id = ? AND receipt_id = ?").get(
@@ -6904,68 +6959,39 @@ function requireRoleActorBinding(
   if (!actor.role_id || actor.role_generation === null) throw refusal("ROLE_HOLDER_MISMATCH", "role actor receipt has no exact generation");
   const domainId = actor.domain_id ?? request.domainId ?? "default";
   if (request.domainId !== undefined && request.domainId !== domainId) throw refusal("DOMAIN_FOREIGN", "role actor is bound to another orchestration domain");
-  const head = asRow<{ current_generation: number }>(
-    db.prepare("SELECT current_generation FROM role_generation_heads WHERE project_id = ? AND role_id = ? AND domain_id = ?").get(request.projectId, actor.role_id, domainId),
-  );
-  const generation = asRow<{
-    status: string;
-    role_requirement_id: string;
-    config_revision: number;
-    holder_execution_attempt_id: string;
-    holder_context_digest: string;
-    holder_requested_profile_digest: string;
-    qualification_id: string;
-    eligibility_derivation_digest: string;
-    domain_id: string;
-  }>(
-    db.prepare(`SELECT status, role_requirement_id, config_revision, holder_execution_attempt_id,
-                       holder_context_digest, holder_requested_profile_digest, qualification_id,
-                       eligibility_derivation_digest, domain_id
-                FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ? AND domain_id = ?`).get(
-      request.projectId,
-      actor.role_id,
-      actor.role_generation,
-      domainId,
-    ),
-  );
-  if (!head || head.current_generation !== actor.role_generation) throw refusal("ROLE_GENERATION_STALE", "role actor is not the current generation");
-  if (!generation || generation.status !== "active") throw refusal("ROLE_NOT_ACTIVE", "role actor is not active");
-  if (generation.holder_execution_attempt_id !== actor.subject_id) throw refusal("ROLE_HOLDER_MISMATCH", "role actor does not bind the current holder context");
-  const attempt = asRow<{ origin: string; state: string; native_receipt_digest: string | null; requested_profile_digest: string | null }>(
-    db.prepare("SELECT origin, state, native_receipt_digest, requested_profile_digest FROM execution_attempts WHERE project_id = ? AND execution_attempt_id = ?").get(
-      request.projectId,
-      generation.holder_execution_attempt_id,
-    ),
-  );
-  if (
-    !attempt ||
-    attempt.origin !== "role_holder" ||
-    attempt.state !== "done" ||
-    attempt.native_receipt_digest !== generation.holder_context_digest ||
-    attempt.requested_profile_digest !== generation.holder_requested_profile_digest
-  ) {
-    throw refusal("ROLE_HOLDER_MISMATCH", "role holder has no complete canonical execution attempt");
+  requireRoleGenerationBinding(db, request.projectId, actor.role_id as (typeof ROLE_IDS)[number], actor.role_generation, domainId, actor.subject_id);
+  return { roleId: actor.role_id as (typeof ROLE_IDS)[number], roleGeneration: actor.role_generation, domainId };
+}
+
+function requireRoleGenerationConfigContinuation(
+  db: SqliteDatabase,
+  projectId: string,
+  roleId: (typeof ROLE_IDS)[number],
+  roleGeneration: number,
+  domainId: string,
+  currentConfigRevision: number,
+): void {
+  const generation = asRow<{ config_revision: number; role_requirement_id: string; repo_target_id: string | null }>(db.prepare(
+    "SELECT config_revision, role_requirement_id, repo_target_id FROM role_generations WHERE project_id = ? AND role_id = ? AND generation = ? AND domain_id = ? AND status = 'active'",
+  ).get(projectId, roleId, roleGeneration, domainId));
+  if (!generation) throw refusal("ROLE_NOT_ACTIVE", "work dispatch requires the exact active role generation");
+  if (generation.config_revision === currentConfigRevision) return;
+  const identity = (revision: number) => {
+    const requirement = configuredDomains(db, projectId, revision)
+      .find((domain) => domain.domainId === domainId)?.roleRequirements
+      .find((candidate) => candidate.roleRequirementId === generation.role_requirement_id);
+    if (!requirement || requirement.roleId !== roleId || requirement.repoTargetId !== generation.repo_target_id) {
+      throw refusal("PROJECT_CONFIG_STALE", "seated role authority changed across config revisions");
+    }
+    const target = generation.repo_target_id === null ? null : asRow<{ source_id: string; host_id: string; path: string }>(db.prepare(
+      "SELECT source_id, host_id, path FROM repository_targets WHERE project_id = ? AND repo_target_id = ? AND config_revision = ?",
+    ).get(projectId, generation.repo_target_id, revision));
+    if (generation.repo_target_id !== null && !target) throw refusal("PROJECT_CONFIG_STALE", "seated role target is missing from a config revision");
+    return { requirement, target };
+  };
+  if (canonicalJson(identity(generation.config_revision)) !== canonicalJson(identity(currentConfigRevision))) {
+    throw refusal("PROJECT_CONFIG_STALE", "seated role authority changed across config revisions");
   }
-  const eligibility = asRow<{
-    current_qualification_id: string;
-    effective_status: string;
-    config_revision: number;
-    expires_at_ms: number | null;
-    derivation_digest: string;
-  }>(db.prepare(
-    `SELECT current_qualification_id, effective_status, config_revision, expires_at_ms, derivation_digest
-     FROM eligibility_projections
-     WHERE project_id = ? AND role_requirement_id = ? AND requested_profile_digest = ? AND domain_id = ?`,
-  ).get(request.projectId, generation.role_requirement_id, generation.holder_requested_profile_digest, domainId));
-  if (
-    !eligibility || eligibility.current_qualification_id !== generation.qualification_id ||
-    eligibility.effective_status !== "eligible" || eligibility.config_revision !== generation.config_revision ||
-    eligibility.derivation_digest !== generation.eligibility_derivation_digest ||
-    (eligibility.expires_at_ms !== null && eligibility.expires_at_ms <= now())
-  ) {
-    throw refusal("ROLE_UNQUALIFIED", "role actor no longer has current eligible qualification evidence");
-  }
-  return { roleId: actor.role_id as (typeof ROLE_IDS)[number], roleGeneration: actor.role_generation };
 }
 
 function profileEquals(left: ExecutionProfile, right: ExecutionProfile): boolean {
@@ -9509,6 +9535,16 @@ function applyWorkItemTransition(
   const roleActor = requireRoleActorBinding(db, request, false);
   requireNativeSeatActorAgreement(roleActor, nativeSeat);
   const attemptRole = nativeSeat ?? roleActor;
+  if (request.workAttempt && attemptRole && !committedDispatchIntent) {
+    requireRoleGenerationConfigContinuation(db, request.projectId, attemptRole.roleId, attemptRole.roleGeneration, attemptRole.domainId, configRevision);
+  }
+  if (request.workAttempt?.assignmentKind === "review" && request.workAttempt.candidateKind === "local" && !committedDispatchIntent) {
+    if (request.workAttempt.reviewRoleId !== "independent-reviewer" || request.workAttempt.reviewRoleGeneration === undefined || request.workAttempt.reviewRoleRequirementId === undefined) {
+      throw refusal("ROLE_NOT_ACTIVE", "local review requires exact independent-reviewer authority");
+    }
+    requireRoleGenerationBinding(db, request.projectId, "independent-reviewer", request.workAttempt.reviewRoleGeneration, request.domainId ?? "default");
+    requireRoleGenerationConfigContinuation(db, request.projectId, "independent-reviewer", request.workAttempt.reviewRoleGeneration, request.domainId ?? "default", configRevision);
+  }
   const writeAttemptRole = attemptRole;
   const reviewAttemptRole = attemptRole;
   if (request.workAttempt && attemptRole && request.roleId !== undefined && request.roleId !== attemptRole.roleId) {
