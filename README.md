@@ -18,12 +18,17 @@ npm run --silent activate:release -- \
   --release /absolute/path/to/release --project PROJECT_ID
 ```
 
-The transaction stages digest-named read-only roots, verifies the hermetic
-runtime closure, imports the schema fingerprint from that exact staged wrapper,
-binds every installed target, settles for the host rebuild window, proves the
-loaded roots, entries, bytes, health, and canonical schema fingerprint, then
-writes the active receipt.
-Any failure restores every prior source/root and running plugin. The canonical
+The transaction stages digest-named read-only roots with deterministic,
+build-suppressing mtimes, verifies the hermetic runtime closure, imports the
+schema fingerprint from that exact staged wrapper, overlays each stable
+registered root, and reloads it without calling path install. It then settles,
+proves the loaded roots, entries, bytes, health, and canonical schema
+fingerprint, and writes the active receipt. Exact BB/SDK metadata and every
+prior rollback generation must be build-free before the journal permits a
+mutation. Any failure restores every prior source/root and running plugin from
+fresh filesystem, registry, resident, service, byte, and receipt observations;
+an unchanged prior is a no-op, not another reload. Rollback failure preserves
+the pending incident marker, and the failed candidate must not be retried. The canonical
 receipt is host-local under BB's data directory; callers cannot select another
 state root. `npm run --silent check:deployed-dist` accepts only that receipt and
 the matching live deployment.
