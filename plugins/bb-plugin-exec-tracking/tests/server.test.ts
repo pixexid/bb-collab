@@ -41,7 +41,7 @@ describe("exec-tracking package", () => {
     const collection = JSON.parse(readFileSync(resolve(root, ".bb/plugins.json"), "utf8"));
     const marketplace = JSON.parse(readFileSync(resolve(root, "marketplace.json"), "utf8"));
     expect(manifest.engines).toEqual({ bb: ">=0.37.0", bbPluginSdk: ">=0.4.8" });
-    expect(manifest.devDependencies["@get-bb/plugin-sdk"]).toBe("0.4.8");
+    expect(manifest.devDependencies["@get-bb/plugin-sdk"]).toBe("0.4.21");
     expect(manifest.bb).not.toHaveProperty("app");
     expect(collection.plugins).toContainEqual({ name: "exec-tracking", source: "./plugins/bb-plugin-exec-tracking" });
     expect(marketplace.plugins).toContainEqual(expect.objectContaining({ id: "exec-tracking" }));

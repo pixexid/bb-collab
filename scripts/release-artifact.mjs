@@ -9,10 +9,10 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const releaseDirectory = join(root, "release");
 const manifestName = "release-manifest.json";
 const pinnedToolchain = Object.freeze({
-  bbPackage: "bb-app@0.39.0",
-  bbVersion: "0.39.0",
+  bbPackage: "bb-app@0.40.0",
+  bbVersion: "0.40.0",
   nodeVersion: "v22.23.1",
-  pluginSdkVersion: "0.4.8",
+  pluginSdkVersion: "0.4.21",
 });
 
 function canonicalJson(value) {
@@ -152,6 +152,12 @@ function assertRuntimeClosure(directory, artifactRoots, expectedEntries) {
   const required = requiredClosureFiles(directory, artifactRoots);
   if (expectedEntries && canonicalJson(required.entries) !== canonicalJson(expectedEntries)) throw new Error("release runtime external inventory does not match server entries");
   if (canonicalJson(closureFiles(directory)) !== canonicalJson(required.files)) throw new Error("release runtime closure file set does not match its imports");
+  for (const { entry, specifiers } of required.entries) for (const specifier of specifiers) {
+    if (specifier !== "@bb/plugin-sdk" && specifier !== "@get-bb/plugin-sdk") continue;
+    const resolved = realpathSync(createRequire(join(directory, entry)).resolve(specifier));
+    const dependency = JSON.parse(readFileSync(packageManifest(resolved, realpathSync(join(directory, "node_modules"))), "utf8"));
+    if (dependency.version !== pinnedToolchain.pluginSdkVersion) throw new Error(`release runtime closure ${specifier} does not match the pinned plugin SDK`);
+  }
   return required;
 }
 
@@ -182,13 +188,17 @@ function copyRuntimeClosure(sourceDirectory, directory, artifactRoots) {
   const copied = new Set();
   while (queue.length) {
     const { importer, specifier } = queue.shift();
-    const resolved = realpathSync(createRequire(importer).resolve(specifier));
+    const runtimeSpecifier = specifier === "@bb/plugin-sdk" ? "@get-bb/plugin-sdk" : specifier;
+    const resolved = realpathSync(createRequire(importer).resolve(runtimeSpecifier));
     if (!resolved.startsWith(`${sourceNodeModules}${sep}`)) throw new Error(`runtime external resolved outside source dependency root: ${specifier}`);
-    if (copied.has(resolved)) continue;
-    copied.add(resolved);
+    const copyIdentity = `${specifier}:${resolved}`;
+    if (copied.has(copyIdentity)) continue;
+    copied.add(copyIdentity);
     const manifest = packageManifest(resolved, sourceNodeModules);
+    const packageRoot = dirname(manifest);
+    const targetPackageRoot = specifier === "@bb/plugin-sdk" ? join(directory, "node_modules/@bb/plugin-sdk") : join(directory, relative(sourceDirectory, packageRoot));
     for (const source of [manifest, resolved]) {
-      const target = join(directory, relative(sourceDirectory, source));
+      const target = join(targetPackageRoot, relative(packageRoot, source));
       mkdirSync(dirname(target), { recursive: true });
       cpSync(source, target);
     }
@@ -272,6 +282,7 @@ function verifyRelease(directory, manifestPath, sourceDirectory = root) {
   const unmanifested = actual.find((path) => path.endsWith(".map"));
   if (unmanifested) throw new Error(`unmanifested release file: ${unmanifested}`);
   if (canonicalJson(actual) !== canonicalJson(expected)) throw new Error("release artifact file set does not match its manifest");
+  if (execFileSync("git", ["status", "--porcelain", "--untracked-files=no"], { cwd: sourceDirectory, encoding: "utf8" }).trim()) throw new Error("release source checkout has tracked changes");
   return manifest;
 }
 
