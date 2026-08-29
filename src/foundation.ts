@@ -12450,11 +12450,14 @@ export async function doctor(
       : incompatiblePlugins.map((plugin) => plugin.message).join("; ");
     const routing = await routingDoctorEvidence(sdk, projectId, roleGenerationHeads);
     const pluginSourceUnavailable = checkoutDivergence?.verdict === "unavailable";
+    const bbCollabPluginSourceCheckout = checkoutDivergence
+      ? { sourceIdentity: { kind: "plugin-source" as const, pluginId: PLUGIN_ID }, ...checkoutDivergence }
+      : undefined;
     const doctorMessage = [
       pluginCompatibilityMessage,
       ...routing.messages,
       ...(staleProjections.length === 0 ? [] : [`${staleProjections.length} external projection(s) are stale against canonical resource revisions`]),
-      ...(pluginSourceUnavailable ? ["plugin source checkout is unavailable"] : []),
+      ...(pluginSourceUnavailable ? ["bb-collab plugin-source checkout is unavailable"] : []),
     ].filter(Boolean).join("; ");
     const expected = targets.length + 1;
     return result(pluginSourceUnavailable ? "PLUGIN_SOURCE_UNAVAILABLE" : "OK", projectId, expected, expected, expected, {
@@ -12509,7 +12512,7 @@ export async function doctor(
         unresolvedAttempts,
         decisionIntegrity,
         cachedConsumers,
-        ...(checkoutDivergence ? { checkoutDivergence } : {}),
+        ...(bbCollabPluginSourceCheckout ? { bbCollabPluginSourceCheckout } : {}),
         schema: { version: SCHEMA_VERSION, migrationStatementIds: MIGRATIONS.map((_, index) => index), digest: schemaDigest, tables: schemaState.map((row) => row.name) },
       },
     });

@@ -4698,6 +4698,9 @@ export default async function plugin(bb: BbPluginApi, options: PluginOptions = {
          WHERE project_id = ? AND config_revision = ? ORDER BY repo_target_id`,
       ).all(projectId, head.config_revision) as Array<{ repo_target_id: string; remote_url: string | null }>;
       const identity = canonicalJson({ configRevision: head.config_revision, targets });
+      if (targets.some((target) => target.remote_url === null)) {
+        return { identity, repositories: [], reason: "configured-repositories-remoteless" };
+      }
       const repositories = targets.map((target) => githubRepository(target.remote_url));
       if (repositories.length === 0 || repositories.some((repository) => repository === null)) {
         return { identity, repositories: [], reason: "configured-repositories-unreadable" };
