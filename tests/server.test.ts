@@ -15142,6 +15142,67 @@ else printf '%s\\n' '[]'; fi
     expect(() => prove({ expectedConfigRevision: 4 })).toThrow(/worker scope/u);
   });
 
+  it("refuses local review when selected reviewer origin profile or eligibility changed", async () => {
+    const host = await loadedHost();
+    const config = multiProfileRoleConfig();
+    const { db, fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config });
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken)).outcome).toBe("OK");
+    activateReviewer(db, fenceToken);
+    const prove = (workItemId: string, expectedConfigRevision: number, requestedProfile: typeof ROLE_PROFILE) => proveWorkItemDispatchConfig(db, {
+      projectId: PROJECT_ID,
+      workItemId,
+      repoTargetId: TARGET_ID,
+      expectedConfigRevision,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fenceToken,
+      requestedProfile,
+      assignmentKind: "review",
+      candidateKind: "local",
+    });
+    expect(prove(WORK_ITEM_ID, 1, ROLE_PROFILE)).toMatchObject({ reviewerRoleGeneration: 2 });
+
+    db.prepare("UPDATE eligibility_projections SET effective_status = 'ineligible' WHERE project_id = ? AND role_requirement_id = ? AND requested_profile_digest = ?")
+      .run(PROJECT_ID, "reviewer-v1", requestedProfileDigest(ROLE_PROFILE));
+    try {
+      prove(WORK_ITEM_ID, 1, ROLE_PROFILE);
+      throw new Error("expected revoked reviewer eligibility to refuse");
+    } catch (error) {
+      expect(error).toMatchObject({ data: { code: "ROLE_UNQUALIFIED" } });
+    }
+    db.prepare("UPDATE eligibility_projections SET effective_status = 'eligible' WHERE project_id = ? AND role_requirement_id = ? AND requested_profile_digest = ?")
+      .run(PROJECT_ID, "reviewer-v1", requestedProfileDigest(ROLE_PROFILE));
+
+    const changedConfig = structuredClone(config) as typeof config;
+    const reviewer = (changedConfig.extensions.bbCollab.roleRequirements as Array<Record<string, unknown>>)
+      .find((requirement) => requirement.roleRequirementId === "reviewer-v1")!;
+    const changedReviewerProfile = { ...ROLE_PROFILE, model: "changed-reviewer-profile" };
+    reviewer.executedProfile = changedReviewerProfile;
+    const target = bootstrapRequest().targets![0]!;
+    expect(applyWithFixtureReceipt(db, {
+      ...bootstrapRequest(),
+      operationClass: "config_revision",
+      idempotencyKey: "gh779-reviewer-origin-config-2",
+      expectedConfigRevision: 1,
+      configRevision: 2,
+      expectedGovernanceEpoch: 1,
+      expectedFenceToken: fenceToken,
+      config: changedConfig,
+      targets: [target],
+    }).outcome).toBe("OK");
+    const currentWorkItemId = "wi-gh779-current-reviewer-profile";
+    expect(applyWithFixtureReceipt(db, workItemCreateRequest(fenceToken, {
+      idempotencyKey: "gh779-current-reviewer-work-item",
+      expectedConfigRevision: 2,
+      workItem: { workItemId: currentWorkItemId, title: "Reviewer origin control", body: "Require exact reviewer origin authority." },
+    }))).toMatchObject({ outcome: "OK" });
+    try {
+      prove(currentWorkItemId, 2, changedReviewerProfile);
+      throw new Error("expected changed reviewer origin profile to refuse");
+    } catch (error) {
+      expect(error).toMatchObject({ data: { code: "PROJECT_CONFIG_STALE" } });
+    }
+  });
+
   it("rejects duplicate requirement IDs and indistinguishable selectors before config commit", async () => {
     for (const [suffix, duplicate] of [
       ["id", { roleRequirementId: "worker-claude-v1", roleId: "worker", repoTargetId: TARGET_ID, executedProfile: { ...CLAUDE_PROFILE, model: "different-profile" } }],
