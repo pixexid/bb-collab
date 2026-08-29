@@ -366,8 +366,10 @@ function roleReader(
     events: [
       {
         id: ROLE_REQUEST_EVENT_ID,
+        threadId: ROLE_THREAD_ID,
         seq: 1,
         type: "client/turn/requested",
+        scope: { kind: "thread" },
         data: {
           requestId: "request-1",
           execution: {
@@ -379,9 +381,9 @@ function roleReader(
           },
         },
       },
-      { id: "event-accepted", seq: 2, type: "turn/input/accepted", data: { clientRequestId: "request-1", providerThreadId: "provider-thread-1" } },
-      { id: "event-started", seq: 3, type: "turn/started", data: { providerThreadId: "provider-thread-1" } },
-      { id: ROLE_COMPLETION_EVENT_ID, seq: 4, type: "turn/completed", data: { providerThreadId: "provider-thread-1", status: "completed" } },
+      { id: "event-accepted", threadId: ROLE_THREAD_ID, seq: 2, type: "turn/input/accepted", scope: { kind: "turn", turnId: "turn-1" }, data: { clientRequestId: "request-1", providerThreadId: "provider-thread-1" } },
+      { id: "event-started", threadId: ROLE_THREAD_ID, seq: 3, type: "turn/started", scope: { kind: "turn", turnId: "turn-1" }, data: { providerThreadId: "provider-thread-1" } },
+      { id: ROLE_COMPLETION_EVENT_ID, threadId: ROLE_THREAD_ID, seq: 4, type: "turn/completed", scope: { kind: "turn", turnId: "turn-1" }, data: { providerThreadId: "provider-thread-1", status: "completed" } },
     ],
     environment: {
       id: ROLE_ENVIRONMENT_ID,
@@ -403,7 +405,22 @@ function roleReader(
     version: "0.37.0",
   };
   mutate?.(facts);
+  for (const event of facts.events) {
+    if (event.threadId === ROLE_THREAD_ID) event.threadId = facts.thread.id;
+  }
   return new DeterministicRoleFactReader(facts);
+}
+
+function splitProviderTurnRoleFacts(facts: ConstructorParameters<typeof DeterministicRoleFactReader>[0]): void {
+  const [request, accepted, started, completion] = facts.events;
+  facts.events = [
+    request!,
+    { ...started!, id: "atlas-bootstrap-start", seq: 6, scope: { kind: "turn", turnId: "atlas-spawn-t1" } },
+    { ...accepted!, id: "atlas-accepted", seq: 7, scope: { kind: "turn", turnId: "atlas-spawn-t1" } },
+    { ...completion!, id: "atlas-bootstrap-completion", seq: 8, scope: { kind: "turn", turnId: "atlas-spawn-t1" } },
+    { ...started!, id: "atlas-seat-start", seq: 9, scope: { kind: "turn", turnId: "atlas-spawn-t2" } },
+    { ...completion!, seq: 83, scope: { kind: "turn", turnId: "atlas-spawn-t2" } },
+  ];
 }
 
 function qualificationRequest(fenceToken: string, overrides: Partial<ApplyRequest> = {}): ApplyRequest {
@@ -596,10 +613,10 @@ function hostFor(
             .slice(0, limit === undefined ? undefined : Number(limit))
             .map((event) => ({
             id: event.id,
-            threadId: roleFacts.facts.thread.id,
+            threadId: event.threadId ?? roleFacts.facts.thread.id,
             seq: event.seq,
             type: event.type,
-            scope: { kind: "thread" as const },
+            scope: event.scope ?? { kind: "thread" as const },
             data: event.data,
             createdAt: event.seq,
             })),
@@ -17647,7 +17664,7 @@ printf '%s\\n' '${external}'
       ["failed-completion", (facts) => { facts.events[3]!.data.status = "failed"; }, "EXECUTION_PROFILE_UNKNOWN"],
       ["model-fallback", (facts) => {
         facts.events[3]!.seq = 5;
-        facts.events.splice(3, 0, { id: "fallback", seq: 4, type: "provider/modelFallback", data: { providerThreadId: "provider-thread-1" } });
+        facts.events.splice(3, 0, { id: "fallback", threadId: ROLE_THREAD_ID, seq: 4, type: "provider/modelFallback", scope: { kind: "turn", turnId: "turn-1" }, data: { providerThreadId: "provider-thread-1" } });
       }, "EXECUTION_PROFILE_UNKNOWN", { roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 5 } }],
     ];
     for (const [name, mutate, outcome, requestOverride, message] of cases) {
@@ -17674,6 +17691,45 @@ printf '%s\\n' '${external}'
       idempotencyKey: "cited-completion-only",
       qualificationId: "cited-completion-only",
     }), null, facts)).toMatchObject({ outcome: "OK", attempted: 1, verified: 1 });
+  });
+
+  it("correlates a split provider spawn to the exact cited native turn", async () => {
+    const host = await loadedHost(PROJECT_ID, splitProviderTurnRoleFacts);
+    const { fenceToken } = seedAndBootstrap(host, PROJECT_ID, { config: roleConfig() });
+    expect(await host.harness.callRpc("apply", qualificationRequest(fenceToken, {
+      idempotencyKey: "atlas-split-provider-turn",
+      qualificationId: "atlas-split-provider-turn",
+      roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 83 },
+    }))).toMatchObject({ outcome: "OK", attempted: 1, verified: 1 });
+  });
+
+  it("refuses foreign, duplicate, missing, fallback, provider, and unordered cited-turn evidence", async () => {
+    const cases: Array<[string, (events: ConstructorParameters<typeof DeterministicRoleFactReader>[0]["events"]) => void, string, string]> = [
+      ["foreign-turn", (events) => { events[4]!.scope = { kind: "turn", turnId: "atlas-spawn-t3" }; }, "EXECUTION_PROFILE_UNKNOWN", "correlated execution start is missing or ambiguous"],
+      ["cross-thread-colliding-prefix", (events) => { events[4]!.threadId = "foreign-thread"; events[4]!.scope = { kind: "turn", turnId: "atlas-spawn-t20" }; }, "EXECUTION_PROFILE_UNKNOWN", "correlated execution start is missing or ambiguous"],
+      ["duplicate-target-start", (events) => { events.splice(5, 0, { ...events[4]!, id: "atlas-seat-start-duplicate", seq: 10 }); }, "EXECUTION_PROFILE_UNKNOWN", "correlated execution start is missing or ambiguous"],
+      ["missing-acceptance", (events) => { events.splice(2, 1); }, "EXECUTION_COMPLETION_AMBIGUOUS", "execution input correlation is missing or ambiguous"],
+      ["fallback", (events) => { events.splice(5, 0, { id: "atlas-fallback", threadId: ROLE_THREAD_ID, seq: 10, type: "provider/modelFallback", scope: { kind: "turn", turnId: "atlas-spawn-t2" }, data: { providerThreadId: "provider-thread-1" } }); }, "EXECUTION_PROFILE_UNKNOWN", "model fallback has no final unambiguous executed profile"],
+      ["wrong-provider", (events) => { events[5]!.data.providerThreadId = "foreign-provider-thread"; }, "EXECUTION_COMPLETION_AMBIGUOUS", "completion does not match the exact requested correlation"],
+      ["unordered", (events) => { events[4]!.seq = 7; }, "EXECUTION_COMPLETION_AMBIGUOUS", "reader-returned correlation events are not strictly ordered after the cited request"],
+      ["foreign-thread-colliding-turn-prefix", (events) => { events[4]!.threadId = "foreign-thread"; }, "EXECUTION_PROFILE_UNKNOWN", "correlated execution start belongs to another native thread or provider thread"],
+    ];
+    for (const [name, mutate, outcome, message] of cases) {
+      const { db, fenceToken } = seedAndBootstrap(await loadedHost(), PROJECT_ID, { config: roleConfig() });
+      const facts = roleReader((input) => {
+        splitProviderTurnRoleFacts(input);
+        mutate(input.events);
+      });
+      const before = exportFoundation(db, PROJECT_ID);
+      const result = applyWithFixtureReceipt(db, qualificationRequest(fenceToken, {
+        idempotencyKey: `atlas-${name}`,
+        qualificationId: `atlas-${name}`,
+        roleContext: { threadId: ROLE_THREAD_ID, requestEventId: ROLE_REQUEST_EVENT_ID, requestEventSeq: 1, completionEventId: ROLE_COMPLETION_EVENT_ID, completionEventSeq: 83 },
+      }), null, facts);
+      expect(result.outcome, name).toBe(outcome);
+      expect(result.message, name).toBe(message);
+      expect(exportFoundation(db, PROJECT_ID), name).toEqual(before);
+    }
   });
 
   it("resolves a long-lived holder from exact cited events without enumerating its history", async () => {

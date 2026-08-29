@@ -70,6 +70,7 @@ import {
   type GitHubIssueAdapter,
   type GitHubIssueMutation,
   type GitHubIssueSnapshot,
+  type RoleEventFact,
   type RoleFactReader,
   type AuthoritativeHistoricalInterruption,
   type AuthoritativeTerminalEvidence,
@@ -1504,7 +1505,7 @@ export async function readLiveRoleFactReader(
       if (events.length !== 1) throw new Error("exact role event is unavailable");
       const event = events[0]!;
       if (event.id !== eventId || event.seq !== eventSeq) throw new Error("exact role event identity does not match");
-      return { id: event.id, seq: event.seq, type: event.type, data: event.data as Record<string, unknown> };
+      return { id: event.id, threadId: event.threadId, seq: event.seq, type: event.type, scope: event.scope, data: event.data as Record<string, unknown> };
     };
     const [thread, requestEvent, completionEvent] = await Promise.all([
       sdk.threads.get({ threadId: request.roleContext.threadId }),
@@ -1556,7 +1557,7 @@ export async function readLiveRoleFactReader(
       host: { id: host.id, status: host.status, maxPermissionMode: host.maxPermissionMode },
       version: version.currentVersion,
     };
-    const correlationPages = new Map<number, Array<{ id: string; seq: number; type: string; data: Record<string, unknown> }>>();
+    const correlationPages = new Map<number, RoleEventFact[]>();
     if (!roleContextPreflightRefusal({
       thread: facts.thread,
       requestEvent: facts.requestEvent,
@@ -1573,7 +1574,7 @@ export async function readLiveRoleFactReader(
           threadId: request.roleContext.threadId,
           afterSeq: String(afterSeq),
           limit: String(ROLE_CONTEXT_EVENT_PAGE_SIZE),
-        })).map((event) => ({ id: event.id, seq: event.seq, type: event.type, data: event.data as Record<string, unknown> }));
+        })).map((event) => ({ id: event.id, threadId: event.threadId, seq: event.seq, type: event.type, scope: event.scope, data: event.data as Record<string, unknown> }));
         correlationPages.set(afterSeq, page);
         if (
           page.some((event) => event.id === request.roleContext!.completionEventId && event.seq === request.roleContext!.completionEventSeq) ||
