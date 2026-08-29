@@ -9,6 +9,7 @@ const files = {
   roles: {
     director: "docs/roles/director.md",
     orchestrator: "docs/roles/orchestrator.md",
+    reviewer: "docs/roles/reviewer.md",
     worker: "docs/roles/worker.md",
   },
 };

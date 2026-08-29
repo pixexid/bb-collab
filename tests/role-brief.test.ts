@@ -19,7 +19,7 @@ describe("role briefs", () => {
     host.harness.sdk.stub("projects.get", (async ({ projectId }: { projectId: string }) => project(projectId)) as never);
     await plugin(host.bb);
 
-    for (const role of ["director", "orchestrator", "worker"] as const) {
+    for (const role of ["director", "orchestrator", "reviewer", "worker"] as const) {
       const brief = await host.harness.callRpc("roleBrief", { projectId: "project-brief", role }) as {
         role: string;
         roleContent: string;
@@ -51,65 +51,14 @@ describe("role briefs", () => {
     }
   });
 
-  it("queues a created worker brief while its first turn is active", async () => {
+  it("leaves created non-role threads ordinary", async () => {
     const host = createFakePluginHost({ pluginId: "bb-collab" });
     host.harness.sdk.stub("projects.get", (async ({ projectId }: { projectId: string }) => project(projectId)) as never);
-    host.harness.sdk.stub("threads.wait", (async () => { throw new Error("must not wait for first-turn seating"); }) as never);
     host.harness.sdk.stub("threads.send", (async () => ({ ok: true })) as never);
     await plugin(host.bb);
 
     await expect(host.harness.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id: "worker-brief", projectId: "project-brief", status: "active" }) })).resolves.toEqual({ errors: [] });
-    const request = host.harness.inspection.sdk.callsTo("threads.send")[0]?.[0] as { threadId: string; mode: string; input: Array<{ visibility: string; text: string }> };
-    expect(request).toMatchObject({ threadId: "worker-brief", mode: "queue-if-active" });
-    expect(request.input[0]).toMatchObject({ visibility: "agent-only", text: expect.stringContaining("Does this need to exist at all?") });
-    expect(host.harness.inspection.sdk.callsTo("threads.wait")).toHaveLength(0);
-  });
-
-  it("serializes concurrent role briefs without waiting for idle", async () => {
-    const host = createFakePluginHost({ pluginId: "bb-collab" });
-    host.harness.sdk.stub("projects.get", (async ({ projectId }: { projectId: string }) => project(projectId)) as never);
-    const sendStatuses: string[] = [];
-    let status: "idle" | "active" = "idle";
-    host.harness.sdk.stub("threads.wait", (async () => { throw new Error("must not wait for seating"); }) as never);
-    host.harness.sdk.stub("threads.send", (async () => {
-      sendStatuses.push(status);
-      status = "active";
-      return { ok: true };
-    }) as never);
-    await plugin(host.bb);
-
-    const thread = makeThreadResponse({ id: "worker-brief", projectId: "project-brief", status: "active" });
-    await expect(Promise.all([
-      host.harness.emitThreadEvent("thread.created", { thread }),
-      host.harness.emitThreadEvent("thread.created", { thread }),
-    ])).resolves.toEqual([{ errors: [] }, { errors: [] }]);
-    expect(sendStatuses).toEqual(["idle", "active"]);
-    expect(host.harness.inspection.sdk.callsTo("threads.wait")).toHaveLength(0);
-  });
-
-  it("logs a role-brief send failure at error level", async () => {
-    const host = createFakePluginHost({ pluginId: "bb-collab" });
-    host.harness.sdk.stub("projects.get", (async ({ projectId }: { projectId: string }) => project(projectId)) as never);
-    host.harness.sdk.stub("threads.send", (async () => { throw new Error("send failed"); }) as never);
-    await plugin(host.bb);
-
-    await expect(host.harness.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id: "worker-failure", projectId: "project-brief", status: "active" }) })).resolves.toEqual({ errors: [] });
-    expect(host.harness.inspection.logEntries).toContainEqual(expect.objectContaining({
-      level: "error",
-      message: "role brief seating failed for thread=worker-failure: Error: send failed",
-    }));
-  });
-
-  it("sends an already-idle role brief without consuming the timeout", async () => {
-    const host = createFakePluginHost({ pluginId: "bb-collab" });
-    host.harness.sdk.stub("projects.get", (async ({ projectId }: { projectId: string }) => project(projectId)) as never);
-    const order: string[] = [];
-    host.harness.sdk.stub("threads.wait", (async () => { order.push("idle"); return { matched: true }; }) as never);
-    host.harness.sdk.stub("threads.send", (async () => { order.push("send"); return { ok: true }; }) as never);
-    await plugin(host.bb);
-
-    await expect(host.harness.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id: "worker-idle", projectId: "project-brief", status: "idle" }) })).resolves.toEqual({ errors: [] });
-    expect(order).toEqual(["send"]);
+    expect(host.harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
     expect(host.harness.inspection.sdk.callsTo("threads.wait")).toHaveLength(0);
   });
 
