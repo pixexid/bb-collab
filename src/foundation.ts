@@ -11,7 +11,7 @@ export const PLUGIN_ID = "bb-collab";
 export const BB_VERSION_RANGE = ">=0.37.0";
 export const PLUGIN_SDK_VERSION = "0.4.1";
 // Runtime contract version; the separate instruction contract is INSTRUCTION_CONTRACT_VERSION in AGENTS.md.
-export const RUNTIME_CONTRACT_VERSION = 35;
+export const RUNTIME_CONTRACT_VERSION = 36;
 export const SCHEMA_VERSION = 35;
 // v27 records correlated terminal evidence and first-class interrupted attempts.
 const PREVIOUS_RUNTIME_CONTRACT_VERSION = 27;
@@ -2409,6 +2409,24 @@ const workItemSatisfactionEvidenceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("config_revision"), configRevision: z.number().int().positive(), digest: digestSchema }).strict(),
   z.object({ kind: z.literal("decision"), decisionId: id }).strict(),
   z.object({ kind: z.literal("github_issue_closed"), owner: githubRefPartSchema, repo: githubRefPartSchema, issueNumber: z.number().int().positive().refine(Number.isSafeInteger) }).strict(),
+  z.object({
+    kind: z.literal("local_merge"),
+    projectId: id,
+    repoTargetId: id,
+    executionAttemptId: id,
+    baseSha: gitShaSchema,
+    candidateSha: gitShaSchema,
+    mergedSha: gitShaSchema,
+    environment: z.object({
+      bbServerId: id,
+      environmentId: id,
+      sourceId: id,
+      hostId: id,
+      path: id,
+      mode: z.literal("managed-worktree"),
+    }).strict(),
+    observation: z.object({ clean: z.literal(true), reachable: z.literal(true) }).strict(),
+  }).strict(),
 ]);
 const projectionRecoveryEvidenceSchema = z.discriminatedUnion("kind", [
   z.object({
@@ -3280,6 +3298,11 @@ export type AuthoritativeTerminalEvidence = {
   evidence: Array<{ kind: string; digest: string; ref: string }>;
 };
 
+export type AuthoritativeLocalMergeEvidence = {
+  evidence: Extract<NonNullable<ApplyRequest["satisfactionEvidence"]>, { kind: "local_merge" }>;
+  reviewTier: "A" | "B" | "C";
+};
+
 export function threadlessPreparedReplayProbeDigest(input: {
   projectId: string;
   workItemId: string;
@@ -3431,6 +3454,7 @@ export type AuthoritativeHistoricalInterruption = {
 export interface ExecutionAttemptEvidenceReader {
   terminal(input: { projectId: string; workItemId: string; executionAttemptId: string; nativeEventId: string; nativeEventSeq: number; nativeTurnId: string }): AuthoritativeTerminalEvidence;
   historical(input: { projectId: string; workItemId: string; executionAttemptId: string; nativeEventId: string; nativeEventSeq: number; threadId: string }): AuthoritativeHistoricalInterruption;
+  localMerge?(input: { projectId: string; workItemId: string; executionAttemptId: string }): AuthoritativeLocalMergeEvidence;
 }
 
 export interface ResolvedRoleContext {
@@ -8718,8 +8742,10 @@ function requireWorkItemSatisfactionEvidence(db: SqliteDatabase, request: ApplyR
     if (!decision || !decision.decision_identity_digest || storedDecisionIdentityDigest(decision) !== decision.decision_identity_digest) {
       throw refusal("WORK_ITEM_STATE_INVALID", "satisfaction evidence does not name an exact project Decision");
     }
-  } else {
+  } else if (evidence.kind === "github_issue_closed") {
     requireBoundGithubIssue(db, request.projectId, request.workItemId!, evidence);
+  } else {
+    throw refusal("WORK_ITEM_STATE_INVALID", "local merge evidence is valid only for direct Tier C local completion");
   }
   return evidence;
 }
@@ -9514,6 +9540,7 @@ function applyWorkItemTransition(
   githubObservation: GitHubIssueSnapshot | null,
   githubPrObservation: GithubPrObservation | undefined,
   nativeSeat: AuthenticatedNativeSeat | null,
+  evidenceReader: ExecutionAttemptEvidenceReader | null,
 ): FoundationResult {
   if (request.threadlessPreparedClosure !== undefined) return applyThreadlessPreparedClosure(db, request, digest, nativeSeat);
   if (request.strandedExecutionAttemptClosure !== undefined) return applyStrandedExecutionAttemptClosure(db, request, digest, nativeSeat);
@@ -9632,6 +9659,9 @@ function applyWorkItemTransition(
     workItem.lifecycle_state === "in_progress" &&
     nextState === "succeeded" &&
     externalEvent?.kind === "github_issue_closed";
+  const localMergeClose = workItem.lifecycle_state === "in_progress" &&
+    nextState === "succeeded" &&
+    request.satisfactionEvidence?.kind === "local_merge";
   const existingWait = asRow<WorkItemWaitRow>(db.prepare(
     "SELECT * FROM work_item_waits WHERE project_id = ? AND work_item_id = ?",
   ).get(request.projectId, workItem.work_item_id));
@@ -9758,7 +9788,7 @@ function applyWorkItemTransition(
     throw refusal("WORK_ITEM_STATE_INVALID", "review-pending may only register a review attempt");
   }
   const redispatchingReview = workItem.lifecycle_state === "review_pending" && nextState === "review_pending";
-  if (request.reviewHandoff !== undefined && (nextState !== "review_pending" || redispatchingReview)) {
+  if (request.reviewHandoff !== undefined && ((nextState !== "review_pending" && !localMergeClose) || redispatchingReview)) {
     throw refusal("WORK_ITEM_STATE_INVALID", "review handoff is valid only when entering review-pending");
   }
   const priorReview = redispatchingReview
@@ -9964,8 +9994,42 @@ function applyWorkItemTransition(
       },
     );
   }
-  if (!nextState || (!redispatchingReview && !swappingBlockedWait && !directMergeClose && !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState))) {
+  if (!nextState || (!redispatchingReview && !swappingBlockedWait && !directMergeClose && !localMergeClose && !WORK_ITEM_TRANSITIONS[workItem.lifecycle_state].includes(nextState))) {
     throw refusal("WORK_ITEM_STATE_INVALID", "work item lifecycle transition is not allowed");
+  }
+  let localMergeEvidence: AuthoritativeLocalMergeEvidence | undefined;
+  if (localMergeClose) {
+    const supplied = request.satisfactionEvidence as Extract<NonNullable<ApplyRequest["satisfactionEvidence"]>, { kind: "local_merge" }>;
+    if (supplied.projectId !== request.projectId || supplied.repoTargetId !== workItem.repo_target_id || supplied.executionAttemptId !== request.executionAttemptId) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "local merge evidence does not bind the exact project, target, and writing attempt");
+    }
+    if (supplied.candidateSha !== supplied.mergedSha) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "local merge evidence does not identify the candidate as the merged head");
+    }
+    if (attemptRole?.roleId !== "project-orchestrator") {
+      throw refusal("ROLE_HOLDER_MISMATCH", "direct local completion requires the exact current project-orchestrator holder");
+    }
+    const target = asRow<{ remote_url: string | null }>(db.prepare(
+      "SELECT remote_url FROM repository_targets WHERE project_id = ? AND repo_target_id = ? AND config_revision = ?",
+    ).get(request.projectId, workItem.repo_target_id, configRevision));
+    if (!target || target.remote_url !== null) throw refusal("WORK_ITEM_STATE_INVALID", "direct local completion requires an exact remote-less repository target");
+    if (!request.reviewHandoff || request.reviewHandoff.kind !== "accepted-write-terminal-report") {
+      throw refusal("WORK_ITEM_STATE_INVALID", "direct local completion requires the exact accepted DONE writing report");
+    }
+    requireReviewHandoff(db, request, workItem);
+    if (!evidenceReader?.localMerge) throw refusal("WORK_ITEM_STATE_INVALID", "direct local completion requires authoritative local merge evidence");
+    try {
+      localMergeEvidence = evidenceReader.localMerge({
+        projectId: request.projectId,
+        workItemId: workItem.work_item_id,
+        executionAttemptId: supplied.executionAttemptId,
+      });
+    } catch {
+      throw refusal("WORK_ITEM_STATE_INVALID", "authoritative local merge evidence is unavailable or foreign");
+    }
+    if (localMergeEvidence.reviewTier !== "C" || canonicalJson(localMergeEvidence.evidence) !== canonicalJson(supplied)) {
+      throw refusal("WORK_ITEM_STATE_INVALID", "local merge evidence is not the exact independently observed Tier C fast-forward");
+    }
   }
   const satisfactionEvidence = satisfactionExit ? requireWorkItemSatisfactionEvidence(db, request) : undefined;
   const githubIssueSatisfaction = satisfactionEvidence?.kind === "github_issue_closed";
@@ -10035,7 +10099,7 @@ function applyWorkItemTransition(
   }
   const reviewHandoff = nextState === "review_pending" && !redispatchingReview
     ? requireReviewHandoff(db, request, workItem)
-    : undefined;
+    : localMergeClose ? request.reviewHandoff : undefined;
   const latestAttempt = latestWorkItemAttempt(db, request.projectId, workItem.work_item_id);
   if (nextState === "succeeded" && latestAttempt?.state === "interrupted") {
     throw refusal("WORK_ITEM_STATE_INVALID", "interrupted attempt requires explicit resume or disposition before success");
@@ -10201,14 +10265,16 @@ function applyWorkItemTransition(
       });
     }
   } else {
-    executionAttemptId = terminalizeWorkItemAttempt(
-      db,
-      request.projectId,
-      workItem.work_item_id,
-      nextState === "succeeded" ? "done" : nextState === "blocked" ? "blocked" : "failed",
-      workItem.lifecycle_state === "review_pending" ? "review" : undefined,
-      nextState === "succeeded" ? (directMergeClose ? "fleet-watchdog-merge-close" : "work-item-review-adjudication") : undefined,
-    );
+    executionAttemptId = localMergeClose
+      ? reviewHandoff!.executionAttemptId
+      : terminalizeWorkItemAttempt(
+        db,
+        request.projectId,
+        workItem.work_item_id,
+        nextState === "succeeded" ? "done" : nextState === "blocked" ? "blocked" : "failed",
+        workItem.lifecycle_state === "review_pending" ? "review" : undefined,
+        nextState === "succeeded" ? (directMergeClose ? "fleet-watchdog-merge-close" : "work-item-review-adjudication") : undefined,
+      );
   }
   return commitMutation(
     db,
@@ -10239,6 +10305,7 @@ function applyWorkItemTransition(
         ...(isGithubPrWait(machineWait ?? { kind: "none" }) ? { initialObservation: githubPrObservation, initialSemanticDigest: githubPrSemanticDigest(githubPrObservation!) } : {}),
         ...(unblock === undefined ? {} : { unblock }),
         ...(satisfactionEvidence === undefined ? {} : { satisfactionEvidence }),
+        ...(localMergeEvidence === undefined ? {} : { satisfactionEvidence: localMergeEvidence.evidence, reviewTier: localMergeEvidence.reviewTier }),
         ...(firedReplacementSwap ? { previousBlocker: unblock, replacementBlocker: machineWait } : {}),
         ...(recordedExternalEvent === null ? {} : { externalEvent: recordedExternalEvent }),
         ...(configContinuation === null ? {} : {
@@ -10276,6 +10343,7 @@ function applyWorkItemTransition(
           ...(isGithubPrWait(machineWait ?? { kind: "none" }) ? { initialSemanticDigest: githubPrSemanticDigest(githubPrObservation!) } : {}),
           ...(unblock === undefined ? {} : { unblock }),
           ...(satisfactionEvidence === undefined ? {} : { satisfactionEvidence }),
+          ...(localMergeEvidence === undefined ? {} : { satisfactionEvidence: localMergeEvidence.evidence, reviewTier: localMergeEvidence.reviewTier }),
           ...(firedReplacementSwap ? { previousBlocker: unblock, replacementBlocker: machineWait } : {}),
           ...(recordedExternalEvent === null ? {} : { externalEvent: recordedExternalEvent }),
           ...(configContinuation === null ? {} : {
@@ -11746,7 +11814,7 @@ export function applyFixtureMutation(
         case "work_item_create":
           return applyWorkItemCreate(db, request, digest);
         case "work_item_transition":
-          return applyWorkItemTransition(db, request, digest, githubObservation, request.githubPrObservation, nativeSeat);
+          return applyWorkItemTransition(db, request, digest, githubObservation, request.githubPrObservation, nativeSeat, executionAttemptEvidenceReader);
         case "github_pr_observation_record":
           return applyGithubPrObservation(db, request, digest);
         case "execution_attempt_terminal_report":

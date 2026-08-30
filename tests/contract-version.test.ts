@@ -4,6 +4,6 @@ import { expect, it } from "vitest";
 import { RUNTIME_CONTRACT_VERSION } from "../src/foundation.js";
 
 it("bumps the instruction contract for shipped canonical-operation reachability without changing the runtime contract", () => {
-  expect(readFileSync(join(process.cwd(), "AGENTS.md"), "utf8")).toMatch(/INSTRUCTION_CONTRACT_VERSION:\s*50/u);
-  expect(RUNTIME_CONTRACT_VERSION).toBe(35);
+  expect(readFileSync(join(process.cwd(), "AGENTS.md"), "utf8")).toMatch(/INSTRUCTION_CONTRACT_VERSION:\s*51/u);
+  expect(RUNTIME_CONTRACT_VERSION).toBe(36);
 });
