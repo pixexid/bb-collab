@@ -16176,14 +16176,17 @@ else printf '%s\\n' '[]'; fi
   });
 
   it.each([
-    ["Tier C", "docs/candidate.md", true],
-    ["Tier B", "src/candidate.ts", false],
-    ["Tier A", "src/foundation.ts", false],
-  ] as const)("derives and enforces %s local completion through the shipped CLI", async (_tier, changedFile, succeeds) => {
+    ["Tier C", "docs/candidate.md", true, false],
+    ["Tier B", "src/candidate.ts", false, false],
+    ["Tier A", "src/foundation.ts", false, false],
+    ["source-confused Tier C", "docs/candidate.md", false, true],
+  ] as const)("derives and enforces %s local completion through the shipped CLI", async (_tier, changedFile, succeeds, sourceConfused) => {
     const accepted = await acceptedDoneWorkItemFixture();
     const root = mkdtempSync(join(tmpdir(), "bb-collab-tier-c-local-"));
     const targetPath = join(root, "target");
     const candidatePath = join(root, "candidate-worktree");
+    const secondSourcePath = join(root, "second-source");
+    const secondSourceCandidatePath = join(root, "second-source-worktree");
     try {
       mkdirSync(targetPath);
       execFileSync("git", ["-C", targetPath, "init", "-b", "main"]);
@@ -16201,11 +16204,19 @@ else printf '%s\\n' '[]'; fi
       execFileSync("git", ["-C", candidatePath, "commit", "-m", "candidate"]);
       const candidateSha = execFileSync("git", ["-C", candidatePath, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
       execFileSync("git", ["-C", targetPath, "merge", "--ff-only", "candidate"]);
+      if (sourceConfused) {
+        execFileSync("git", ["clone", targetPath, secondSourcePath]);
+        execFileSync("git", ["-C", secondSourcePath, "worktree", "add", "-b", "second-source-candidate", secondSourceCandidatePath, candidateSha]);
+      }
+      const environmentPath = sourceConfused ? secondSourceCandidatePath : candidatePath;
 
       accepted.fixture.db.prepare("UPDATE repository_targets SET path = ?, remote_url = NULL, default_branch = 'main' WHERE project_id = ? AND repo_target_id = ?").run(targetPath, PROJECT_ID, TARGET_ID);
-      accepted.fixture.host.harness.sdk.stub("projects.get", (async () => ({ id: PROJECT_ID, sources: [{ id: "source-main", projectId: PROJECT_ID, hostId: "host-main", path: targetPath }] })) as never);
+      accepted.fixture.host.harness.sdk.stub("projects.get", (async () => ({ id: PROJECT_ID, sources: [
+        { id: "source-main", projectId: PROJECT_ID, hostId: "host-main", path: targetPath },
+        ...(sourceConfused ? [{ id: "source-second", projectId: PROJECT_ID, hostId: "host-main", path: secondSourcePath }] : []),
+      ] })) as never);
       accepted.fixture.host.harness.sdk.stub("environments.get", (async () => ({
-        id: accepted.report.environmentId, projectId: PROJECT_ID, hostId: "host-main", path: candidatePath,
+        id: accepted.report.environmentId, projectId: PROJECT_ID, hostId: "host-main", path: environmentPath,
         managed: true, isGitRepo: true, isWorktree: true, workspaceProvisionType: "managed-worktree",
       })) as never);
       accepted.fixture.host.harness.sdk.stub("environments.diff", (async () => ({ outcome: "available" })) as never);
@@ -16220,17 +16231,19 @@ else printf '%s\\n' '[]'; fi
       const evidence = {
         kind: "local_merge" as const, projectId: PROJECT_ID, repoTargetId: TARGET_ID, executionAttemptId: accepted.attempt.execution_attempt_id,
         baseSha, candidateSha, mergedSha: candidateSha,
-        environment: { bbServerId: accepted.fixture.host.bb.server.loopbackBaseUrl, environmentId: accepted.report.environmentId!, sourceId: "source-main", hostId: "host-main", path: candidatePath, mode: "managed-worktree" as const },
+        environment: { bbServerId: accepted.fixture.host.bb.server.loopbackBaseUrl, environmentId: accepted.report.environmentId!, sourceId: "source-main", hostId: "host-main", path: environmentPath, mode: "managed-worktree" as const },
         observation: { clean: true as const, reachable: true as const },
       };
       const request = acceptedReviewPendingRequest(accepted, 3, {
         idempotencyKey: "tier-c-live-cli", actorReceiptId: "role-actor-assignment", lifecycleState: "succeeded", satisfactionEvidence: evidence, workAttempt: undefined,
       });
+      const before = exportFoundation(accepted.fixture.db, PROJECT_ID);
       const cli = await accepted.fixture.host.harness.runCli(["apply", "--project", PROJECT_ID, "--request", JSON.stringify(request)]);
       expect(cli.exitCode, cli.stdout).toBe(succeeds ? 0 : 2);
       expect(JSON.parse(cli.stdout)).toMatchObject(succeeds
         ? { outcome: "OK", evidence: { lifecycleState: "succeeded", reviewTier: "C", satisfactionEvidence: evidence } }
-        : { outcome: "WORK_ITEM_STATE_INVALID" });
+        : { outcome: sourceConfused ? "EXTERNAL_UNAVAILABLE" : "WORK_ITEM_STATE_INVALID" });
+      if (!succeeds) expect(exportFoundation(accepted.fixture.db, PROJECT_ID)).toEqual(before);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -2537,6 +2537,10 @@ async function liveLocalMergeReader(
       supplied.environment.bbServerId !== bb.server.loopbackBaseUrl || supplied.environment.sourceId !== target.source_id || supplied.environment.hostId !== target.host_id ||
       project.sources.filter((source) => source.id === target.source_id && source.projectId === request.projectId && source.hostId === target.host_id && source.path === target.path).length !== 1
     ) throw new Error("local merge environment or source identity is foreign");
+    if (gitEvidence(environment.path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]) !==
+      gitEvidence(target.path, ["rev-parse", "--path-format=absolute", "--git-common-dir"])) {
+      throw new Error("local merge environment does not belong to the repository target source");
+    }
     if (baseCommit.outcome !== "available" || candidateCommit.outcome !== "available" || status.outcome !== "available") throw new Error("local merge candidate is unreachable");
     const checkout = status.workspace.checkout;
     const workingTree = status.workspace.workingTree as { state?: string; hasUncommittedChanges?: boolean; files?: unknown[]; insertions?: number; deletions?: number };
