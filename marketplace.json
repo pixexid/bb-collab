@@ -2,8 +2,8 @@
   "$schema": "https://getbb.app/schemas/marketplace.schema.json",
   "schemaVersion": 1,
   "name": "bb-collab",
-  "displayName": "bb-collab plugins",
-  "description": "Plugins maintained with bb-collab.",
+  "displayName": "bb-collab independent plugins",
+  "description": "Independent BB-native plugins retained after governor retirement.",
   "plugins": [
     {
       "id": "threads-list",
@@ -14,45 +14,6 @@
         "git": {
           "url": "https://github.com/pixexid/bb-collab.git",
           "subdir": "plugins/bb-plugin-threads-list",
-          "ref": "main"
-        }
-      }
-    },
-    {
-      "id": "collaboration-lanes",
-      "displayName": "Collaboration Lanes",
-      "description": "Open collaboration lanes and their thread-row activity pulse.",
-      "author": { "name": "bb-collab" },
-      "source": {
-        "git": {
-          "url": "https://github.com/pixexid/bb-collab.git",
-          "subdir": "plugins/bb-plugin-lanes",
-          "ref": "main"
-        }
-      }
-    },
-    {
-      "id": "operator-inbox",
-      "displayName": "Operator Inbox",
-      "description": "Project-scoped operator and supervisor messages with delivery-aware replies.",
-      "author": { "name": "bb-collab" },
-      "source": {
-        "git": {
-          "url": "https://github.com/pixexid/bb-collab.git",
-          "subdir": "plugins/bb-plugin-operator-inbox",
-          "ref": "main"
-        }
-      }
-    },
-    {
-      "id": "exec-tracking",
-      "displayName": "Exec Tracking",
-      "description": "Records executed-triple evidence and coalesces silent abnormal-thread wakes.",
-      "author": { "name": "bb-collab" },
-      "source": {
-        "git": {
-          "url": "https://github.com/pixexid/bb-collab.git",
-          "subdir": "plugins/bb-plugin-exec-tracking",
           "ref": "main"
         }
       }

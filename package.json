@@ -1,59 +1,11 @@
 {
-  "name": "bb-plugin-bb-collab",
-  "version": "0.1.0",
-  "workspaces": ["plugins/*", "packages/*"],
-  "type": "module",
-  "engines": {
-    "bb": ">=0.37.0",
-    "bbPluginSdk": "^0.4.1"
-  },
-  "bb": {
-    "name": "bb-collab",
-    "description": "BB-native project governance storage and conformance boundary.",
-    "branding": {
-      "logo": {
-        "light": "./assets/logo.svg"
-      }
-    },
-    "server": "./dist/server.js",
-    "app": "./app.tsx",
-    "skills": []
-  },
+  "name": "bb-collab-retired",
+  "private": true,
+  "version": "0.0.0",
+  "workspaces": ["plugins/bb-plugin-threads-list"],
   "scripts": {
-    "build": "node scripts/build.mjs",
-    "release": "node scripts/release-artifact.mjs",
-    "activate:release": "node scripts/activate-release.mjs activate",
-    "check:deployed-dist": "node scripts/check-dist.mjs --deployed",
-    "typecheck": "tsc -p tsconfig.json",
-    "test": "vitest run",
-    "check:composed-pr": "node scripts/check-composed-pr.mjs",
-    "executed-profile": "node scripts/read-executed-profile.mjs",
-    "throughput-report": "node scripts/weekly-throughput-report.mjs",
-    "verify": "npm run typecheck && npm run release && npm test && node scripts/check-production-reachability.mjs",
-    "changeset": "changeset",
-    "version-packages": "changeset version"
-  },
-  "dependencies": {
-    "zod": "4.3.6"
-  },
-  "devDependencies": {
-    "@bb/plugin-sdk": "file:vendor/bb-plugin-sdk-0.4.1.tgz",
-    "@changesets/cli": "3.0.0",
-    "@testing-library/react": "^16.3.2",
-    "@types/better-sqlite3": "^7.6.12",
-    "@types/node": "^22.0.0",
-    "@types/react": "^19.0.0",
-    "@types/react-dom": "^19.0.0",
-    "better-sqlite3": "^12.0.0",
-    "cron-parser": "^5.5.0",
-    "hono": "4.13.1",
-    "jsdom": "^29.0.1",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "typescript": "^5.7.0",
-    "vitest": "^4.1.1"
-  },
-  "allowScripts": {
-    "better-sqlite3@12.11.1": true
+    "typecheck": "npm --workspace plugins/bb-plugin-threads-list run typecheck",
+    "test": "node --test tests/retirement.test.mjs && npm --workspace plugins/bb-plugin-threads-list test",
+    "verify": "npm run typecheck && npm test"
   }
 }

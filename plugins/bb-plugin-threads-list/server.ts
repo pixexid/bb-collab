@@ -1,5 +1,4 @@
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
-import { registerDeploymentIdentityCli } from "../../src/deployment-identity.js";
 import { z } from "zod";
 
 const id = z.string().min(1).max(256);
@@ -42,7 +41,6 @@ const stateKey = (threadId: string) => `thread-state:${threadId}`;
 const collapseKey = (kind: "project" | "thread", value: string) => `collapse:${kind}:${value}`;
 
 export default function plugin(bb: BbPluginApi) {
-  registerDeploymentIdentityCli(bb, "threads-list", "threads-list", import.meta.url);
   bb.rpc.register(rpcContract, {
     async threadStates({ threadIds }) {
       const values = await Promise.all(threadIds.map(async (threadId) => {

@@ -14,7 +14,6 @@ type ThreadModels = PluginRpcResult<typeof rpcContract["threadModels"]>;
 type ThreadExecution = NonNullable<ThreadModels[string]>;
 type SidebarCollapseState = PluginRpcResult<typeof rpcContract["sidebarCollapseState"]>;
 
-const SETTINGS_ACTION_TITLE = "bb-collab settings";
 const STATE_MIGRATION_NOTICE_KEY = "bb-plugin-threads-list.state-migration-notice";
 
 function migrationNoticeVisible(): boolean {
