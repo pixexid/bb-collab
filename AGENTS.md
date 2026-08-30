@@ -23,6 +23,21 @@ repository adds no collaboration runtime or authority layer.
 - The target repository owns review, merge, deploy, and destructive-action
   policy.
 
+## Operator requests
+
+Operator Inbox is the only channel for requests requiring operator approval,
+review, a decision, clarification, or permission.
+
+- Send exactly one `needs-decision` message with
+  `send_operator_inbox_message` from the thread that owns the request.
+- Use `urgent` only when delay is time-sensitive and harmful.
+- Do not send routine progress or completion to Inbox, or duplicate an
+  actionable request in chat, notifications, issues, or another inbox.
+- After sending, return `WAITING: operator response in Inbox` and resume from
+  the native reply.
+- Request credentials through the Secrets plugin, never through Inbox.
+- If Inbox is unavailable, return `BLOCKED:` naming the missing plugin.
+
 ## Worker return contract
 
 Before becoming idle, start the final response with exactly one of:
