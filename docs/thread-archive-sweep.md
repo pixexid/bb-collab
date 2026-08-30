@@ -1,5 +1,0 @@
-# Thread archive sweep (GH-147)
-
-`thread-archive-sweep` runs hourly while the plugin is loaded, once per native BB project. It reports only: scheduled runs never archive a thread. `BB_COLLAB_ARCHIVE_IDLE_H` sets the positive idle floor in hours; the default is 24.
-
-`bb collab archive-sweep --project PROJECT_ID --apply` is the explicit, opt-in archive path. The protected set is resolved from every non-empty `execution_attempts.thread_id`, every `role_generations` holder, the current `role_generation_heads` seats, and the canonical director first-generation holder. Missing or unreadable canonical bindings, thread inventory, or parent/source relationships refuse the report. Unknown status, archived-state inconsistencies, and non-finite timestamps are protected; an unavailable per-thread environment or pull-request read protects that thread and does not abort other threads. Open/draft PRs, below-floor descendants, source-thread forks, and their ancestors remain protected. Apply rebuilds the report before each root archive and refuses if that root has changed.

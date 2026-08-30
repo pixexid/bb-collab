@@ -857,7 +857,7 @@ describe("replacement thread list", () => {
 
   it("reads the native model and reasoning by thread id and falls back safely when unavailable", async () => {
     const host = createFakePluginHost({
-      pluginId: "bb-collab",
+      pluginId: "threads-list",
       sdk: {
         threads: {
           defaultExecutionOptions: async ({ threadId }) => {
@@ -882,7 +882,7 @@ describe("replacement thread list", () => {
   it("persists project/thread collapse and forwards native thread/project reorder", async () => {
     const reorderPinned = vi.fn(async () => []);
     const reorderProjects = vi.fn(async () => [{ id: "project-a" }, { id: "project-b" }]);
-    const host = createFakePluginHost({ pluginId: "bb-collab", sdk: { threads: { reorderPinned }, projects: { reorder: reorderProjects } } });
+    const host = createFakePluginHost({ pluginId: "threads-list", sdk: { threads: { reorderPinned }, projects: { reorder: reorderProjects } } });
     await plugin(host.bb);
 
     await host.harness.callRpc("setSidebarCollapse", { kind: "project", id: "project-a", collapsed: true });
@@ -898,7 +898,7 @@ describe("replacement thread list", () => {
 
 
   it("accepts the live sidebar population across every batched RPC input", async () => {
-    const host = createFakePluginHost({ pluginId: "bb-collab" });
+    const host = createFakePluginHost({ pluginId: "threads-list" });
     await plugin(host.bb);
     const { sidebarRpcBatches } = await import("../app");
     const threadIds = Array.from({ length: 829 }, (_, index) => `thread-${index}`);
